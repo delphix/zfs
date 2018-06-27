@@ -9,6 +9,15 @@ depmod -a _KVERS_
 
 case $1 in
 	(configure)
+		#
+		# Ubuntu kernel comes integrated with ZFS modules. We want to
+		# remove those.
+		#
+		find /lib/modules/_KVERS_/kernel/zfs \
+			-type f -name '*.ko' \
+			-exec dpkg-divert --local --rename {} \;
+			depmod -a _KVERS_
+
 		if [ -x /usr/share/update-notifier/notify-reboot-required ]; then
 			/usr/share/update-notifier/notify-reboot-required
 		fi
