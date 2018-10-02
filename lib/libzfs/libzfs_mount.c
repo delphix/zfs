@@ -800,6 +800,9 @@ zfs_init_libshare(libzfs_handle_t *zhandle, int service)
 {
 	int ret = SA_OK;
 
+	VERIFY(zhandle != NULL);
+	zhandle->libzfs_shareflags |= ZFSSHARE_MISS;
+
 	if (ret == SA_OK && zhandle->libzfs_shareflags & ZFSSHARE_MISS) {
 		/*
 		 * We had a cache miss. Most likely it is a new ZFS
@@ -1039,6 +1042,7 @@ zfs_unshare_proto(zfs_handle_t *zhp, const char *mountpoint,
 		if (mountpoint == NULL)
 			mntpt = zfs_strdup(zhp->zfs_hdl, entry.mnt_mountp);
 
+		verify(sharetab_lock() == 0);
 		for (curr_proto = proto; *curr_proto != PROTO_END;
 		    curr_proto++) {
 
@@ -1047,9 +1051,11 @@ zfs_unshare_proto(zfs_handle_t *zhp, const char *mountpoint,
 			    mntpt, *curr_proto) != 0) {
 				if (mntpt != NULL)
 					free(mntpt);
+				verify(sharetab_unlock() == 0);
 				return (-1);
 			}
 		}
+		verify(sharetab_unlock() == 0);
 	}
 	if (mntpt != NULL)
 		free(mntpt);
@@ -1434,13 +1440,17 @@ zpool_disable_datasets(zpool_handle_t *zhp, boolean_t force)
 	 */
 	for (i = 0; i < used; i++) {
 		zfs_share_proto_t *curr_proto;
+		verify(sharetab_lock() == 0);
 		for (curr_proto = share_all_proto; *curr_proto != PROTO_END;
 		    curr_proto++) {
 			if (is_shared(hdl, mountpoints[i], *curr_proto) &&
 			    unshare_one(hdl, mountpoints[i],
-			    mountpoints[i], *curr_proto) != 0)
+			    mountpoints[i], *curr_proto) != 0) {
+				verify(sharetab_unlock() == 0);
 				goto out;
+			}
 		}
+		verify(sharetab_unlock() == 0);
 	}
 
 	/*
