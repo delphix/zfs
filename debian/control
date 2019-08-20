@@ -68,8 +68,6 @@ Section: contrib/headers
 Architecture: linux-any
 Depends: libzfslinux-dev (= ${binary:Version}),
  ${misc:Depends}
-Breaks: zfs-dkms (>> ${binary:Version}), zfs-dkms (<< ${binary:Version})
-Conflicts:zfs-dkms
 Description: OpenZFS kernel header files for compiling software
  to function with OpenZFS kernel modules.
 
