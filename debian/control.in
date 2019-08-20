@@ -63,6 +63,16 @@ Description: OpenZFS filesystem development files for Linux
  This package includes the development files of libnvpair1, libuutil1,
  libzpool2 and libzfs2.
 
+Package: zfs-headers
+Section: contrib/headers
+Architecture: linux-any
+Depends: libzfslinux-dev (= ${binary:Version}),
+ ${misc:Depends}
+Breaks: zfs-dkms (>> ${binary:Version}), zfs-dkms (<< ${binary:Version})
+Conflicts: zfs-dkms
+Description: OpenZFS kernel header files for compiling software
+ to function with OpenZFS kernel modules.
+
 Package: libzfs2linux
 Section: contrib/libs
 Architecture: linux-any
@@ -194,6 +204,7 @@ Depends: libnvpair1linux (= ${binary:Version}),
          libzfs2linux (= ${binary:Version}),
          libzpool2linux (= ${binary:Version}),
          libzfslinux-dev (= ${binary:Version}),
+         zfs-headers (= ${binary:Version}),
          zfsutils-linux (= ${binary:Version}),
          zfs-dbg (= ${binary:Version}),
          zfs-initramfs (= ${binary:Version}),
