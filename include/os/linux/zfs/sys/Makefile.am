@@ -10,6 +10,7 @@ KERNEL_H = \
 	$(top_srcdir)/include/os/linux/zfs/sys/trace_dnode.h \
 	$(top_srcdir)/include/os/linux/zfs/sys/trace_multilist.h \
 	$(top_srcdir)/include/os/linux/zfs/sys/trace_rrwlock.h \
+	$(top_srcdir)/include/os/linux/zfs/sys/trace_taskq.h \
 	$(top_srcdir)/include/os/linux/zfs/sys/trace_txg.h \
 	$(top_srcdir)/include/os/linux/zfs/sys/trace_vdev.h \
 	$(top_srcdir)/include/os/linux/zfs/sys/trace_zil.h \
