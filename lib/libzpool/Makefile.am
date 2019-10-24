@@ -109,7 +109,6 @@ KERNEL_C = \
 	space_map.c \
 	space_reftree.c \
 	txg.c \
-	trace.c \
 	uberblock.c \
 	unique.c \
 	vdev.c \
