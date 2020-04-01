@@ -53,6 +53,8 @@
 #include <sys/zfs_fuid.h>
 #include <sys/sa.h>
 #include <sys/zfs_sa.h>
+#include <sys/dmu_objset.h>
+#include <sys/dsl_dir.h>
 
 /*
  * zfs_match_find() is used by zfs_dirent_lock() to perform zap lookups
@@ -737,9 +739,18 @@ zfs_rmnode(znode_t *zp)
 		zfs_unlinked_add(xzp, tx);
 	}
 
+	mutex_enter(&os->os_dsl_dataset->ds_dir->dd_activity_lock);
+
 	/* Remove this znode from the unlinked set */
 	VERIFY3U(0, ==,
 	    zap_remove_int(zfsvfs->z_os, zfsvfs->z_unlinkedobj, zp->z_id, tx));
+
+	uint64_t count;
+	if (zap_count(os, zfsvfs->z_unlinkedobj, &count) == 0 && count == 0) {
+		cv_broadcast(&os->os_dsl_dataset->ds_dir->dd_activity_cv);
+	}
+
+	mutex_exit(&os->os_dsl_dataset->ds_dir->dd_activity_lock);
 
 	dataset_kstats_update_nunlinked_kstat(&zfsvfs->z_kstat, 1);
 
