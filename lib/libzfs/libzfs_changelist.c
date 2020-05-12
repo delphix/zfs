@@ -24,7 +24,7 @@
  * Use is subject to license terms.
  *
  * Portions Copyright 2007 Ramprakash Jelari
- * Copyright (c) 2014, 2015 by Delphix. All rights reserved.
+ * Copyright (c) 2014, 2020 by Delphix. All rights reserved.
  * Copyright 2016 Igor Kozhukhov <ikozhukhov@gmail.com>
  * Copyright (c) 2018 Datto Inc.
  */
@@ -98,6 +98,7 @@ changelist_prefix(prop_changelist_t *clp)
 	prop_changenode_t *cn;
 	uu_avl_walk_t *walk;
 	int ret = 0;
+	boolean_t update_shares = B_FALSE;
 
 	if (clp->cl_prop != ZFS_PROP_MOUNTPOINT &&
 	    clp->cl_prop != ZFS_PROP_SHARESMB)
@@ -135,6 +136,7 @@ changelist_prefix(prop_changelist_t *clp)
 				break;
 			case ZFS_PROP_SHARESMB:
 				(void) zfs_unshare_smb(cn->cn_handle, NULL);
+				update_shares = B_TRUE;
 				break;
 
 			default:
@@ -143,6 +145,8 @@ changelist_prefix(prop_changelist_t *clp)
 		}
 	}
 
+	if (update_shares)
+		zfs_shares_commit();
 	uu_avl_walk_end(walk);
 
 	if (ret == -1)
@@ -167,7 +171,7 @@ changelist_postfix(prop_changelist_t *clp)
 	uu_avl_walk_t *walk;
 	char shareopts[ZFS_MAXPROPLEN];
 	int errors = 0;
-	libzfs_handle_t *hdl;
+	boolean_t update_shares = B_FALSE;
 
 	/*
 	 * If we're changing the mountpoint, attempt to destroy the underlying
@@ -181,18 +185,6 @@ changelist_postfix(prop_changelist_t *clp)
 
 	if (clp->cl_prop == ZFS_PROP_MOUNTPOINT)
 		remove_mountpoint(cn->cn_handle);
-
-	/*
-	 * It is possible that the changelist_prefix() used libshare
-	 * to unshare some entries. Since libshare caches data, an
-	 * attempt to reshare during postfix can fail unless libshare
-	 * is uninitialized here so that it will reinitialize later.
-	 */
-	if (cn->cn_handle != NULL) {
-		hdl = cn->cn_handle->zfs_hdl;
-		assert(hdl != NULL);
-		zfs_uninit_libshare(hdl);
-	}
 
 	/*
 	 * We walk the datasets in reverse, because we want to mount any parent
@@ -260,16 +252,23 @@ changelist_postfix(prop_changelist_t *clp)
 		 * if the filesystem is currently shared, so that we can
 		 * adopt any new options.
 		 */
-		if (sharenfs && mounted)
+		if (sharenfs && mounted) {
 			errors += zfs_share_nfs(cn->cn_handle);
-		else if (cn->cn_shared || clp->cl_waslegacy)
+			update_shares = B_TRUE;
+		} else if (cn->cn_shared || clp->cl_waslegacy) {
 			errors += zfs_unshare_nfs(cn->cn_handle, NULL);
-		if (sharesmb && mounted)
+			update_shares = B_TRUE;
+		}
+		if (sharesmb && mounted) {
 			errors += zfs_share_smb(cn->cn_handle);
-		else if (cn->cn_shared || clp->cl_waslegacy)
+			update_shares = B_TRUE;
+		} else if (cn->cn_shared || clp->cl_waslegacy) {
 			errors += zfs_unshare_smb(cn->cn_handle, NULL);
+			update_shares = B_TRUE;
+		}
 	}
-
+	if (update_shares)
+		zfs_shares_commit();
 	uu_avl_walk_end(walk);
 
 	return (errors ? -1 : 0);
@@ -357,6 +356,7 @@ changelist_unshare(prop_changelist_t *clp, zfs_share_proto_t *proto)
 			ret = -1;
 	}
 
+	zfs_shares_commit();
 	uu_avl_walk_end(walk);
 
 	return (ret);

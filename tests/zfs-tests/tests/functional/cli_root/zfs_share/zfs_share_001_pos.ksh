@@ -72,7 +72,7 @@ function cleanup
 		log_must zfs destroy -f $TESTPOOL/$TESTFS@snapshot
 	fi
 
-	log_must zfs share -ag
+	log_must zfs share -a
 }
 
 
@@ -146,7 +146,6 @@ log_must zfs share -a
 # of this file on cleanup.
 #
 unset __ZFS_POOL_EXCLUDE
-log_must zfs share -g
 
 i=0
 while (( i < ${#fs[*]} )); do
@@ -154,7 +153,7 @@ while (( i < ${#fs[*]} )); do
 	    log_fail "File system ${fs[i]} is not shared (share -a)"
 
 	is_exported ${fs[i]} || \
-	    log_fail "File system ${fs[i]} is not exported (share -ag)"
+	    log_fail "File system ${fs[i]} is not exported (share -a)"
 
 	((i = i + 2))
 done
