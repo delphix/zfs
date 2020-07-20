@@ -4,6 +4,8 @@ DEFAULT_INCLUDES += \
 	-I$(top_srcdir)/include \
 	-I$(top_srcdir)/lib/libspl/include
 
+DEFAULT_INCLUDES += -I$(srcdir)
+
 noinst_LTLIBRARIES = libshare.la
 
 USER_C = \

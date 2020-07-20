@@ -21,7 +21,7 @@
 
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2011, 2019 by Delphix. All rights reserved.
+ * Copyright (c) 2011, 2020 by Delphix. All rights reserved.
  * Copyright (c) 2018 Datto Inc.
  */
 
@@ -47,7 +47,6 @@ struct libzfs_handle {
 	int libzfs_error;
 	int libzfs_fd;
 	FILE *libzfs_mnttab;
-	FILE *libzfs_sharetab;
 	zpool_handle_t *libzfs_pool_handles;
 	uu_avl_pool_t *libzfs_ns_avlpool;
 	uu_avl_t *libzfs_ns_avl;
@@ -57,8 +56,6 @@ struct libzfs_handle {
 	char libzfs_desc[1024];
 	int libzfs_printerr;
 	int libzfs_storeerr; /* stuff error messages into buffer */
-	void *libzfs_sharehdl; /* libshare handle */
-	uint_t libzfs_shareflags;
 	boolean_t libzfs_mnttab_enable;
 	/*
 	 * We need a lock to handle the case where parallel mount
@@ -72,8 +69,6 @@ struct libzfs_handle {
 	char libzfs_chassis_id[256];
 	boolean_t libzfs_prop_debug;
 };
-
-#define	ZFSSHARE_MISS	0x01	/* Didn't find entry in cache */
 
 struct zfs_handle {
 	libzfs_handle_t *zfs_hdl;
@@ -194,18 +189,11 @@ int zfs_validate_name(libzfs_handle_t *hdl, const char *path, int type,
 
 void namespace_clear(libzfs_handle_t *);
 
-/*
- * libshare (sharemgr) interfaces used internally.
- */
-
-extern int zfs_init_libshare(libzfs_handle_t *, int);
-extern void zfs_uninit_libshare(libzfs_handle_t *);
 extern int zfs_parse_options(char *, zfs_share_proto_t);
 
 extern int zfs_unshare_proto(zfs_handle_t *,
     const char *, zfs_share_proto_t *);
-int nfs_exports_lock(void);
-int nfs_exports_unlock(void);
+extern void zfs_commit_proto(zfs_share_proto_t *);
 
 #ifdef	__cplusplus
 }

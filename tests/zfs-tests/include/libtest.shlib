@@ -22,7 +22,7 @@
 #
 # Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
 # Use is subject to license terms.
-# Copyright (c) 2012, 2019 by Delphix. All rights reserved.
+# Copyright (c) 2012, 2020 by Delphix. All rights reserved.
 # Copyright (c) 2017 by Tim Chase. All rights reserved.
 # Copyright (c) 2017 by Nexenta Systems, Inc. All rights reserved.
 # Copyright (c) 2017 Lawrence Livermore National Security, LLC.
@@ -1280,34 +1280,78 @@ function is_shared
 	is_shared_impl "$fs"
 }
 
+function is_exported_illumos
+{
+	typeset fs=$1
+	typeset mtpt
+
+	for mtpt in `awk '{print $1}' /etc/dfs/sharetab` ; do
+		if [[ $mtpt == $fs ]] ; then
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+function is_exported_freebsd
+{
+	typeset fs=$1
+	typeset mtpt
+
+	for mtpt in `awk '{print $1}' /etc/zfs/exports` ; do
+		if [[ $mtpt == $fs ]] ; then
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+function is_exported_linux
+{
+	typeset fs=$1
+	typeset mtpt
+
+	for mtpt in `awk '{print $1}' /etc/exports.d/zfs.exports` ; do
+		if [[ $mtpt == $fs ]] ; then
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+#
+# Given a mountpoint, or a dataset name, determine if it is exported via
+# the os-specific NFS exports file.
+#
+# Returns 0 if exported, 1 otherwise.
+#
 function is_exported
 {
 	typeset fs=$1
 	typeset mtpt
 
-	if is_linux; then
-		if [[ $fs != "/"* ]] ; then
-			if datasetnonexists "$fs" ; then
-				return 1
-			else
-				mtpt=$(get_prop mountpoint "$fs")
-				case $mtpt in
-					none|legacy|-) return 1
-						;;
-					*)	fs=$mtpt
-						;;
-				esac
-			fi
+	if [[ $fs != "/"* ]] ; then
+		if datasetnonexists "$fs" ; then
+			return 1
+		else
+			mtpt=$(get_prop mountpoint "$fs")
+			case $mtpt in
+				none|legacy|-) return 1
+					;;
+				*)	fs=$mtpt
+					;;
+			esac
 		fi
-		for mtpt in `awk '{print $1}' /etc/exports.d/zfs.exports` ; do
-			if [[ $mtpt == $fs ]] ; then
-				return 0
-			fi
-		done
-
-		return 1
 	fi
 
+	case $(uname) in
+	FreeBSD)	is_exported_freebsd "$fs"	;;
+	Linux)		is_exported_linux "$fs"	;;
+	*)		is_exported_illumos "$fs"	;;
+	esac
 }
 
 #
@@ -1334,7 +1378,7 @@ function is_shared_smb
 		done
 		return 1
 	else
-		log_unsupported "Currently unsupported by the test framework"
+		log_note "Currently unsupported by the test framework"
 		return 1
 	fi
 }
@@ -1382,7 +1426,7 @@ function unshare_fs #fs
 
 	is_shared $fs || is_shared_smb $fs
 	if (($? == 0)); then
-		log_must zfs unshare $fs
+		zfs unshare $fs || log_fail "zfs unshare $fs failed"
 	fi
 
 	return 0
@@ -1458,6 +1502,21 @@ function showshares_smb
 	fi
 
 	return 0
+}
+
+function check_nfs
+{
+	if is_linux; then
+		share -s
+	elif is_freebsd; then
+		showmount -e
+	else
+		log_unsupported "Unknown platform"
+	fi
+
+	if [[ $? -ne 0 ]]; then
+		log_unsupported "The NFS utilities are not installed"
+	fi
 }
 
 #
@@ -3633,4 +3692,24 @@ function sha256digest
 	typeset file=$1
 
 	sha256sum -b $file | awk '{ print $1 }'
+}
+
+#
+# Given an array of pids, wait until all processes
+# have completed and check their return status.
+#
+function wait_for_children #children
+{
+	rv=0
+	children=("$@")
+	for child in "${children[@]}"
+	do
+		child_exit=0
+		wait ${child} || child_exit=$?
+		if [ $child_exit -ne 0 ]; then
+			echo "child ${child} failed with ${child_exit}"
+			rv=1
+		fi
+	done
+	return $rv
 }

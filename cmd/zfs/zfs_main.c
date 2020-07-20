@@ -21,7 +21,7 @@
 
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2011, 2019 by Delphix. All rights reserved.
+ * Copyright (c) 2011, 2020 by Delphix. All rights reserved.
  * Copyright 2012 Milan Jurik. All rights reserved.
  * Copyright (c) 2012, Joyent, Inc. All rights reserved.
  * Copyright (c) 2013 Steven Hartland.  All rights reserved.
@@ -311,8 +311,7 @@ get_usage(zfs_help_t idx)
 		return (gettext("\tset <property=value> ... "
 		    "<filesystem|volume|snapshot> ...\n"));
 	case HELP_SHARE:
-		return (gettext("\tshare [-l] <-a [nfs|smb] | filesystem>\n"
-		    "\tshare <-g [nfs]\n"));
+		return (gettext("\tshare [-l] <-a [nfs|smb] | filesystem>\n"));
 	case HELP_SNAPSHOT:
 		return (gettext("\tsnapshot [-r] [-o property=value] ... "
 		    "<filesystem|volume>@<snap> ...\n"));
@@ -605,19 +604,6 @@ parseprop(nvlist_t *props, char *propname)
 		return (B_FALSE);
 	}
 
-	/*
-	 * If we are setting the sharenfs property, lock the sharetab to
-	 * ensure concurrent writers don't update the file simultaneously.
-	 * The sharetab will remain locked until the process exits.
-	 */
-	if (strcmp(propname, zfs_prop_to_name(ZFS_PROP_SHARENFS)) == 0) {
-		if (sharetab_lock() != 0) {
-			(void) fprintf(stderr, gettext("unable to set "
-			    "property: %s\n"), strerror(errno));
-			exit(1);
-		}
-	}
-
 	if (nvlist_add_string(props, propname, propval) != 0)
 		nomem();
 	return (B_TRUE);
@@ -763,6 +749,7 @@ zfs_mount_and_share(libzfs_handle_t *hdl, const char *dataset, zfs_type_t type)
 			    "successfully created, but not shared\n"));
 			ret = 1;
 		}
+		zfs_commit_all_shares();
 	}
 
 	zfs_close(zhp);
@@ -6426,7 +6413,6 @@ typedef enum { OP_SHARE, OP_MOUNT } share_mount_op_t;
 typedef struct share_mount_state {
 	share_mount_op_t	sm_op;
 	boolean_t	sm_verbose;
-	boolean_t	sm_generate;
 	int	sm_flags;
 	char	*sm_options;
 	char	*sm_proto; /* only valid for OP_SHARE */
@@ -6441,7 +6427,7 @@ typedef struct share_mount_state {
  */
 static int
 share_mount_one(zfs_handle_t *zhp, int op, int flags, char *protocol,
-    boolean_t explicit, boolean_t generate, const char *options)
+    boolean_t explicit, const char *options)
 {
 	char mountpoint[ZFS_MAXPROPLEN];
 	char shareopts[ZFS_MAXPROPLEN];
@@ -6548,20 +6534,9 @@ share_mount_one(zfs_handle_t *zhp, int op, int flags, char *protocol,
 		    "'canmount' property is set to 'off'\n"), cmdname,
 		    zfs_get_name(zhp));
 		return (1);
-	} else if (canmount == ZFS_CANMOUNT_NOAUTO) {
-		/*
-		 * Skip this request when noauto is set and we wanted all
-		 * mounts|shares (i.e. -a) or we're not generating exports
-		 */
-		if (!explicit && !generate)
-			return (0);
-	}
-
-	/*
-	 * When generating shares and the filesystem isn't mounted then skip it
-	 */
-	if (generate && !zfs_is_mounted(zhp, NULL))
+	} else if (canmount == ZFS_CANMOUNT_NOAUTO && !explicit) {
 		return (0);
+	}
 
 	/*
 	 * If this filesystem is encrypted and does not have
@@ -6617,15 +6592,6 @@ share_mount_one(zfs_handle_t *zhp, int op, int flags, char *protocol,
 	 */
 	switch (op) {
 	case OP_SHARE:
-
-		/*
-		 * Generate a linux-specific exports file. This will create
-		 * an NFS only file that can be used by the linux NFS utils
-		 * to automatically share out ZFS filesystems.
-		 */
-		if (generate) {
-			return (zfs_share_generate(zhp));
-		}
 
 		shared_nfs = zfs_is_shared_nfs(zhp, NULL);
 		shared_smb = zfs_is_shared_smb(zhp, NULL);
@@ -6751,7 +6717,7 @@ share_mount_one_cb(zfs_handle_t *zhp, void *arg)
 	int ret;
 
 	ret = share_mount_one(zhp, sms->sm_op, sms->sm_flags, sms->sm_proto,
-	    B_FALSE, sms->sm_generate, sms->sm_options);
+	    B_FALSE, sms->sm_options);
 
 	pthread_mutex_lock(&sms->sm_lock);
 	if (ret != 0)
@@ -6785,19 +6751,18 @@ append_options(char *mntopts, char *newopts)
 static int
 share_mount(int op, int argc, char **argv)
 {
-	boolean_t do_all = B_FALSE;
+	int do_all = 0;
 	boolean_t verbose = B_FALSE;
-	boolean_t do_generate = B_FALSE;
 	int c, ret = 0;
 	char *options = NULL;
 	int flags = 0;
 
 	/* check options */
-	while ((c = getopt(argc, argv, op == OP_MOUNT ? ":alvo:Of" : "agl"))
+	while ((c = getopt(argc, argv, op == OP_MOUNT ? ":alvo:Of" : "al"))
 	    != -1) {
 		switch (c) {
 		case 'a':
-			do_all = B_TRUE;
+			do_all = 1;
 			break;
 		case 'v':
 			verbose = B_TRUE;
@@ -6823,14 +6788,6 @@ share_mount(int op, int argc, char **argv)
 			break;
 		case 'f':
 			flags |= MS_FORCE;
-			break;
-		case 'g':
-			/*
-			 * Generating the share information can only be
-			 * performed on all shares.
-			 */
-			do_all = B_TRUE;
-			do_generate = B_TRUE;
 			break;
 		case ':':
 			(void) fprintf(stderr, gettext("missing argument for "
@@ -6858,13 +6815,6 @@ share_mount(int op, int argc, char **argv)
 				    "must be 'nfs' or 'smb'\n"));
 				usage(B_FALSE);
 			}
-			if (do_generate && strcmp(argv[0], "smb") == 0) {
-				(void) fprintf(stderr, gettext("export file "
-				    "generation is not compatible fow smb "
-				    "shares\n"));
-				usage(B_FALSE);
-			}
-
 			protocol = argv[0];
 			argc--;
 			argv++;
@@ -6888,15 +6838,11 @@ share_mount(int op, int argc, char **argv)
 		share_mount_state_t share_mount_state = { 0 };
 		share_mount_state.sm_op = op;
 		share_mount_state.sm_verbose = verbose;
-		share_mount_state.sm_generate = do_generate;
 		share_mount_state.sm_flags = flags;
 		share_mount_state.sm_options = options;
 		share_mount_state.sm_proto = protocol;
 		share_mount_state.sm_total = cb.cb_used;
 		pthread_mutex_init(&share_mount_state.sm_lock, NULL);
-
-		if (do_generate)
-			verify(nfs_exports_lock() == 0);
 
 		/*
 		 * libshare isn't mt-safe, so only do the operation in parallel
@@ -6907,10 +6853,7 @@ share_mount(int op, int argc, char **argv)
 		zfs_foreach_mountpoint(g_zfs, cb.cb_handles, cb.cb_used,
 		    share_mount_one_cb, &share_mount_state,
 		    op == OP_MOUNT && !(flags & MS_CRYPT));
-
-		if (do_generate)
-			verify(nfs_exports_unlock() == 0);
-
+		zfs_commit_all_shares();
 		ret = share_mount_state.sm_status;
 
 		for (int i = 0; i < cb.cb_used; i++)
@@ -6962,7 +6905,8 @@ share_mount(int op, int argc, char **argv)
 			ret = 1;
 		} else {
 			ret = share_mount_one(zhp, op, flags, NULL, B_TRUE,
-			    B_FALSE, options);
+			    options);
+			zfs_commit_all_shares();
 			zfs_close(zhp);
 		}
 	}
@@ -6975,7 +6919,6 @@ share_mount(int op, int argc, char **argv)
 
 /*
  * zfs mount -a [nfs]
- * zfs mount -g [nfs]
  * zfs mount filesystem
  *
  * Mount all filesystems, or mount the given filesystem.
@@ -7110,6 +7053,7 @@ unshare_unmount_path(int op, char *path, int flags, boolean_t is_manual)
 			    "not currently shared\n"), path);
 		} else {
 			ret = zfs_unshareall_bypath(zhp, path);
+			zfs_commit_all_shares();
 		}
 	} else {
 		char mtpt_prop[ZFS_MAXPROPLEN];
@@ -7328,6 +7272,9 @@ unshare_unmount(int op, int argc, char **argv)
 			free(node->un_mountp);
 			free(node);
 		}
+
+		if (op == OP_SHARE)
+			zfs_commit_shares(protocol);
 
 		uu_avl_walk_end(walk);
 		uu_avl_destroy(tree);
