@@ -1148,6 +1148,7 @@ static void arc_buf_watch(arc_buf_t *);
 static void arc_tuning_update(void);
 static void arc_prune_async(int64_t);
 static void arc_wait_for_eviction(uint64_t);
+static uint64_t arc_free_memory(void);
 
 static arc_buf_contents_t arc_buf_type(arc_buf_hdr_t *);
 static uint32_t arc_bufc_to_flags(arc_buf_contents_t);
@@ -4075,6 +4076,20 @@ arc_evict_hdr(arc_buf_hdr_t *hdr, kmutex_t *hash_lock)
 	return (bytes_evicted);
 }
 
+static void
+arc_set_need_free(void)
+{
+	ASSERT(MUTEX_HELD(&arc_evict_lock));
+	int64_t remaining = arc_free_memory() - arc_sys_free / 2;
+	arc_evict_waiter_t *aw = list_tail(&arc_evict_waiters);
+	if (aw == NULL) {
+		arc_need_free = MAX(-remaining, 0);
+	} else {
+		arc_need_free =
+		    MAX(-remaining, (int64_t)(aw->aew_count - arc_evict_count));
+	}
+}
+
 static uint64_t
 arc_evict_state_impl(multilist_t *ml, int idx, arc_buf_hdr_t *marker,
     uint64_t spa, int64_t bytes)
@@ -4154,36 +4169,38 @@ arc_evict_state_impl(multilist_t *ml, int idx, arc_buf_hdr_t *marker,
 			if (evicted != 0)
 				evict_count++;
 
-			/*
-			 * Increment the count of evicted bytes, and wake up
-			 * any threads that are waiting for the count to
-			 * reach this value.  Since the list is ordered by
-			 * ascending aew_count, we pop off the beginning of
-			 * the list until we reach the end, or a waiter
-			 * that's past the current "count".
-			 */
-			mutex_enter(&arc_evict_lock);
-			arc_evict_count += evicted;
-			arc_evict_waiter_t *aw;
-			while ((aw = list_head(&arc_evict_waiters)) != NULL &&
-			    aw->aew_count <= arc_evict_count) {
-				list_remove(&arc_evict_waiters, aw);
-				cv_broadcast(&aw->aew_cv);
-			}
-
-			aw = list_tail(&arc_evict_waiters);
-			if (aw == NULL) {
-				arc_need_free = 0;
-			} else {
-				arc_need_free = aw->aew_count - arc_evict_count;
-			}
-			mutex_exit(&arc_evict_lock);
 		} else {
 			ARCSTAT_BUMP(arcstat_mutex_miss);
 		}
 	}
 
 	multilist_sublist_unlock(mls);
+
+	/*
+	 * Increment the count of evicted bytes, and wake up any threads that
+	 * are waiting for the count to reach this value.  Since the list is
+	 * ordered by ascending aew_count, we pop off the beginning of the
+	 * list until we reach the end, or a waiter that's past the current
+	 * "count".  Doing this outside the loop reduces the number of times
+	 * we need to acquire the global arc_evict_lock.
+	 *
+	 * Only wake when there's sufficient free memory in the system
+	 * (specifically, arc_sys_free/2, which is 1/64th of RAM by default).
+	 */
+	mutex_enter(&arc_evict_lock);
+	arc_evict_count += bytes_evicted;
+
+	int64_t remaining = arc_free_memory() - arc_sys_free / 2;
+	if (remaining > 0) {
+		arc_evict_waiter_t *aw;
+		while ((aw = list_head(&arc_evict_waiters)) != NULL &&
+		    aw->aew_count <= arc_evict_count) {
+			list_remove(&arc_evict_waiters, aw);
+			cv_broadcast(&aw->aew_cv);
+		}
+	}
+	arc_set_need_free();
+	mutex_exit(&arc_evict_lock);
 
 	/*
 	 * If the ARC size is reduced from arc_c_max to arc_c_min (especially
@@ -4850,7 +4867,16 @@ static void
 arc_reduce_target_size(int64_t to_free)
 {
 	uint64_t asize = aggsum_value(&arc_size);
-	uint64_t c = arc_c;
+
+	/*
+	 * All callers want the ARC to actually evict (at least) this much
+	 * memory.  Therefore we reduce from the lower of the current size
+	 * and the target size.  This way, even if arc_c is much higher than
+	 * arc_size (as is the case the first time this is called after
+	 * booting), we will immediately have arc_c < arc_size and therefore
+	 * the arc_evict_zthr will evict.
+	 */
+	uint64_t c = MIN(arc_c, asize);
 
 	if (c > to_free && c - to_free > arc_c_min) {
 		arc_c = c - to_free;
@@ -5087,6 +5113,7 @@ arc_evict_cb(void *arg, zthr_t *zthr)
 		while ((aw = list_remove_head(&arc_evict_waiters)) != NULL) {
 			cv_broadcast(&aw->aew_cv);
 		}
+		arc_set_need_free();
 	}
 	mutex_exit(&arc_evict_lock);
 	spl_fstrans_unmark(cookie);
@@ -5465,7 +5492,9 @@ arc_get_data_buf(arc_buf_hdr_t *hdr, uint64_t size, void *tag)
 
 /*
  * Wait for the specified amount of data (in bytes) to be evicted from the
- * ARC, or for the ARC to no longer be full.
+ * ARC, or for the ARC to no longer be full.  If the ARC is full, we must
+ * also wait for there to be sufficient free memory (based on
+ * arc_free_memory()).
  */
 static void
 arc_wait_for_eviction(uint64_t amount)
@@ -5491,7 +5520,7 @@ arc_wait_for_eviction(uint64_t amount)
 
 			list_insert_tail(&arc_evict_waiters, &aw);
 
-			arc_need_free = aw.aew_count - arc_evict_count;
+			arc_set_need_free();
 
 			DTRACE_PROBE4(arc__wait__for__eviction,
 			    arc_evict_waiter_t *, &aw,
@@ -5538,7 +5567,8 @@ arc_get_data_impl(arc_buf_hdr_t *hdr, uint64_t size, void *tag)
 	 * faster than we are evicting.  To ensure we don't compound the
 	 * problem by adding more data and forcing arc_size to grow even
 	 * further past it's target size, we wait for the eviction thread to
-	 * make some progress.
+	 * make some progress.  We also wait for there to be sufficient free
+	 * memory in the system, as measured by arc_free_memory().
 	 *
 	 * Specifically, we wait for zfs_arc_get_data_eviction_pct percent of
 	 * the requested size to be evicted.  This should be more than 100%,
@@ -7798,8 +7828,26 @@ arc_init(void)
 	 * system.  This gives the ARC time to shrink in response to memory
 	 * pressure, before running completely out of memory and invoking the
 	 * direct-reclaim ARC shrinker.
+	 *
+	 * This should be more than twice high_wmark_pages(), so that
+	 * arc_wait_for_eviction() will wait until at least the
+	 * high_wmark_pages() are free (see arc_evict_state_impl()).
+	 *
+	 * It's hard to iterate the zones from a linux kernel module, which
+	 * makes it difficult to determine the watermark dynamically. Instead
+	 * we consider the maximum high watermark for any system, assuming
+	 * default parameters on Linux kernel 5.3.  The maximum low watermark
+	 * is 64MB, the max high watermark is 64MB + 0.2% of RAM, and the
+	 * maximum boost is 150% of the high watermark.  So the maximum
+	 * boosted high watermark is 160MB + 0.5% of RAM.
+	 *
+	 * The default arc_sys_free is 512MB + 1/32nd (3%) of RAM, which is
+	 * more than double the highest high_wmark (160MB + 0.5% of RAM).
+	 * Note that the extra 512MB is only strictly necessary on systems
+	 * with less than 16GB of RAM, but we always add it as an extra
+	 * cushion.
 	 */
-	arc_sys_free = allmem / 32;
+	arc_sys_free = 512 * 1024 * 1024 + allmem / 32;
 #endif
 
 	/* Set min cache to 1/32 of all memory, or 32MB, whichever is more */
