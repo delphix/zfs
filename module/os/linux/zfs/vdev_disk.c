@@ -36,7 +36,6 @@
 #include <sys/zio.h>
 #include <linux/msdos_fs.h>
 #include <linux/vfs_compat.h>
-
 /*
  * Unique identifier for the exclusive vdev holder.
  */
@@ -194,7 +193,7 @@ vdev_disk_open(vdev_t *v, uint64_t *psize, uint64_t *max_psize,
 
 			blkdev_put(bdev, mode | FMODE_EXCL);
 		}
-
+		/*
 		if (reread_part) {
 			bdev = blkdev_get_by_path(disk_name, mode | FMODE_EXCL,
 			    zfs_vdev_holder);
@@ -207,6 +206,7 @@ vdev_disk_open(vdev_t *v, uint64_t *psize, uint64_t *max_psize,
 				}
 			}
 		}
+		*/
 	} else {
 		vd = kmem_zalloc(sizeof (vdev_disk_t), KM_SLEEP);
 

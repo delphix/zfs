@@ -39,6 +39,7 @@
 #include <unistd.h>
 #include <libgen.h>
 #include <zone.h>
+#include <linux/blkpg.h>
 #include <sys/stat.h>
 #include <sys/efi_partition.h>
 #include <sys/systeminfo.h>
@@ -2854,6 +2855,82 @@ zpool_relabel_disk(libzfs_handle_t *hdl, const char *path, const char *msg)
 	return (0);
 }
 
+static int
+zpool_expand_part(libzfs_handle_t *hdl, const char *path, const char *msg)
+{
+	int fd, error, i;
+
+	if ((fd = open(path, O_RDWR|O_DIRECT)) < 0) {
+		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN, "cannot "
+		    "expand part '%s': unable to open device: %d"), path, errno);
+		return (zfs_error(hdl, EZFS_OPENFAILED, msg));
+	}
+
+	uint_t                  resv_index = 0, data_index = 0;
+	diskaddr_t              resv_start = 0, data_start = 0;
+	diskaddr_t              data_size;
+	struct dk_gpt           *efi_label = NULL;
+	(void) fprintf(stdout, "efi_alloc_and_read\n");
+
+	error = efi_alloc_and_read(fd, &efi_label);
+	if (error < 0) {
+		(void) fprintf(stdout, "efi_alloc_and_read: got error %d\n", error);
+		if (efi_label != NULL)
+			efi_free(efi_label);
+		return (0);
+	}
+        /*
+         * Find the last physically non-zero partition.
+         * This should be the reserved partition.
+         */
+        for (i = 0; i < efi_label->efi_nparts; i ++) {
+                if (resv_start < efi_label->efi_parts[i].p_start) {
+                        resv_start = efi_label->efi_parts[i].p_start;
+                        resv_index = i;
+                }
+        }
+	(void) fprintf(stdout, "resv index: %d, resv_start %llu\n", resv_index, resv_start);
+
+        /*
+         * Find the last physically non-zero partition before that.
+         * This is the data partition.
+         */
+        for (i = 0; i < resv_index; i ++) {
+                if (data_start < efi_label->efi_parts[i].p_start) {
+                        data_start = efi_label->efi_parts[i].p_start;
+                        data_index = i;
+                }
+        }
+        data_size = efi_label->efi_parts[data_index].p_size;
+	(void) fprintf(stdout, "data_index: %d, data_start %llu, data_size: %llu\n",
+	    data_index, data_start, data_size);
+
+	/* construct the BLKPG arguments */
+	struct blkpg_partition  linux_part;
+	memset (&linux_part, 0, sizeof (linux_part));
+ 	linux_part.start = data_start;
+	linux_part.length = data_size;
+	linux_part.pno = data_index;
+	strncpy (linux_part.devname, path, BLKPG_DEVNAMELTH-1);
+	linux_part.devname[BLKPG_DEVNAMELTH-1] = '\0';
+
+	/* construct the ioctl arguments */
+	struct blkpg_ioctl_arg ioctl_arg;
+        ioctl_arg.op = BLKPG_RESIZE_PARTITION;
+        ioctl_arg.flags = 0;
+        ioctl_arg.datalen = sizeof (struct blkpg_partition);
+        ioctl_arg.data = &linux_part;
+ 
+	/* call ioctl */
+        error = ioctl(fd, BLKPG, &ioctl_arg);
+	if (error != 0) {
+		(void) fprintf(stdout, "BLKPG ioctl: got error %d\n", error);
+	}
+	(void) close(fd);
+
+	return (0);
+}
+
 /*
  * Convert a vdev path to a GUID.  Returns GUID or 0 on error.
  *
@@ -2959,12 +3036,16 @@ zpool_vdev_online(zpool_handle_t *zhp, const char *path, int flags,
 			error = zpool_relabel_disk(hdl, fullpath, msg);
 			if (error != 0)
 				return (error);
+
+			error = zpool_expand_part(hdl, fullpath, msg);
+			if (error != 0)
+				return (error);
 		}
 	}
 
 	zc.zc_cookie = VDEV_STATE_ONLINE;
 	zc.zc_obj = flags;
-
+	
 	if (zfs_ioctl(hdl, ZFS_IOC_VDEV_SET_STATE, &zc) != 0) {
 		if (errno == EINVAL) {
 			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN, "was split "
