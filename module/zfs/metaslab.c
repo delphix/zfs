@@ -990,7 +990,20 @@ metaslab_group_initialized(metaslab_group_t *mg)
 uint64_t
 metaslab_group_get_space(metaslab_group_t *mg)
 {
-	return ((1ULL << mg->mg_vd->vdev_ms_shift) * mg->mg_vd->vdev_ms_count);
+	uint64_t space = 0;
+	avl_tree_t *t = &mg->mg_metaslab_tree;
+	mutex_enter(&mg->mg_lock);
+	for (metaslab_t *msp = avl_first(t);
+	    msp != NULL; msp = AVL_NEXT(t, msp)) {
+		/* skip if not a member */
+		if (msp->ms_group != mg)
+			continue;
+
+		space += msp->ms_size;
+	}
+
+	mutex_exit(&mg->mg_lock);
+	return (space);
 }
 
 void
