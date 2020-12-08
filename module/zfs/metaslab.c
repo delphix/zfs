@@ -1001,6 +1001,9 @@ metaslab_group_get_space(metaslab_group_t *mg)
 
 		space += msp->ms_size;
 	}
+	VERIFY3U(space, ==,
+	    (1ULL << mg->mg_vd->vdev_ms_shift) *
+	    avl_numnodes(&mg->mg_metaslab_tree));
 
 	mutex_exit(&mg->mg_lock);
 	return (space);
@@ -1026,6 +1029,7 @@ metaslab_group_histogram_verify(metaslab_group_t *mg)
 	for (metaslab_t *msp = avl_first(t);
 	    msp != NULL; msp = AVL_NEXT(t, msp)) {
 		/* skip if not active or not a member */
+		VERIFY3P(msp->ms_group, ==, mg);
 		if (msp->ms_sm == NULL || msp->ms_group != mg)
 			continue;
 
