@@ -247,6 +247,8 @@ typedef enum {
 	ZPOOL_PROP_LOAD_GUID,
 	ZPOOL_PROP_AUTOTRIM,
 	ZPOOL_PROP_COMPATIBILITY,
+	ZPOOL_PROP_OBJ_ENDPOINT,
+	ZPOOL_PROP_OBJ_CREDENTIALS,
 	ZPOOL_NUM_PROPS
 } zpool_prop_t;
 
@@ -615,6 +617,7 @@ typedef struct zpool_load_policy {
 #define	ZPOOL_CONFIG_GUID		"guid"
 #define	ZPOOL_CONFIG_INDIRECT_OBJECT	"com.delphix:indirect_object"
 #define	ZPOOL_CONFIG_INDIRECT_BIRTHS	"com.delphix:indirect_births"
+#define	ZPOOL_CONFIG_OBJSTORE_BUCKET	"com.delphix:bucket_name"
 #define	ZPOOL_CONFIG_PREV_INDIRECT_VDEV	"com.delphix:prev_indirect_vdev"
 #define	ZPOOL_CONFIG_PATH		"path"
 #define	ZPOOL_CONFIG_DEVID		"devid"
@@ -779,6 +782,7 @@ typedef struct zpool_load_policy {
 #define	VDEV_TYPE_LOG			"log"
 #define	VDEV_TYPE_L2CACHE		"l2cache"
 #define	VDEV_TYPE_INDIRECT		"indirect"
+#define	VDEV_TYPE_OBJSTORE		"object_store"
 
 #define	VDEV_RAIDZ_MAXPARITY		3
 
