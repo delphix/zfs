@@ -210,7 +210,8 @@ agent_request(vdev_object_store_t *vos, nvlist_t *nv)
 	iov.iov_base = iov_buf;
 	iov.iov_len = iov_size;
 	// XXX need locking on socket?
-	VERIFY0(kernel_sendmsg(vos->vos_sock, &msg, &iov, 1, iov_size));
+	VERIFY3U(kernel_sendmsg(vos->vos_sock, &msg, &iov, 1, iov_size), ==,
+	    iov_size);
 
 	fnvlist_pack_free(iov_buf, iov_size);
 }
@@ -318,7 +319,6 @@ vdev_object_store_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 {
 	vdev_object_store_t *vos;
 	struct socket *sock;
-	zfs_file_attr_t zfa;
 	int error;
 
 	/*
@@ -367,19 +367,6 @@ vdev_object_store_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	}
 
 	vos->vos_sock = sock;
-
-#ifdef _KERNEL
-	/*
-	 * Make sure it's a socket file.
-	 */
-	if (zfs_file_getattr(sock->file, &zfa)) {
-		return (SET_ERROR(ENODEV));
-	}
-	if (!S_ISSOCK(zfa.zfa_mode)) {
-		vd->vdev_stat.vs_aux = VDEV_AUX_OPEN_FAILED;
-		return (SET_ERROR(ENODEV));
-	}
-#endif
 
 	vos->vos_reader = thread_create(NULL, 0, agent_reader,
 	    vos, 0, &p0, TS_RUN, defclsyspri);
