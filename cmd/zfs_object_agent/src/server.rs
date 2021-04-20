@@ -8,18 +8,18 @@ use s3::Region;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::UnixStream;
 use tokio::sync::Mutex;
-use tokio_pipe::PipeRead;
-use tokio_pipe::PipeWrite;
 
 pub struct Server {
-    input: PipeRead,
-    output: Arc<tokio::sync::Mutex<PipeWrite>>,
+    input: OwnedReadHalf,
+    output: Arc<tokio::sync::Mutex<OwnedWriteHalf>>,
     pools: Arc<std::sync::Mutex<HashMap<PoolGUID, Pool>>>,
 }
 
 impl Server {
-    async fn get_next_request(pipe: &mut PipeRead) -> NvList {
+    async fn get_next_request(pipe: &mut OwnedReadHalf) -> NvList {
         let len64 = pipe.read_u64().await.unwrap();
         let mut v = Vec::new();
         v.resize(len64 as usize, 0);
@@ -29,10 +29,11 @@ impl Server {
         nvl
     }
 
-    pub fn start(input: PipeRead, output: PipeWrite) {
+    pub fn start(connection: UnixStream) {
+        let (r, w) = connection.into_split();
         let mut server = Server {
-            input,
-            output: Arc::new(Mutex::new(output)),
+            input: r,
+            output: Arc::new(Mutex::new(w)),
             pools: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         tokio::spawn(async move {
@@ -105,7 +106,7 @@ impl Server {
         });
     }
 
-    async fn send_response(output: Arc<Mutex<PipeWrite>>, nvl: NvList) {
+    async fn send_response(output: Arc<Mutex<OwnedWriteHalf>>, nvl: NvList) {
         println!("sending response: {:?}", nvl);
         let buf = nvl.pack(NvEncoding::Native).unwrap();
         drop(nvl);

@@ -4,28 +4,39 @@ use nvpair::NvEncoding;
 use nvpair::NvList;
 use nvpair::NvListRef;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::task::JoinHandle;
-use tokio_pipe::PipeRead;
-use tokio_pipe::PipeWrite;
 
 pub struct Client {
-    input: Option<PipeRead>,
-    output: PipeWrite,
+    input: Option<OwnedReadHalf>,
+    output: OwnedWriteHalf,
 }
 
 impl Client {
     pub async fn new() -> Client {
-        let (r1, w1) = tokio_pipe::pipe().unwrap();
-        let (r2, w2) = tokio_pipe::pipe().unwrap();
+        let (s1, s2) = tokio::net::UnixStream::pair().unwrap();
 
-        Server::start(r1, w2);
+        Server::start(s1);
+        let (r, w) = s2.into_split();
         Client {
-            input: Some(r2), // None while get_responses_initiate() is running
-            output: w1,
+            input: Some(r), // None while get_responses_initiate() is running
+            output: w,
         }
     }
 
-    async fn get_next_response_impl(input: &mut PipeRead) -> NvList {
+    pub async fn connect() -> Client {
+        let s = tokio::net::UnixStream::connect("/tmp/zfs_socket")
+            .await
+            .unwrap();
+
+        let (r, w) = s.into_split();
+        Client {
+            input: Some(r), // None while get_responses_initiate() is running
+            output: w,
+        }
+    }
+
+    async fn get_next_response_impl(input: &mut OwnedReadHalf) -> NvList {
         let len64 = input.read_u64().await.unwrap();
         let mut v = Vec::new();
         v.resize(len64 as usize, 0);
@@ -41,7 +52,7 @@ impl Client {
 
     /// Only one of these can be running at a time; call get_responses_join() on
     /// the returned value to wait.
-    pub fn get_responses_initiate(&mut self, num: usize) -> JoinHandle<PipeRead> {
+    pub fn get_responses_initiate(&mut self, num: usize) -> JoinHandle<OwnedReadHalf> {
         let mut input = self.input.take().unwrap();
         tokio::spawn(async move {
             for _ in 0..num {
@@ -52,7 +63,7 @@ impl Client {
     }
 
     // If we wanted to get fancy, this could return a Vec<NvList> of the responses
-    pub async fn get_responses_join(&mut self, handle: JoinHandle<PipeRead>) {
+    pub async fn get_responses_join(&mut self, handle: JoinHandle<OwnedReadHalf>) {
         self.input = Some(handle.await.unwrap());
     }
 

@@ -17,6 +17,7 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::io::Read;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::net::UnixListener;
 mod client;
 mod object_access;
 mod object_based_log;
@@ -202,6 +203,57 @@ async fn do_read(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+async fn do_free_client(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
+    let guid = PoolGUID(1234);
+
+    let mut client = Client::connect().await;
+
+    client.open_pool(&bucket.name(), guid).await;
+
+    let nvl = client.get_next_response().await;
+    let mut next_txg = TXG(nvl.lookup_uint64("next txg").unwrap());
+    let mut next_block = BlockID(nvl.lookup_uint64("next block").unwrap());
+
+    // write some blocks, which we will then free some of
+
+    client.begin_txg(guid, next_txg).await;
+    next_txg = TXG(next_txg.0 + 1);
+
+    let num_writes: usize = 10000;
+    let task = client.get_responses_initiate(num_writes);
+    let mut ids = Vec::new();
+
+    for _ in 0..num_writes {
+        let mut data: Vec<u8> = Vec::new();
+        let mut rng = thread_rng();
+        let len = rng.gen::<u32>() % 100;
+        for _ in 0..len {
+            data.push(rng.gen());
+        }
+        //println!("requesting write of {}B", len);
+        client.write_block(guid, next_block, &data).await;
+        //println!("writing {}B to {:?}...", len, id);
+        ids.push(next_block);
+        next_block = BlockID(next_block.0 + 1);
+    }
+    client.flush_writes(guid).await;
+    client.get_responses_join(task).await;
+
+    client.end_txg(guid, &[]).await;
+    client.get_next_response().await;
+
+    // free half the blocks, randomly selected
+    client.begin_txg(guid, next_txg).await;
+
+    for i in rand::seq::index::sample(&mut thread_rng(), ids.len(), ids.len() / 2) {
+        client.free_block(guid, ids[i]).await;
+    }
+    client.end_txg(guid, &[]).await;
+    client.get_next_response().await;
+
+    Ok(())
+}
+
 async fn do_free(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
     let guid = PoolGUID(1234);
     let (mut client, mut next_txg, mut next_block) = setup_server(bucket, guid).await;
@@ -325,6 +377,26 @@ fn do_nvpair() {
     write_file_as_bytes("./zpool.cache.rust", &newbuf);
 }
 
+async fn do_server() {
+    let socket_name = std::env::args()
+        .nth(2)
+        .unwrap_or("/tmp/zfs_socket".to_string());
+
+    let listener = UnixListener::bind(&socket_name).unwrap();
+    println!("Listening on: {}", socket_name);
+
+    loop {
+        match listener.accept().await {
+            Ok((socket, _)) => {
+                server::Server::start(socket);
+            }
+            Err(e) => {
+                println!("accept() failed: {}", e);
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -345,8 +417,10 @@ async fn main() {
         "write" => do_write(&bucket).await.unwrap(),
         "read" => do_read(&bucket).await.unwrap(),
         "free" => do_free(&bucket).await.unwrap(),
+        "free_client" => do_free_client(&bucket).await.unwrap(),
         "btree" => do_btree(),
         "nvpair" => do_nvpair(),
+        "server" => do_server().await,
 
         _ => {
             println!("invalid argument: {}", args[1]);
