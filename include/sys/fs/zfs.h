@@ -617,7 +617,6 @@ typedef struct zpool_load_policy {
 #define	ZPOOL_CONFIG_GUID		"guid"
 #define	ZPOOL_CONFIG_INDIRECT_OBJECT	"com.delphix:indirect_object"
 #define	ZPOOL_CONFIG_INDIRECT_BIRTHS	"com.delphix:indirect_births"
-#define	ZPOOL_CONFIG_OBJSTORE_BUCKET	"com.delphix:bucket_name"
 #define	ZPOOL_CONFIG_PREV_INDIRECT_VDEV	"com.delphix:prev_indirect_vdev"
 #define	ZPOOL_CONFIG_PATH		"path"
 #define	ZPOOL_CONFIG_DEVID		"devid"

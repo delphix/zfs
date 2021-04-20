@@ -264,7 +264,7 @@ make_objstore_vdev(nvlist_t *props, const char *arg)
 {
 	nvlist_t *vdev = fnvlist_alloc();
 	char *endpoint, *creds;
-	fnvlist_add_string(vdev, ZPOOL_CONFIG_OBJSTORE_BUCKET, arg);
+	fnvlist_add_string(vdev, ZPOOL_CONFIG_PATH, arg);
 	fnvlist_add_string(vdev, ZPOOL_CONFIG_TYPE, VDEV_TYPE_OBJSTORE);
 
 	if ((nvlist_lookup_string(props,
