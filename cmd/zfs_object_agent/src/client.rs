@@ -1,5 +1,4 @@
 use crate::pool::*;
-use crate::server::Server;
 use nvpair::NvEncoding;
 use nvpair::NvList;
 use nvpair::NvListRef;
@@ -13,17 +12,6 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn new() -> Client {
-        let (s1, s2) = tokio::net::UnixStream::pair().unwrap();
-
-        Server::start(s1);
-        let (r, w) = s2.into_split();
-        Client {
-            input: Some(r), // None while get_responses_initiate() is running
-            output: w,
-        }
-    }
-
     pub async fn connect() -> Client {
         let s = tokio::net::UnixStream::connect("/tmp/zfs_socket")
             .await

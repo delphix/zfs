@@ -126,7 +126,7 @@ fn do_btree() {
 }
 
 async fn do_create(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
-    let mut client = Client::new().await;
+    let mut client = Client::connect().await;
     let guid = PoolGUID(1234);
 
     client.create_pool(&bucket.name(), guid, "testpool").await;
@@ -137,7 +137,7 @@ async fn do_create(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
 
 async fn do_write(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
     let guid = PoolGUID(1234);
-    let (mut client, next_txg, mut next_block) = setup_server(bucket, guid).await;
+    let (mut client, next_txg, mut next_block) = setup_client(bucket, guid).await;
 
     let begin = Instant::now();
     let n = 5200;
@@ -169,8 +169,8 @@ async fn do_write(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn setup_server(bucket: &Bucket, guid: PoolGUID) -> (Client, TXG, BlockID) {
-    let mut client = Client::new().await;
+async fn setup_client(bucket: &Bucket, guid: PoolGUID) -> (Client, TXG, BlockID) {
+    let mut client = Client::connect().await;
 
     client.open_pool(&bucket.name(), guid).await;
 
@@ -183,7 +183,7 @@ async fn setup_server(bucket: &Bucket, guid: PoolGUID) -> (Client, TXG, BlockID)
 
 async fn do_read(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
     let guid = PoolGUID(1234);
-    let (mut client, _, _) = setup_server(bucket, guid).await;
+    let (mut client, _, _) = setup_client(bucket, guid).await;
 
     let max = 1000;
     let begin = Instant::now();
@@ -203,60 +203,9 @@ async fn do_read(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn do_free_client(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
-    let guid = PoolGUID(1234);
-
-    let mut client = Client::connect().await;
-
-    client.open_pool(&bucket.name(), guid).await;
-
-    let nvl = client.get_next_response().await;
-    let mut next_txg = TXG(nvl.lookup_uint64("next txg").unwrap());
-    let mut next_block = BlockID(nvl.lookup_uint64("next block").unwrap());
-
-    // write some blocks, which we will then free some of
-
-    client.begin_txg(guid, next_txg).await;
-    next_txg = TXG(next_txg.0 + 1);
-
-    let num_writes: usize = 10000;
-    let task = client.get_responses_initiate(num_writes);
-    let mut ids = Vec::new();
-
-    for _ in 0..num_writes {
-        let mut data: Vec<u8> = Vec::new();
-        let mut rng = thread_rng();
-        let len = rng.gen::<u32>() % 100;
-        for _ in 0..len {
-            data.push(rng.gen());
-        }
-        //println!("requesting write of {}B", len);
-        client.write_block(guid, next_block, &data).await;
-        //println!("writing {}B to {:?}...", len, id);
-        ids.push(next_block);
-        next_block = BlockID(next_block.0 + 1);
-    }
-    client.flush_writes(guid).await;
-    client.get_responses_join(task).await;
-
-    client.end_txg(guid, &[]).await;
-    client.get_next_response().await;
-
-    // free half the blocks, randomly selected
-    client.begin_txg(guid, next_txg).await;
-
-    for i in rand::seq::index::sample(&mut thread_rng(), ids.len(), ids.len() / 2) {
-        client.free_block(guid, ids[i]).await;
-    }
-    client.end_txg(guid, &[]).await;
-    client.get_next_response().await;
-
-    Ok(())
-}
-
 async fn do_free(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
     let guid = PoolGUID(1234);
-    let (mut client, mut next_txg, mut next_block) = setup_server(bucket, guid).await;
+    let (mut client, mut next_txg, mut next_block) = setup_client(bucket, guid).await;
 
     // write some blocks, which we will then free some of
 
@@ -417,7 +366,6 @@ async fn main() {
         "write" => do_write(&bucket).await.unwrap(),
         "read" => do_read(&bucket).await.unwrap(),
         "free" => do_free(&bucket).await.unwrap(),
-        "free_client" => do_free_client(&bucket).await.unwrap(),
         "btree" => do_btree(),
         "nvpair" => do_nvpair(),
         "server" => do_server().await,
