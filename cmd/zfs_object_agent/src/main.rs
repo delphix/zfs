@@ -329,7 +329,7 @@ fn do_nvpair() {
 async fn do_server() {
     let socket_name = std::env::args()
         .nth(2)
-        .unwrap_or("/tmp/zfs_socket".to_string());
+        .unwrap_or("/run/zfs_socket".to_string());
 
     let listener = UnixListener::bind(&socket_name).unwrap();
     println!("Listening on: {}", socket_name);

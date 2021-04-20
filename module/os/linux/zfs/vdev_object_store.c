@@ -117,7 +117,7 @@ zfs_object_store_open(char *bucket_name, int mode, struct socket **sock)
 	rc = s->ops->connect(s, (struct sockaddr *)&zfs_socket,
 	    sizeof (zfs_socket), 0);
 	if (rc != 0) {
-		zfs_dbgmsg("zfs_object_store_opne failed to connect: %d", rc);
+		zfs_dbgmsg("zfs_object_store_open failed to connect: %d", rc);
 		sock_release(s);
 		s = NULL;
 		return (rc);
