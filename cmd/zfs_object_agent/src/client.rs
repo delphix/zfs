@@ -25,7 +25,7 @@ impl Client {
     }
 
     async fn get_next_response_impl(input: &mut OwnedReadHalf) -> NvList {
-        let len64 = input.read_u64().await.unwrap();
+        let len64 = input.read_u64_le().await.unwrap();
         let mut v = Vec::new();
         v.resize(len64 as usize, 0);
         input.read_exact(v.as_mut()).await.unwrap();
@@ -58,7 +58,7 @@ impl Client {
     async fn send_request(&mut self, nvl: &NvListRef) {
         println!("sending request: {:?}", nvl);
         let buf = nvl.pack(NvEncoding::Native).unwrap();
-        self.output.write_u64(buf.len() as u64).await.unwrap();
+        self.output.write_u64_le(buf.len() as u64).await.unwrap();
         self.output.write_all(buf.as_ref()).await.unwrap();
     }
 

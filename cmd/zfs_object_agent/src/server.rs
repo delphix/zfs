@@ -20,7 +20,7 @@ pub struct Server {
 
 impl Server {
     async fn get_next_request(pipe: &mut OwnedReadHalf) -> tokio::io::Result<NvList> {
-        let len64 = pipe.read_u64().await?;
+        let len64 = pipe.read_u64_le().await?;
         let mut v = Vec::new();
         v.resize(len64 as usize, 0);
         pipe.read_exact(v.as_mut()).await?;
@@ -118,7 +118,7 @@ impl Server {
         drop(nvl);
         let len64 = buf.len() as u64;
         let mut w = output.lock().await;
-        w.write(&len64.to_be_bytes()).await.unwrap();
+        w.write_u64_le(len64).await.unwrap();
         w.write(buf.as_slice()).await.unwrap();
     }
 
