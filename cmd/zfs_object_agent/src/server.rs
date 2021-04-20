@@ -19,14 +19,14 @@ pub struct Server {
 }
 
 impl Server {
-    async fn get_next_request(pipe: &mut OwnedReadHalf) -> NvList {
-        let len64 = pipe.read_u64().await.unwrap();
+    async fn get_next_request(pipe: &mut OwnedReadHalf) -> tokio::io::Result<NvList> {
+        let len64 = pipe.read_u64().await?;
         let mut v = Vec::new();
         v.resize(len64 as usize, 0);
-        pipe.read_exact(v.as_mut()).await.unwrap();
+        pipe.read_exact(v.as_mut()).await?;
         let nvl = NvList::try_unpack(v.as_ref()).unwrap();
         println!("got request: {:?}", nvl);
-        nvl
+        Ok(nvl)
     }
 
     pub fn start(connection: UnixStream) {
@@ -38,7 +38,12 @@ impl Server {
         };
         tokio::spawn(async move {
             loop {
-                let nvl = Self::get_next_request(&mut server.input).await;
+                let result = Self::get_next_request(&mut server.input).await;
+                if result.is_err() {
+                    println!("got error reading from connection: {:?}", result);
+                    return;
+                }
+                let nvl = result.unwrap();
                 let type_name = nvl.lookup_string("Type").unwrap();
                 match type_name.to_str().unwrap() {
                     "create pool" => {
