@@ -96,6 +96,7 @@ impl Client {
         nvl.insert("Type", "read block").unwrap();
         nvl.insert("GUID", &guid.0).unwrap();
         nvl.insert("block", &block.0).unwrap();
+        nvl.insert("request_id", &1234u64).unwrap();
         self.send_request(nvl.as_ref()).await;
     }
 

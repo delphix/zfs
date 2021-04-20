@@ -98,7 +98,8 @@ impl Server {
                     "read block" => {
                         let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
                         let block = BlockID(nvl.lookup_uint64("block").unwrap());
-                        server.read_block(guid, block);
+                        let id = nvl.lookup_uint64("request_id").unwrap();
+                        server.read_block(guid, block, id);
                     }
                     _ => panic!("bad type {:?}", type_name),
                 }
@@ -198,7 +199,7 @@ impl Server {
     }
 
     /// initiate read, sends response when completed.  Does not block.
-    fn read_block(&mut self, guid: PoolGUID, block: BlockID) {
+    fn read_block(&mut self, guid: PoolGUID, block: BlockID, request_id: u64) {
         let mut pools = self.pools.lock().unwrap();
         let pool = pools.get_mut(&guid).unwrap();
         let arc = self.output.clone();
@@ -208,6 +209,7 @@ impl Server {
             nvl.insert("GUID", &guid.0).unwrap();
             nvl.insert("BlockID", &block.0).unwrap();
             nvl.insert("data", data.as_slice()).unwrap();
+            nvl.insert("request_id", &request_id).unwrap();
             Self::send_response(arc, nvl)
         });
     }
