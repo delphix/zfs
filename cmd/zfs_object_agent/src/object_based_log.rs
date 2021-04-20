@@ -200,6 +200,12 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         }
     }
 
+    pub async fn clear(&mut self, pool: &PoolSharedState) {
+        self.flush(pool).await;
+        self.generation += 1;
+        self.num_chunks = 0;
+    }
+
     /*
     pub async fn read_serial(&self) -> Vec<T> {
         let mut entries = Vec::new();
