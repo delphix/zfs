@@ -40,10 +40,26 @@
  * Virtual device vector for object storage.
  */
 
-#define	VDEV_OBJECT_STORE_REQUEST	"vdev_object_store_request"
-#define	VDEV_OBJECT_STORE_SIZE		"vdev_object_store_size"
-#define	VDEV_OBJECT_STORE_BLKID		"vdev_object_store_blkid"
-#define	VDEV_OBJECT_STORE_DATA		"vdev_object_store_date"
+/*
+ * Possible keys in nvlist requests / responses to/from the Agent
+ */
+#define	AGENT_TYPE		"Type"
+#define	AGENT_TYPE_CREATE_POOL		"create pool"
+#define	AGENT_TYPE_OPEN_POOL		"open pool"
+#define	AGENT_TYPE_OPEN_POOL		"open pool"
+#define	AGENT_TYPE_READ_BLOCK		"read block"
+#define	AGENT_TYPE_WRITE_BLOCK		"write block"
+#define	AGENT_TYPE_FREE_BLOCK		"free block"
+#define	AGENT_TYPE_BEGIN_TXG		"begin txg"
+#define	AGENT_TYPE_END_TXG		"end txg"
+#define	AGENT_TYPE_FLUSH_WRITES		"flush writes"
+#define	AGENT_SIZE		"size"
+#define	AGENT_TXG		"TXG"
+#define	AGENT_GUID		"GUID"
+#define	AGENT_BUCKET		"bucket"
+#define	AGENT_BLKID		"block"
+#define	AGENT_DATA		"data"
+#define	AGENT_REQUEST_ID	"request_id"
 
 /*
  * By default, the logical/physical ashift for object store vdevs is set to
@@ -56,10 +72,14 @@
 unsigned long vdev_object_store_logical_ashift = SPA_MINBLOCKSHIFT;
 unsigned long vdev_object_store_physical_ashift = SPA_MINBLOCKSHIFT;
 
+#define VOS_MAXREQ 100
+
 typedef struct vdev_object_store {
 	char *vos_access_id;
 	char *vos_secrete_key;
 	struct socket *vos_sock;
+	zio_t *vos_outstanding_requests[VOS_MAXREQ];
+	kthread_t *vos_reader;
 } vdev_object_store_t;
 
 static mode_t
@@ -150,12 +170,12 @@ zfs_object_store_request(struct socket *sock, zio_type_t type, void *buf,
 	struct kvec iov = {};
 
 	nvlist_t *nv = fnvlist_alloc();
-	fnvlist_add_uint64(nv, VDEV_OBJECT_STORE_REQUEST, type);
+	fnvlist_add_uint64(nv, AGENT_TYPE, type);
 
 	if (type != ZIO_TYPE_IOCTL) {
-		fnvlist_add_uint64(nv, VDEV_OBJECT_STORE_SIZE, size);
-		fnvlist_add_uint64(nv, VDEV_OBJECT_STORE_BLKID, off);
-		fnvlist_add_uint8_array(nv, VDEV_OBJECT_STORE_DATA,
+		fnvlist_add_uint64(nv, AGENT_SIZE, size);
+		fnvlist_add_uint64(nv, AGENT_BLKID, off);
+		fnvlist_add_uint8_array(nv, AGENT_DATA,
 		    (uint8_t *)buf, size / sizeof (uint8_t));
 	}
 
@@ -175,6 +195,121 @@ zfs_object_store_request(struct socket *sock, zio_type_t type, void *buf,
 	fnvlist_free(nv);
 	fnvlist_pack_free(iov_buf, iov_size);
 	return (0);
+}
+
+static void
+agent_request(vdev_object_store_t *vos, nvlist_t *nv)
+{
+	struct msghdr msg = {};
+	struct kvec iov = {};
+	size_t iov_size = 0;
+	zfs_dbgmsg("sending request to agent type=%s",
+	    fnvlist_lookup_string(nv, AGENT_TYPE));
+	char *iov_buf = fnvlist_pack(nv, &iov_size);
+
+	iov.iov_base = iov_buf;
+	iov.iov_len = iov_size;
+	// XXX need locking on socket?
+	VERIFY0(kernel_sendmsg(vos->vos_sock, &msg, &iov, 1, iov_size));
+
+	fnvlist_pack_free(iov_buf, iov_size);
+}
+
+/*
+ * Send request to agent; returns request ID (index in
+ * vos_outstanding_requests).  nvlist may be modified.
+ */
+static uint64_t
+agent_request_zio(vdev_object_store_t *vos, zio_t *zio, nvlist_t *nv)
+{
+	uint64_t req;
+
+	// XXX need locking on requests array since this could be called concurrently
+	for (req = 0; req < VOS_MAXREQ; req++) {
+		if (vos->vos_outstanding_requests[req] == NULL) {
+			vos->vos_outstanding_requests[req] = zio;
+			break;
+		}
+	}
+	// XXX if all slots are full, need to block and wait for one to complete
+	VERIFY3U(req, <, VOS_MAXREQ);
+	fnvlist_add_uint64(nv, AGENT_REQUEST_ID, req);
+	zio->io_vsd = (void *)(uintptr_t)req;
+	agent_request(vos, nv);
+	return (req);
+}
+
+/*
+ * Send read request to agent; returns request ID (index in
+ * vos_outstanding_requests).
+ */
+static void
+agent_read_block(vdev_object_store_t *vos, zio_t *zio)
+{
+	nvlist_t *nv = fnvlist_alloc();
+	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_READ_BLOCK);
+	fnvlist_add_uint64(nv, AGENT_SIZE, zio->io_size);
+	fnvlist_add_uint64(nv, AGENT_BLKID, zio->io_offset);
+	agent_request_zio(vos, zio, nv);
+}
+
+static void
+agent_open_pool(vdev_t *vd, vdev_object_store_t *vos)
+{
+	nvlist_t *nv = fnvlist_alloc();
+	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_OPEN_POOL);
+	fnvlist_add_uint64(nv, AGENT_GUID, vd->vdev_spa->spa_config_guid);
+	fnvlist_add_string(nv, AGENT_BUCKET, vd->vdev_path);
+	agent_request(vos, nv);
+}
+
+static void
+agent_read_all(vdev_object_store_t *vos, void *buf, size_t len)
+{
+	struct msghdr msg = {};
+	struct kvec iov = {};
+
+	iov.iov_base = buf;
+	iov.iov_len = len;
+
+	// XXX need a loop to keep trying to read?
+	VERIFY3U(kernel_recvmsg(vos->vos_sock, &msg, &iov, 1, len, 0), ==, len);
+}
+
+static void
+agent_reader(void *arg)
+{
+	vdev_object_store_t *vos = arg;
+
+	for (;;) {
+		uint64_t nvlist_len;
+		agent_read_all(vos, &nvlist_len, sizeof (nvlist_len));
+		void *buf = kmem_alloc(nvlist_len, KM_SLEEP);
+		agent_read_all(vos, buf, nvlist_len);
+		nvlist_t *nv = fnvlist_unpack(buf, nvlist_len);
+		kmem_free(buf, nvlist_len);
+
+		const char *type = fnvlist_lookup_string(nv, AGENT_TYPE);
+		zfs_dbgmsg("got response from agent type=%s", type);
+		// XXX debug message the nvlist
+		if (strcmp(type, "pool open done") == 0) {
+
+		} else if (strcmp(type, "read done") == 0) {
+			uint64_t req = fnvlist_lookup_uint64(nv, AGENT_REQUEST_ID);
+			uint_t len;
+			void *data = fnvlist_lookup_uint8_array(nv, AGENT_DATA, &len);
+			VERIFY3U(req, <, VOS_MAXREQ);
+			zio_t *zio = vos->vos_outstanding_requests[req];
+			VERIFY3U((uintptr_t)zio->io_vsd, ==, req);
+			zio->io_vsd = NULL;
+			vos->vos_outstanding_requests[req] = NULL;
+			VERIFY3U(len, ==, zio->io_size);
+			VERIFY3U(len, ==, abd_get_size(zio->io_abd));
+			abd_copy_from_buf(zio->io_abd, data, len);
+			fnvlist_free(nv);
+			zio_delay_interrupt(zio);
+		}
+	}
 }
 
 static int
@@ -246,6 +381,13 @@ vdev_object_store_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	}
 #endif
 
+	vos->vos_reader = thread_create(NULL, 0, agent_reader,
+	    vos, 0, &p0, TS_RUN, defclsyspri);
+
+	agent_open_pool(vd, vos);
+	// XXX wait for response from agent
+	delay(hz * 10);
+
 skip_open:
 
 	*max_psize = *psize = UINT64_MAX; /* XXX Set to max for now */
@@ -287,10 +429,7 @@ vdev_object_store_io_strategy(void *arg)
 	size = zio->io_size;
 
 	if (zio->io_type == ZIO_TYPE_READ) {
-		buf = abd_borrow_buf(zio->io_abd, zio->io_size);
-		err = zfs_object_store_request(vos->vos_sock, zio->io_type, buf,
-		    size, off);
-		abd_return_buf_copy(zio->io_abd, buf, size);
+		agent_read_block(vos, zio);
 	} else {
 		buf = abd_borrow_buf_copy(zio->io_abd, zio->io_size);
 		err = zfs_object_store_request(vos->vos_sock, zio->io_type, buf,
@@ -302,7 +441,7 @@ vdev_object_store_io_strategy(void *arg)
 	if (zio->io_error == 0)
 		zio->io_error = SET_ERROR(ENOSPC);
 
-	zio_delay_interrupt(zio);
+	//zio_delay_interrupt(zio);
 }
 
 static void
