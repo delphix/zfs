@@ -226,6 +226,9 @@ static vdev_ops_t *vdev_ops_table[] = {
 	&vdev_missing_ops,
 	&vdev_hole_ops,
 	&vdev_indirect_ops,
+#ifdef _KERNEL
+	&vdev_object_storage_ops,
+#endif
 	NULL
 };
 
