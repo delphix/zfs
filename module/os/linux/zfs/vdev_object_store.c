@@ -515,7 +515,7 @@ vdev_ops_t vdev_object_storage_ops = {
 	.vdev_op_config_generate = NULL,
 	.vdev_op_nparity = NULL,
 	.vdev_op_ndisks = NULL,
-	.vdev_op_type = VDEV_TYPE_OBJECT_STORE,		/* name of this vdev type */
+	.vdev_op_type = VDEV_TYPE_OBJSTORE,		/* name of this vdev type */
 	.vdev_op_leaf = B_TRUE			/* leaf vdev */
 };
 
