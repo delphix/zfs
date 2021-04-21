@@ -146,7 +146,7 @@ impl Server {
         let output = self.output.clone();
         tokio::spawn(async move {
             let pool = Pool::open(&mybuck, guid).await;
-            let last_txg = pool.state.last_txg;
+            let last_txg = pool.last_txg();
             let next_block = pool.next_block();
             pools.lock().unwrap().insert(guid, pool);
             let mut nvl = NvList::new_unique_names();

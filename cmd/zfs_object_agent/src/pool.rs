@@ -205,8 +205,7 @@ impl DataObjectPhys {
 
 #[derive(Debug)]
 pub struct Pool {
-    // XXX use accessor rather than pub?
-    pub state: PoolSharedState,
+    state: PoolSharedState,
     syncing_state: Arc<tokio::sync::Mutex<PoolSyncingState>>,
     objects: Arc<std::sync::RwLock<BTreeMap<BlockID, ObjectID>>>,
     stats: PoolStatsPhys,
@@ -757,5 +756,9 @@ impl Pool {
         self.stats.pending_frees_count += 1;
         // XXX make caller pass in size of block?
         //self.stats.pending_frees_bytes += size;
+    }
+
+    pub fn last_txg(&self) -> TXG {
+        self.state.last_txg
     }
 }

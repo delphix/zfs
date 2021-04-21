@@ -53,6 +53,7 @@
 #define	AGENT_TYPE_BEGIN_TXG		"begin txg"
 #define	AGENT_TYPE_END_TXG		"end txg"
 #define	AGENT_TYPE_FLUSH_WRITES		"flush writes"
+#define	AGENT_NAME		"name"
 #define	AGENT_SIZE		"size"
 #define	AGENT_TXG		"TXG"
 #define	AGENT_GUID		"GUID"
@@ -219,6 +220,21 @@ agent_write_block(vdev_object_store_t *vos, zio_t *zio)
 }
 
 static void
+agent_create_pool(vdev_t *vd, vdev_object_store_t *vos)
+{
+	nvlist_t *nv = fnvlist_alloc();
+	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_CREATE_POOL);
+	fnvlist_add_string(nv, AGENT_NAME, spa_name(vd->vdev_spa));
+	fnvlist_add_uint64(nv, AGENT_GUID, spa_guid(vd->vdev_spa));
+	fnvlist_add_string(nv, AGENT_BUCKET, vd->vdev_path);
+	zfs_dbgmsg("agent_create_pool(guid=%llu name=%s bucket=%s)",
+	    spa_guid(vd->vdev_spa),
+	    spa_name(vd->vdev_spa),
+	    vd->vdev_path);
+	agent_request(vos, nv);
+}
+
+static void
 agent_open_pool(vdev_t *vd, vdev_object_store_t *vos)
 {
 	nvlist_t *nv = fnvlist_alloc();
@@ -352,7 +368,11 @@ vdev_object_store_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	vos->vos_reader = thread_create(NULL, 0, agent_reader,
 	    vos, 0, &p0, TS_RUN, defclsyspri);
 
-	agent_open_pool(vd, vos);
+	if (vd->vdev_spa->spa_load_state == SPA_LOAD_CREATE) {
+		agent_create_pool(vd, vos);
+	} else {
+		agent_open_pool(vd, vos);
+	}
 	// XXX wait for response from agent
 	delay(hz * 10);
 
