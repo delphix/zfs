@@ -4952,9 +4952,8 @@ zpool_get_objstore_credentials(libzfs_handle_t *hdl, nvlist_t *props,
 		return (err);
 	}
 
-	fnvlist_remove(props, zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS));
 	fnvlist_add_string(props,
-	    zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), creds_buf);
+	    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, creds_buf);
 	free(creds_buf);
 	
 	return (err);

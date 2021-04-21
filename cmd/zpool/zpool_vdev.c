@@ -278,7 +278,7 @@ make_objstore_vdev(nvlist_t *props, const char *arg)
 	    endpoint);
 
 	if ((nvlist_lookup_string(props,
-	    zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), &creds)) != 0) {
+	    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, &creds)) != 0) {
 		fprintf(stderr, gettext("No credentials location provided for "
 		    "objstore vdev %s\n"), arg);
 		fnvlist_free(vdev);
