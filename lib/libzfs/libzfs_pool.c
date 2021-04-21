@@ -4936,3 +4936,22 @@ zpool_load_compat(const char *compat, boolean_t *features, char *report,
 		strlcpy(report, gettext("compatibility set ok"), rlen);
 	return (ZPOOL_COMPATIBILITY_OK);
 }
+
+int
+zpool_get_objstore_credentials(libzfs_handle_t *hdl, nvlist_t *props, char *creds)
+{
+	char *creds_buf;
+	size_t creds_len;
+	int err = get_key_material(hdl, B_FALSE, B_FALSE,
+	    ZFS_KEYFORMAT_PASSPHRASE, creds, NULL, (uint8_t **)&creds_buf,
+	    &creds_len, NULL);
+	if (err != 0)
+		return (err);
+
+	fnvlist_remove(props, zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS));
+	fnvlist_add_string(props,
+	    zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), creds_buf);
+	free(creds_buf);
+	
+	return (err);
+}

@@ -332,6 +332,7 @@ extern int zpool_props_refresh(zpool_handle_t *);
 
 extern const char *zpool_prop_to_name(zpool_prop_t);
 extern const char *zpool_prop_values(zpool_prop_t);
+extern int zpool_get_objstore_credentials(libzfs_handle_t *, nvlist_t *, char *);
 
 /*
  * Pool health statistics.

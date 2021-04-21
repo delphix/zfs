@@ -98,6 +98,9 @@ zfs_prop_parse_keylocation(libzfs_handle_t *restrict hdl, const char *str,
 	if (strcmp("prompt", str) == 0) {
 		*locp = ZFS_KEYLOCATION_PROMPT;
 		return (0);
+	} else if (strcmp("environment", str) == 0) {
+		*locp = ZFS_KEYLOCATION_ENVIRONMENT;
+		return (0);
 	}
 
 	regmatch_t pmatch[2];
@@ -489,7 +492,7 @@ get_key_material_file(libzfs_handle_t *hdl, const char *uri,
  * to B_TRUE if the user is providing the key material interactively, allowing
  * for re-entry attempts.
  */
-static int
+int
 get_key_material(libzfs_handle_t *hdl, boolean_t do_verify, boolean_t newkey,
     zfs_keyformat_t keyformat, char *keylocation, const char *fsname,
     uint8_t **km_out, size_t *kmlen_out, boolean_t *can_retry_out)
@@ -547,6 +550,9 @@ get_key_material(libzfs_handle_t *hdl, boolean_t do_verify, boolean_t newkey,
 		}
 
 		break;
+	case ZFS_KEYLOCATION_ENVIRONMENT:
+		// TODO
+		break;
 	default:
 		ret = EINVAL;
 		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
@@ -554,6 +560,7 @@ get_key_material(libzfs_handle_t *hdl, boolean_t do_verify, boolean_t newkey,
 		goto error;
 	}
 
+	/* TODO: Ideally we wouldn't do this for the objstore case */
 	if ((ret = validate_key(hdl, keyformat, (const char *)km, kmlen)) != 0)
 		goto error;
 

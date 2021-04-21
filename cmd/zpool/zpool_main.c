@@ -1548,6 +1548,13 @@ zpool_do_create(int argc, char **argv)
 		goto errout;
 	}
 
+	char *creds;
+	if ((nvlist_lookup_string(props,
+	    zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), &creds)) == 0) {
+		if (zpool_get_objstore_credentials(g_zfs, props, creds) != 0)
+			goto errout;
+	}
+
 	/* pass off to make_root_vdev for bulk processing */
 	nvroot = make_root_vdev(NULL, props, force, !force, B_FALSE, dryrun,
 	    argc - 1, argv + 1);
