@@ -73,9 +73,8 @@ async fn do_obl(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
         bucket: bucket.clone(),
         guid: fake_guid,
         name: "obltest".to_string(),
-        last_txg: TXG(0),
-        syncing_txg: None,
     };
+    let fake_txg = TXG(1);
 
     println!("{:#?}", obl);
 
@@ -90,7 +89,7 @@ async fn do_obl(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
     println!("read {} entries", entries.len());
 
     let mut bt = BTreeMap::new();
-    let mut i = 0;
+    let mut i: i32 = 0;
     let begin = Instant::now();
     //for ent in &obl {
     for ent in obl.read().await {
@@ -107,9 +106,13 @@ async fn do_obl(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
 
     //obl.append(5u32);
     for _ in 1..1500000 {
-        obl.append(&fake_state, MyEntry(subsec_nanos().try_into().unwrap()));
+        obl.append(
+            &fake_state,
+            fake_txg,
+            MyEntry(subsec_nanos().try_into().unwrap()),
+        );
     }
-    obl.flush(&fake_state).await;
+    obl.flush(&fake_state, fake_txg).await;
 
     Ok(())
 }

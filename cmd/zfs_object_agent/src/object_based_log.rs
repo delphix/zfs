@@ -154,21 +154,22 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         }
     }
 
-    pub fn append(&mut self, pool: &PoolSharedState, value: T) {
+    pub fn append(&mut self, pool: &PoolSharedState, txg: TXG, value: T) {
         assert!(self.recovered);
+        // XXX assert that txg is the same as the txg for the other pending entries?
         self.pending_entries.push(value);
         // XXX should be based on chunk size (bytes)
         if self.pending_entries.len() > 1000 {
-            self.initiate_flush(pool);
+            self.initiate_flush(pool, txg);
         }
     }
 
-    pub fn initiate_flush(&mut self, pool: &PoolSharedState) {
+    pub fn initiate_flush(&mut self, pool: &PoolSharedState, txg: TXG) {
         assert!(self.recovered);
 
         let chunk = ObjectBasedLogChunk {
             guid: pool.guid,
-            txg: pool.syncing_txg.unwrap(),
+            txg: txg,
             generation: self.generation,
             chunk: self.num_chunks,
             entries: self.pending_entries.split_off(0),
@@ -189,9 +190,9 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         self.num_chunks += 1;
     }
 
-    pub async fn flush(&mut self, pool: &PoolSharedState) {
+    pub async fn flush(&mut self, pool: &PoolSharedState, txg: TXG) {
         if !self.pending_entries.is_empty() {
-            self.initiate_flush(pool);
+            self.initiate_flush(pool, txg);
         }
         let wait_for = self.pending_flushes.split_off(0);
         let join_result = join_all(wait_for).await;
@@ -200,8 +201,8 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         }
     }
 
-    pub async fn clear(&mut self, pool: &PoolSharedState) {
-        self.flush(pool).await;
+    pub async fn clear(&mut self, pool: &PoolSharedState, txg: TXG) {
+        self.flush(pool, txg).await;
         self.generation += 1;
         self.num_chunks = 0;
     }
