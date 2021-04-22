@@ -310,7 +310,6 @@ impl Pool {
             }),
         };
 
-        //let arc = pool.state.clone();
         let mut syncing_state = pool.state.syncing_state.lock().await;
 
         syncing_state.storage_object_log.recover().await;
@@ -318,28 +317,24 @@ impl Pool {
 
         // load block -> object mapping
         let begin = Instant::now();
-        //let mut objects = BTreeMap::new();
-        let objects = &pool.state.objects;
+        let objects_rwlock = &pool.state.objects;
         syncing_state
             .storage_object_log
             .iterate()
             .for_each(|ent| {
+                let mut objects = objects_rwlock.write().unwrap();
                 match ent {
                     StorageObjectLogEntry::Alloc {
                         obj,
                         first_possible_block,
                     } => {
-                        objects.write().unwrap().insert(first_possible_block, obj);
+                        objects.insert(first_possible_block, obj);
                     }
                     StorageObjectLogEntry::Free {
                         obj,
                         first_possible_block,
                     } => {
-                        let (_, removed_obj) = objects
-                            .write()
-                            .unwrap()
-                            .remove_entry(&first_possible_block)
-                            .unwrap();
+                        let (_, removed_obj) = objects.remove_entry(&first_possible_block).unwrap();
                         assert_eq!(removed_obj, obj);
                     }
                 }
@@ -349,13 +344,13 @@ impl Pool {
             .await;
         println!(
             "loaded mapping for {} objects in {}ms",
-            objects.write().unwrap().len(),
+            objects_rwlock.write().unwrap().len(),
             begin.elapsed().as_millis()
         );
 
         // verify that object ID's are increasing as block ID's are increasing
         let mut max_obj = ObjectID(0);
-        for v in objects.write().unwrap().values() {
+        for v in objects_rwlock.write().unwrap().values() {
             assert!(*v > max_obj);
             max_obj = *v;
         }
@@ -670,9 +665,10 @@ impl Pool {
         //self.stats.objects_bytes += XXX;
 
         // write to object store
-        let bucket = self.state.readonly_state.bucket.clone();
+        let readonly_state = self.state.readonly_state.clone();
+
         let handle = tokio::spawn(async move {
-            old_po.phys.put(&bucket).await;
+            old_po.phys.put(&readonly_state.bucket).await;
             old_po.done.close();
         });
         syncing_state.pending_flushes.push(handle);
@@ -756,12 +752,11 @@ impl Pool {
         F: Future + Send + 'static,
     {
         let obj = Self::block_to_object(&self.state.objects.read().unwrap(), id);
-        let bucket = self.state.readonly_state.bucket.clone();
-        let guid = self.state.readonly_state.guid;
+        let readonly_state = self.state.readonly_state.clone();
 
         tokio::spawn(async move {
             println!("reading {:?} for {:?}", obj, id);
-            let block = DataObjectPhys::get(&bucket, guid, obj).await;
+            let block = DataObjectPhys::get(&readonly_state.bucket, readonly_state.guid, obj).await;
             // XXX add block to a small cache
             if block.blocks.get(&id).is_none() {
                 //println!("{:#?}", self.objects);
