@@ -8,6 +8,7 @@ use futures_core::Stream;
 use s3::bucket::Bucket;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::JoinHandle;
 
@@ -70,7 +71,7 @@ pub struct ObjectBasedLog<T: ObjectBasedLogEntry> {
     // XXX maybe the bucket should not be in here; instead the caller should
     // always provide it by passing in the PoolSharedState. That way the
     // lifetime stuff (for this and Pool) is less complicated.
-    bucket: Bucket,
+    pool: Arc<PoolSharedState>,
     name: String,
     generation: u64,
     num_chunks: u64,
@@ -80,9 +81,9 @@ pub struct ObjectBasedLog<T: ObjectBasedLogEntry> {
 }
 
 impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
-    pub fn create(bucket: &Bucket, name: &str) -> ObjectBasedLog<T> {
+    pub fn create(pool: Arc<PoolSharedState>, name: &str) -> ObjectBasedLog<T> {
         ObjectBasedLog {
-            bucket: bucket.clone(),
+            pool,
             name: name.to_string(),
             generation: 0,
             num_chunks: 0,
@@ -93,12 +94,12 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
     }
 
     pub fn open_by_phys(
-        bucket: &Bucket,
+        pool: Arc<PoolSharedState>,
         name: &str,
         phys: &ObjectBasedLogPhys,
     ) -> ObjectBasedLog<T> {
         ObjectBasedLog {
-            bucket: bucket.clone(),
+            pool,
             name: name.to_string(),
             generation: phys.generation,
             num_chunks: phys.num_chunks,
@@ -125,8 +126,8 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         // Delete any chunks past the logical end of the log
         for c in self.num_chunks.. {
             let key = &format!("{}/{}/{}", self.name, self.generation, c);
-            if object_access::object_exists(&self.bucket, &key).await {
-                object_access::delete_object(&self.bucket, &key).await;
+            if object_access::object_exists(&self.pool.bucket, &key).await {
+                object_access::delete_object(&self.pool.bucket, &key).await;
             } else {
                 break;
             }
@@ -135,8 +136,8 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         // Delete the partially-complete generation (if present)
         for c in 0.. {
             let key = &format!("{}/{}/{}", self.name, self.generation + 1, c);
-            if object_access::object_exists(&self.bucket, key).await {
-                object_access::delete_object(&self.bucket, key).await;
+            if object_access::object_exists(&self.pool.bucket, key).await {
+                object_access::delete_object(&self.pool.bucket, key).await;
             } else {
                 break;
             }
@@ -154,22 +155,22 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         }
     }
 
-    pub fn append(&mut self, pool: &PoolSharedState, txg: TXG, value: T) {
+    pub fn append(&mut self, txg: TXG, value: T) {
         assert!(self.recovered);
         // XXX assert that txg is the same as the txg for the other pending entries?
         self.pending_entries.push(value);
         // XXX should be based on chunk size (bytes)
         if self.pending_entries.len() > 1000 {
-            self.initiate_flush(pool, txg);
+            self.initiate_flush(txg);
         }
     }
 
-    pub fn initiate_flush(&mut self, pool: &PoolSharedState, txg: TXG) {
+    pub fn initiate_flush(&mut self, txg: TXG) {
         assert!(self.recovered);
 
         let chunk = ObjectBasedLogChunk {
-            guid: pool.guid,
-            txg: txg,
+            guid: self.pool.guid,
+            txg,
             generation: self.generation,
             chunk: self.num_chunks,
             entries: self.pending_entries.split_off(0),
@@ -177,12 +178,12 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
 
         // XXX cloning bucket/name, would be nice if we could find a way to
         // reference them from the spawned task
-        let bucket = pool.bucket.clone();
+        let pool = self.pool.clone();
         let name = self.name.clone();
         let generation = self.generation;
         let num_chunks = self.num_chunks;
         let handle = tokio::spawn(async move {
-            chunk.put(&bucket, &name, generation, num_chunks).await;
+            chunk.put(&pool.bucket, &name, generation, num_chunks).await;
         });
         self.pending_flushes.push(handle);
 
@@ -190,9 +191,9 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         self.num_chunks += 1;
     }
 
-    pub async fn flush(&mut self, pool: &PoolSharedState, txg: TXG) {
+    pub async fn flush(&mut self, txg: TXG) {
         if !self.pending_entries.is_empty() {
-            self.initiate_flush(pool, txg);
+            self.initiate_flush(txg);
         }
         let wait_for = self.pending_flushes.split_off(0);
         let join_result = join_all(wait_for).await;
@@ -201,8 +202,8 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         }
     }
 
-    pub async fn clear(&mut self, pool: &PoolSharedState, txg: TXG) {
-        self.flush(pool, txg).await;
+    pub async fn clear(&mut self, txg: TXG) {
+        self.flush(txg).await;
         self.generation += 1;
         self.num_chunks = 0;
     }
@@ -225,7 +226,8 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
     pub async fn read(&self) -> Vec<T> {
         let mut stream = FuturesOrdered::new();
         for chunk in 0..self.num_chunks {
-            let fut = ObjectBasedLogChunk::get(&self.bucket, &self.name, self.generation, chunk);
+            let fut =
+                ObjectBasedLogChunk::get(&self.pool.bucket, &self.name, self.generation, chunk);
             stream.push(fut);
         }
         let mut entries = Vec::new();
@@ -251,10 +253,10 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         let mut stream = FuturesOrdered::new();
         let generation = self.generation;
         for chunk in 0..self.num_chunks {
-            let b = self.bucket.clone();
+            let pool = self.pool.clone();
             let n = self.name.clone();
             let fut2 = async move {
-                async move { ObjectBasedLogChunk::get(&b, &n, generation, chunk).await }
+                async move { ObjectBasedLogChunk::get(&pool.bucket, &n, generation, chunk).await }
             };
             stream.push(fut2);
         }

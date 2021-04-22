@@ -16,6 +16,7 @@ use std::fs;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::Read;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UnixListener;
 mod client;
@@ -67,13 +68,13 @@ impl ObjectBasedLogEntry for MyEntry {}
 
 async fn do_obl(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
     let obl_name = "mahrens/obl";
-    let mut obl: ObjectBasedLog<MyEntry> = ObjectBasedLog::create(&bucket, obl_name);
     let fake_guid = PoolGUID(1234);
     let fake_state = PoolSharedState {
         bucket: bucket.clone(),
         guid: fake_guid,
         name: "obltest".to_string(),
     };
+    let mut obl: ObjectBasedLog<MyEntry> = ObjectBasedLog::create(Arc::new(fake_state), obl_name);
     let fake_txg = TXG(1);
 
     println!("{:#?}", obl);
@@ -106,13 +107,9 @@ async fn do_obl(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
 
     //obl.append(5u32);
     for _ in 1..1500000 {
-        obl.append(
-            &fake_state,
-            fake_txg,
-            MyEntry(subsec_nanos().try_into().unwrap()),
-        );
+        obl.append(fake_txg, MyEntry(subsec_nanos().try_into().unwrap()));
     }
-    obl.flush(&fake_state, fake_txg).await;
+    obl.flush(fake_txg).await;
 
     Ok(())
 }

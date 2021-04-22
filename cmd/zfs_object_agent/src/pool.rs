@@ -224,7 +224,7 @@ pub struct PoolState {
     syncing_state: tokio::sync::Mutex<PoolSyncingState>,
 
     objects: std::sync::RwLock<BTreeMap<BlockID, ObjectID>>,
-    pub readonly_state: PoolSharedState,
+    pub readonly_state: Arc<PoolSharedState>,
 }
 
 /// state that's modified while syncing a txg
@@ -279,23 +279,24 @@ impl Pool {
     ) -> (Pool, TXG, BlockID) {
         let phys = UberblockPhys::get(bucket, pool_phys.guid, txg).await;
 
+        let readonly_state = Arc::new(PoolSharedState {
+            bucket: bucket.clone(),
+            guid: pool_phys.guid,
+            name: pool_phys.name.clone(),
+        });
         let pool = Pool {
             state: Arc::new(PoolState {
-                readonly_state: PoolSharedState {
-                    bucket: bucket.clone(),
-                    guid: pool_phys.guid,
-                    name: pool_phys.name.clone(),
-                },
+                readonly_state: readonly_state.clone(),
                 syncing_state: tokio::sync::Mutex::new(PoolSyncingState {
                     last_txg: phys.txg,
                     syncing_txg: None,
                     storage_object_log: ObjectBasedLog::open_by_phys(
-                        &bucket,
+                        readonly_state.clone(),
                         &format!("zfs/{}/StorageObjectLog", pool_phys.guid),
                         &phys.storage_object_log,
                     ),
                     pending_frees_log: ObjectBasedLog::open_by_phys(
-                        &bucket,
+                        readonly_state.clone(),
                         &format!("zfs/{}/PendingFreesLog", pool_phys.guid),
                         &phys.pending_frees_log,
                     ),
@@ -392,22 +393,23 @@ impl Pool {
     pub async fn open(bucket: &Bucket, guid: PoolGUID) -> (Pool, TXG, BlockID) {
         let phys = PoolPhys::get(bucket, guid).await;
         if phys.last_txg.0 == 0 {
+            let readonly_state = Arc::new(PoolSharedState {
+                bucket: bucket.clone(),
+                guid,
+                name: phys.name,
+            });
             let pool = Pool {
                 state: Arc::new(PoolState {
-                    readonly_state: PoolSharedState {
-                        bucket: bucket.clone(),
-                        guid,
-                        name: phys.name,
-                    },
+                    readonly_state: readonly_state.clone(),
                     syncing_state: tokio::sync::Mutex::new(PoolSyncingState {
                         last_txg: TXG(0),
                         syncing_txg: None,
                         storage_object_log: ObjectBasedLog::create(
-                            bucket,
+                            readonly_state.clone(),
                             &format!("zfs/{}/StorageObjectLog", guid),
                         ),
                         pending_frees_log: ObjectBasedLog::create(
-                            bucket,
+                            readonly_state.clone(),
                             &format!("zfs/{}/PendingFreesLog", guid),
                         ),
                         pending_object: None,
@@ -527,10 +529,7 @@ impl Pool {
 
         // clear log of frees
         let txg = syncing_state.syncing_txg.unwrap();
-        syncing_state
-            .pending_frees_log
-            .clear(shared_state, txg)
-            .await;
+        syncing_state.pending_frees_log.clear(txg).await;
     }
 
     pub fn end_txg_cb<F>(&mut self, uberblock: Vec<u8>, cb: F)
@@ -545,14 +544,8 @@ impl Pool {
             let mut syncing_state = state.syncing_state.try_lock().unwrap();
             let txg = syncing_state.syncing_txg.unwrap();
             Self::wait_for_pending_flushes(&mut syncing_state).await;
-            syncing_state
-                .storage_object_log
-                .flush(&state.readonly_state, txg)
-                .await;
-            syncing_state
-                .pending_frees_log
-                .flush(&state.readonly_state, txg)
-                .await;
+            syncing_state.storage_object_log.flush(txg).await;
+            syncing_state.pending_frees_log.flush(txg).await;
 
             // XXX change this to be based on bytes, once those stats are working?
             // XXX make this tunable?
@@ -689,7 +682,6 @@ impl Pool {
 
         // log to on-disk block->object map
         syncing_state.storage_object_log.append(
-            &self.state.readonly_state,
             txg,
             StorageObjectLogEntry::Alloc {
                 first_possible_block: min_block,
@@ -788,11 +780,9 @@ impl Pool {
 
         let txg = syncing_state.syncing_txg.unwrap();
         assert!(id < syncing_state.pending_object_min_block);
-        syncing_state.pending_frees_log.append(
-            &self.state.readonly_state,
-            txg,
-            PendingFreesLogEntry { block: id },
-        );
+        syncing_state
+            .pending_frees_log
+            .append(txg, PendingFreesLogEntry { block: id });
         syncing_state.stats.pending_frees_count += 1;
         // XXX make caller pass in size of block?
         //self.stats.pending_frees_bytes += size;
