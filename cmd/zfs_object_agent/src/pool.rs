@@ -456,9 +456,9 @@ impl Pool {
         });
     }
 
-    async fn background_free(state: &PoolState) {
+    async fn background_free(state: &PoolState, syncing_state: &mut PoolSyncingState) {
         let shared_state = &state.readonly_state;
-        let mut syncing_state = state.syncing_state.lock().await;
+        //let mut syncing_state = state.syncing_state.lock().await;
 
         // load pending frees
         let begin = Instant::now();
@@ -536,46 +536,49 @@ impl Pool {
         let state = self.state.clone();
 
         tokio::spawn(async move {
-            let mut syncing_state = state.syncing_state.try_lock().unwrap();
-            let txg = syncing_state.syncing_txg.unwrap();
-            Self::wait_for_pending_flushes(&mut syncing_state).await;
-            syncing_state.storage_object_log.flush(txg).await;
-            syncing_state.pending_frees_log.flush(txg).await;
-
-            // XXX change this to be based on bytes, once those stats are working?
-            // XXX make this tunable?
-            // XXX do this over many txg's
-            if syncing_state.stats.pending_frees_count > syncing_state.stats.blocks_count / 100
-                || syncing_state.stats.pending_frees_count > 10_000
             {
-                Self::background_free(&state).await;
+                // want to drop syncing_state mutex before sending response (in callback)
+                let mut syncing_state = state.syncing_state.try_lock().unwrap();
+                let txg = syncing_state.syncing_txg.unwrap();
+                Self::wait_for_pending_flushes(&mut syncing_state).await;
+                syncing_state.storage_object_log.flush(txg).await;
+                syncing_state.pending_frees_log.flush(txg).await;
+
+                // XXX change this to be based on bytes, once those stats are working?
+                // XXX make this tunable?
+                // XXX do this over many txg's
+                if syncing_state.stats.pending_frees_count > syncing_state.stats.blocks_count / 100
+                    || syncing_state.stats.pending_frees_count > 10_000
+                {
+                    Self::background_free(&state, &mut *syncing_state).await;
+                }
+
+                // write uberblock
+                let u = UberblockPhys {
+                    guid: state.readonly_state.guid,
+                    txg,
+                    date: SystemTime::now(),
+                    storage_object_log: syncing_state.storage_object_log.to_phys(),
+                    pending_frees_log: syncing_state.pending_frees_log.to_phys(),
+                    highest_block: BlockID(syncing_state.pending_object_min_block.0 - 1),
+                    zfs_uberblock: uberblock,
+                    stats: syncing_state.stats.clone(),
+                };
+                u.put(&state.readonly_state.bucket).await;
+
+                // write super
+                let s = PoolPhys {
+                    guid: state.readonly_state.guid,
+                    name: state.readonly_state.name.clone(),
+                    last_txg: txg,
+                };
+                s.put(&state.readonly_state.bucket).await;
+
+                // update txg
+                syncing_state.last_txg = txg;
+                syncing_state.syncing_txg = None;
+                syncing_state.pending_object = None;
             }
-
-            // write uberblock
-            let u = UberblockPhys {
-                guid: state.readonly_state.guid,
-                txg: txg,
-                date: SystemTime::now(),
-                storage_object_log: syncing_state.storage_object_log.to_phys(),
-                pending_frees_log: syncing_state.pending_frees_log.to_phys(),
-                highest_block: BlockID(syncing_state.pending_object_min_block.0 - 1),
-                zfs_uberblock: uberblock,
-                stats: syncing_state.stats.clone(),
-            };
-            u.put(&state.readonly_state.bucket).await;
-
-            // write super
-            let s = PoolPhys {
-                guid: state.readonly_state.guid,
-                name: state.readonly_state.name.clone(),
-                last_txg: txg,
-            };
-            s.put(&state.readonly_state.bucket).await;
-
-            // update txg
-            syncing_state.last_txg = txg;
-            syncing_state.syncing_txg = None;
-            syncing_state.pending_object = None;
 
             cb.await;
         });
