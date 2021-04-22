@@ -5,7 +5,6 @@ use nvpair::NvList;
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::Region;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -15,7 +14,8 @@ use tokio::sync::Mutex;
 pub struct Server {
     input: OwnedReadHalf,
     output: Arc<tokio::sync::Mutex<OwnedWriteHalf>>,
-    pools: Arc<std::sync::Mutex<HashMap<PoolGUID, Pool>>>,
+    // Pool is Some once we get a "open pool" request
+    pool: Option<Pool>,
 }
 
 impl Server {
@@ -37,7 +37,7 @@ impl Server {
         let mut server = Server {
             input: r,
             output: Arc::new(Mutex::new(w)),
-            pools: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pool: None,
         };
         tokio::spawn(async move {
             loop {
@@ -58,7 +58,9 @@ impl Server {
                         let bucket =
                             Bucket::new(bucket_name.to_str().unwrap(), region, credentials)
                                 .unwrap();
-                        server.create_pool(&bucket, guid, name.to_str().unwrap());
+                        server
+                            .create_pool(&bucket, guid, name.to_str().unwrap())
+                            .await;
                     }
                     "open pool" => {
                         let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
@@ -68,46 +70,40 @@ impl Server {
                         let bucket =
                             Bucket::new(bucket_name.to_str().unwrap(), region, credentials)
                                 .unwrap();
-                        server.open_pool(&bucket, guid);
+                        server.open_pool(&bucket, guid).await;
                     }
                     "begin txg" => {
-                        let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
                         let txg = TXG(nvl.lookup_uint64("TXG").unwrap());
-                        server.begin_txg(guid, txg);
+                        server.begin_txg(txg);
                     }
                     "flush writes" => {
-                        let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
-                        server.flush_writes(guid);
+                        server.flush_writes();
                     }
                     "end txg" => {
-                        let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
                         let data = nvl.lookup("data").unwrap().data();
                         if let NvData::Uint8Array(slice) = data {
-                            server.end_txg(guid, slice.to_vec());
+                            server.end_txg(slice.to_vec());
                         } else {
                             panic!("data not expected type")
                         }
                     }
                     "write block" => {
-                        let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
                         let block = BlockID(nvl.lookup_uint64("block").unwrap());
                         let data = nvl.lookup("data").unwrap().data();
                         if let NvData::Uint8Array(slice) = data {
-                            server.write_block(guid, block, slice.to_vec());
+                            server.write_block(block, slice.to_vec());
                         } else {
                             panic!("data not expected type")
                         }
                     }
                     "free block" => {
-                        let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
                         let block = BlockID(nvl.lookup_uint64("block").unwrap());
-                        server.free_block(guid, block);
+                        server.free_block(block);
                     }
                     "read block" => {
-                        let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
                         let block = BlockID(nvl.lookup_uint64("block").unwrap());
                         let id = nvl.lookup_uint64("request_id").unwrap();
-                        server.read_block(guid, block, id);
+                        server.read_block(block, id);
                     }
                     _ => panic!("bad type {:?}", type_name),
                 }
@@ -115,7 +111,7 @@ impl Server {
         });
     }
 
-    async fn send_response(output: Arc<Mutex<OwnedWriteHalf>>, nvl: NvList) {
+    async fn send_response(output: &Mutex<OwnedWriteHalf>, nvl: NvList) {
         println!("sending response: {:?}", nvl);
         let buf = nvl.pack(NvEncoding::Native).unwrap();
         drop(nvl);
@@ -126,98 +122,76 @@ impl Server {
         w.write(buf.as_slice()).await.unwrap();
     }
 
-    fn create_pool(&mut self, bucket: &Bucket, guid: PoolGUID, name: &str) {
-        let mybuck = bucket.clone();
-        let output = self.output.clone();
-        let my_name = name.to_owned();
-        tokio::spawn(async move {
-            Pool::create(&mybuck, &my_name, guid).await;
-            let mut nvl = NvList::new_unique_names();
-            nvl.insert("Type", "pool create done").unwrap();
-            nvl.insert("GUID", &guid.0).unwrap();
-            Self::send_response(output, nvl).await;
-        });
+    async fn create_pool(&mut self, bucket: &Bucket, guid: PoolGUID, name: &str) {
+        Pool::create(bucket, name, guid).await;
+        let mut nvl = NvList::new_unique_names();
+        nvl.insert("Type", "pool create done").unwrap();
+        nvl.insert("GUID", &guid.0).unwrap();
+        Self::send_response(&self.output, nvl).await;
     }
 
     /// initiate pool opening.  Responds when pool is open
-    fn open_pool(&mut self, bucket: &Bucket, guid: PoolGUID) {
-        let mybuck = bucket.clone();
-        let pools = self.pools.clone();
-        let output = self.output.clone();
-        tokio::spawn(async move {
-            let (pool, last_txg, next_block) = Pool::open(&mybuck, guid).await;
-            pools.lock().unwrap().insert(guid, pool);
-            let mut nvl = NvList::new_unique_names();
-            nvl.insert("Type", "pool open done").unwrap();
-            nvl.insert("GUID", &guid.0).unwrap();
-            nvl.insert("next txg", &(last_txg.0 + 1)).unwrap();
-            nvl.insert("next block", &next_block.0).unwrap();
-            Self::send_response(output, nvl).await;
-        });
+    async fn open_pool(&mut self, bucket: &Bucket, guid: PoolGUID) {
+        let (pool, last_txg, next_block) = Pool::open(bucket, guid).await;
+        self.pool = Some(pool);
+        let mut nvl = NvList::new_unique_names();
+        nvl.insert("Type", "pool open done").unwrap();
+        nvl.insert("GUID", &guid.0).unwrap();
+        nvl.insert("next txg", &(last_txg.0 + 1)).unwrap();
+        nvl.insert("next block", &next_block.0).unwrap();
+        Self::send_response(&self.output, nvl).await;
     }
 
     // no response
-    fn begin_txg(&mut self, guid: PoolGUID, txg: TXG) {
-        let mut pools = self.pools.lock().unwrap();
-        let pool = pools.get_mut(&guid).unwrap();
-        pool.begin_txg(txg);
+    fn begin_txg(&mut self, txg: TXG) {
+        self.pool.as_mut().unwrap().begin_txg(txg);
     }
 
     // no response
-    fn flush_writes(&mut self, guid: PoolGUID) {
-        let mut pools = self.pools.lock().unwrap();
-        let pool = pools.get_mut(&guid).unwrap();
-        pool.initiate_flush_object();
+    fn flush_writes(&mut self) {
+        self.pool.as_mut().unwrap().initiate_flush_object();
     }
 
     // sends response when completed
-    fn end_txg(&mut self, guid: PoolGUID, uberblock: Vec<u8>) {
-        let mut pools = self.pools.lock().unwrap();
-        let pool = pools.get_mut(&guid).unwrap();
+    fn end_txg(&mut self, uberblock: Vec<u8>) {
+        let pool = self.pool.as_mut().unwrap();
         let output = self.output.clone();
         pool.end_txg_cb(uberblock, async move {
             let mut nvl = NvList::new_unique_names();
             nvl.insert("Type", "end txg done").unwrap();
-            nvl.insert("GUID", &guid.0).unwrap();
-            Self::send_response(output, nvl).await;
+            Self::send_response(&output, nvl).await;
         });
     }
 
     /// queue write, sends response when completed (persistent).  Does not block.
     /// completion may not happen until flush_pool() is called
-    fn write_block(&mut self, guid: PoolGUID, block: BlockID, data: Vec<u8>) {
-        let mut pools = self.pools.lock().unwrap();
-        let pool = pools.get_mut(&guid).unwrap();
-        let arc = self.output.clone();
+    fn write_block(&mut self, block: BlockID, data: Vec<u8>) {
+        let pool = self.pool.as_mut().unwrap();
+        let output = self.output.clone();
         pool.write_block_cb(block, data, async move {
             let mut nvl = NvList::new_unique_names();
             nvl.insert("Type", "write done").unwrap();
-            nvl.insert("GUID", &guid.0).unwrap();
             nvl.insert("BlockID", &block.0).unwrap();
-            Self::send_response(arc, nvl).await;
+            Self::send_response(&output, nvl).await;
         });
     }
 
     /// initiate free.  No response.  Does not block.  Completes when the current txg is ended.
-    fn free_block(&mut self, guid: PoolGUID, block: BlockID) {
-        let mut pools = self.pools.lock().unwrap();
-        let pool = pools.get_mut(&guid).unwrap();
-        pool.free_block(block);
+    fn free_block(&mut self, block: BlockID) {
+        self.pool.as_mut().unwrap().free_block(block);
     }
 
     /// initiate read, sends response when completed.  Does not block.
-    fn read_block(&mut self, guid: PoolGUID, block: BlockID, request_id: u64) {
-        let mut pools = self.pools.lock().unwrap();
-        let pool = pools.get_mut(&guid).unwrap();
-        let arc = self.output.clone();
-        pool.read_block_cb(block, move |data| {
+    fn read_block(&mut self, block: BlockID, request_id: u64) {
+        let pool = self.pool.as_mut().unwrap();
+        let output = self.output.clone();
+        pool.read_block_cb(block, move |data| async move {
             let mut nvl = NvList::new_unique_names();
             nvl.insert("Type", "read done").unwrap();
-            nvl.insert("GUID", &guid.0).unwrap();
             nvl.insert("BlockID", &block.0).unwrap();
             nvl.insert("data", data.as_slice()).unwrap();
             nvl.insert("request_id", &request_id).unwrap();
-            Self::send_response(arc, nvl)
+            Self::send_response(&output, nvl).await;
         });
     }
 }
