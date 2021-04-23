@@ -614,6 +614,9 @@ extern vdev_ops_t vdev_spare_ops;
 extern vdev_ops_t vdev_indirect_ops;
 extern vdev_ops_t vdev_object_store_ops;
 
+void object_store_begin_txg(spa_t *, uint64_t);
+
+
 /*
  * Common size functions
  */

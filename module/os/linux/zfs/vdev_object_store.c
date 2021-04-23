@@ -207,6 +207,7 @@ agent_read_block(vdev_object_store_t *vos, zio_t *zio)
 	    spa_guid(zio->io_spa),
 	    zio->io_offset);
 	agent_request_zio(vos, zio, nv);
+	fnvlist_free(nv);
 }
 
 static void
@@ -224,6 +225,7 @@ agent_write_block(vdev_object_store_t *vos, zio_t *zio)
 	    zio->io_offset,
 	    zio->io_size);
 	agent_request_zio(vos, zio, nv);
+	fnvlist_free(nv);
 }
 
 static void
@@ -239,6 +241,7 @@ agent_create_pool(vdev_t *vd, vdev_object_store_t *vos)
 	    spa_name(vd->vdev_spa),
 	    vd->vdev_path);
 	agent_request(vos, nv);
+	fnvlist_free(nv);
 }
 
 static void
@@ -252,6 +255,28 @@ agent_open_pool(vdev_t *vd, vdev_object_store_t *vos)
 	    spa_guid(vd->vdev_spa),
 	    vd->vdev_path);
 	agent_request(vos, nv);
+	fnvlist_free(nv);
+}
+
+static void
+agent_begin_txg(vdev_object_store_t *vos, uint64_t txg)
+{
+	nvlist_t *nv = fnvlist_alloc();
+	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_BEGIN_TXG);
+	fnvlist_add_uint64(nv, AGENT_TXG, txg);
+	zfs_dbgmsg("agent_begin_txg(%llu)",
+	    txg);
+	agent_request(vos, nv);
+	fnvlist_free(nv);
+}
+
+void
+object_store_begin_txg(spa_t *spa, uint64_t txg)
+{
+	vdev_t *vd = spa->spa_root_vdev->vdev_child[0];
+	ASSERT3P(vd->vdev_ops, ==, &vdev_object_store_ops);
+	vdev_object_store_t *vos = vd->vdev_tsd;
+	agent_begin_txg(vos, txg);
 }
 
 static void
@@ -283,7 +308,9 @@ agent_reader(void *arg)
 		const char *type = fnvlist_lookup_string(nv, AGENT_TYPE);
 		zfs_dbgmsg("got response from agent type=%s", type);
 		// XXX debug message the nvlist
-		if (strcmp(type, "pool open done") == 0) {
+		if (strcmp(type, "pool create done") == 0) {
+			zfs_dbgmsg("got pool create done");
+		} else if (strcmp(type, "pool open done") == 0) {
 			zfs_dbgmsg("got pool open done");
 		} else if (strcmp(type, "read done") == 0) {
 			uint64_t req = fnvlist_lookup_uint64(nv,
@@ -381,11 +408,12 @@ vdev_object_store_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 
 	if (vd->vdev_spa->spa_load_state == SPA_LOAD_CREATE) {
 		agent_create_pool(vd, vos);
-	} else {
-		agent_open_pool(vd, vos);
+		// XXX wait for response from agent
+		delay(hz * 5);
 	}
+	agent_open_pool(vd, vos);
 	// XXX wait for response from agent
-	delay(hz * 10);
+	delay(hz * 5);
 
 skip_open:
 
@@ -420,7 +448,7 @@ vdev_object_store_close(vdev_t *vd)
 static void
 vdev_object_store_io_strategy(void *arg)
 {
-	zio_t *zio = (zio_t *)arg;
+	zio_t *zio = arg;
 	vdev_t *vd = zio->io_vd;
 	vdev_object_store_t *vos = vd->vdev_tsd;
 

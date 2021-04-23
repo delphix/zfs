@@ -9172,6 +9172,12 @@ spa_sync(spa_t *spa, uint64_t txg)
 
 	VERIFY(spa_writeable(spa));
 
+#ifdef _KERNEL
+	if (!spa_normal_class(spa)->mc_ops->msop_block_based) {
+		object_store_begin_txg(spa, txg);
+	}
+#endif
+
 	/*
 	 * Wait for i/os issued in open context that need to complete
 	 * before this txg syncs.

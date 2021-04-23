@@ -420,7 +420,7 @@ impl Pool {
                             &format!("zfs/{}/PendingFreesLog", guid),
                         ),
                         pending_object: None,
-                        pending_object_min_block: BlockID(1),
+                        pending_object_min_block: BlockID(0),
                         pending_object_max_block: None,
                         pending_flushes: Vec::new(),
                         stats: PoolStatsPhys::default(),
