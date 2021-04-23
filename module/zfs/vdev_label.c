@@ -996,7 +996,8 @@ vdev_label_init(vdev_t *vd, uint64_t crtxg, vdev_labeltype_t reason)
 	/* Track the creation time for this vdev */
 	vd->vdev_crtxg = crtxg;
 
-	if (!vd->vdev_ops->vdev_op_leaf || !spa_writeable(spa))
+	if (!vd->vdev_ops->vdev_op_leaf || !spa_writeable(spa) ||
+	    vdev_is_object_based(vd))
 		return (0);
 
 	/*

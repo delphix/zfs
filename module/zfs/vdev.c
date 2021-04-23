@@ -227,7 +227,7 @@ static vdev_ops_t *vdev_ops_table[] = {
 	&vdev_hole_ops,
 	&vdev_indirect_ops,
 #ifdef _KERNEL
-	&vdev_object_storage_ops,
+	&vdev_object_store_ops,
 #endif
 	NULL
 };
@@ -1343,7 +1343,8 @@ vdev_metaslab_group_create(vdev_t *vd)
 	spa_t *spa = vd->vdev_spa;
 
 	/*
-	 * metaslab_group_create was delayed until allocation bias was available
+	 * metaslab_group_create was delayed until allocation bias
+	 * was available
 	 */
 	if (vd->vdev_mg == NULL) {
 		metaslab_class_t *mc;
@@ -1368,10 +1369,28 @@ vdev_metaslab_group_create(vdev_t *vd)
 			mc = spa_normal_class(spa);
 		}
 
+		/*
+		 * For object store vdevs, we override the normal
+		 * allocator and always use a sequential allocation
+		 * scheme. We also reset the number of allocators
+		 * that will be needed.
+		 */
+		if (vdev_is_object_based(vd)) {
+			ASSERT3P(mc, ==, spa_normal_class(spa));
+			metaslab_class_destroy(spa_normal_class(spa));
+			spa->spa_alloc_count = 1;
+			mc = spa->spa_normal_class = metaslab_class_create(spa,
+			    zfs_objectstore_ops);
+		}
+
 		vd->vdev_mg = metaslab_group_create(mc, vd,
 		    spa->spa_alloc_count);
 
-		if (!vd->vdev_islog) {
+
+		if (vdev_is_object_based(vd))
+			ASSERT3U(vd->vdev_mg->mg_allocators, ==, 1);
+
+		if (!vd->vdev_islog && !vdev_is_object_based(vd)) {
 			vd->vdev_log_mg = metaslab_group_create(
 			    spa_embedded_log_class(spa), vd, 1);
 		}
@@ -1426,6 +1445,8 @@ vdev_metaslab_init(vdev_t *vd, uint64_t txg)
 
 	vd->vdev_ms = mspp;
 	vd->vdev_ms_count = newc;
+	zfs_dbgmsg("vdev_metaslab_init: setting vdev_ms_count: %llu",
+	    vd->vdev_ms_count);
 
 	for (uint64_t m = oldc; m < newc; m++) {
 		uint64_t object = 0;
@@ -1647,6 +1668,12 @@ vdev_probe(vdev_t *vd, zio_t *zio)
 	zio_t *pio;
 
 	ASSERT(vd->vdev_ops->vdev_op_leaf);
+
+	/*
+	 * We can't probe an object store vdev.
+	 */
+	if (vdev_is_object_based(vd))
+		return (NULL);
 
 	/*
 	 * Don't probe the probe.
@@ -1997,10 +2024,17 @@ vdev_open(vdev_t *vd)
 			    VDEV_AUX_TOO_SMALL);
 			return (SET_ERROR(EOVERFLOW));
 		}
-		psize = osize;
-		asize = osize - (VDEV_LABEL_START_SIZE + VDEV_LABEL_END_SIZE);
-		max_asize = max_osize - (VDEV_LABEL_START_SIZE +
-		    VDEV_LABEL_END_SIZE);
+		max_asize = asize = psize = osize;
+
+		/*
+		 * If it's not an object store, then account for the labels.
+		 */
+		if (!vdev_is_object_based(vd)) {
+			asize = osize - (VDEV_LABEL_START_SIZE +
+			    VDEV_LABEL_END_SIZE);
+			max_asize = max_osize - (VDEV_LABEL_START_SIZE +
+			    VDEV_LABEL_END_SIZE);
+		}
 	} else {
 		if (vd->vdev_parent != NULL && osize < SPA_MINDEVSIZE -
 		    (VDEV_LABEL_START_SIZE + VDEV_LABEL_END_SIZE)) {
@@ -2634,6 +2668,12 @@ vdev_metaslab_set_size(vdev_t *vd)
 	uint64_t asize = vd->vdev_asize;
 	uint64_t ms_count = asize >> zfs_vdev_default_ms_shift;
 	uint64_t ms_shift;
+
+	if (vdev_is_object_based(vd)) {
+		vd->vdev_ms_shift = highbit64(asize) - 1;
+		zfs_dbgmsg("vdev_metaslab_set_size: %llu", vd->vdev_ms_shift);
+		return;
+	}
 
 	/*
 	 * There are two dimensions to the metaslab sizing calculation:
@@ -5132,6 +5172,17 @@ vdev_is_concrete(vdev_t *vd)
 	} else {
 		return (B_TRUE);
 	}
+}
+
+boolean_t
+vdev_is_object_based(vdev_t *vd)
+{
+#ifdef _KERNEL
+	vdev_ops_t *ops = vd->vdev_ops;
+	if (ops == &vdev_object_store_ops)
+		return (B_TRUE);
+#endif
+	return (B_FALSE);
 }
 
 /*

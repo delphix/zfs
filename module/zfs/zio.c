@@ -1439,7 +1439,7 @@ zio_vdev_child_io(zio_t *pio, blkptr_t *bp, vdev_t *vd, uint64_t offset,
 		pio->io_pipeline &= ~ZIO_STAGE_CHECKSUM_VERIFY;
 	}
 
-	if (vd->vdev_ops->vdev_op_leaf) {
+	if (vd->vdev_ops->vdev_op_leaf && !vdev_is_object_based(vd)) {
 		ASSERT0(vd->vdev_children);
 		offset += VDEV_LABEL_START_SIZE;
 	}
@@ -3459,6 +3459,31 @@ zio_allocate_dispatch(spa_t *spa, int allocator)
 }
 
 static zio_t *
+zio_object_allocate_and_issue(zio_t *zio)
+{
+	spa_t *spa = zio->io_spa;
+	metaslab_class_t *mc = spa_normal_class(spa);
+	blkptr_t *bp = zio->io_bp;
+
+	/*
+	 * For object allocation, we will issue the I/O directly
+	 * so remove that pipeline stage here.
+	 */
+	zio->io_pipeline &= ~ZIO_STAGE_VDEV_IO_START;
+
+	spa_config_enter(spa, SCL_ALLOC, FTAG, RW_READER);
+
+	int error = metaslab_alloc(spa, mc, zio->io_size, bp,
+	    zio->io_prop.zp_copies, zio->io_txg, NULL, 0,
+	    &zio->io_alloc_list, zio, zio->io_allocator);
+	VERIFY0(error);
+
+	spa_config_exit(spa, SCL_ALLOC, FTAG);
+
+	return (zio_pipeline[highbit64(ZIO_STAGE_VDEV_IO_START) - 1](zio));
+}
+
+static zio_t *
 zio_dva_allocate(zio_t *zio)
 {
 	spa_t *spa = zio->io_spa;
@@ -3466,6 +3491,9 @@ zio_dva_allocate(zio_t *zio)
 	blkptr_t *bp = zio->io_bp;
 	int error;
 	int flags = 0;
+
+	if (!spa_normal_class(spa)->mc_ops->msop_block_based)
+		return (zio_object_allocate_and_issue(zio));
 
 	if (zio->io_gang_leader == NULL) {
 		ASSERT(zio->io_child_type > ZIO_CHILD_GANG);
@@ -3535,8 +3563,9 @@ zio_dva_allocate(zio_t *zio)
 		zio->io_metaslab_class = mc = spa_normal_class(spa);
 		if (zfs_flags & ZFS_DEBUG_METASLAB_ALLOC) {
 			zfs_dbgmsg("%s: metaslab allocation failure, "
-			    "trying normal class: zio %px, size %llu, error %d",
-			    spa_name(spa), zio, zio->io_size, error);
+			    "trying normal class: zio %px, size %llu, "
+			    "error %d", spa_name(spa), zio,
+			    zio->io_size, error);
 		}
 
 		error = metaslab_alloc(spa, mc, zio->io_size, bp,

@@ -73,7 +73,7 @@
 unsigned long vdev_object_store_logical_ashift = SPA_MINBLOCKSHIFT;
 unsigned long vdev_object_store_physical_ashift = SPA_MINBLOCKSHIFT;
 
-#define VOS_MAXREQ 100
+#define	VOS_MAXREQ	100
 
 typedef struct vdev_object_store {
 	char *vos_access_id;
@@ -101,7 +101,7 @@ vdev_object_store_open_mode(spa_mode_t spa_mode)
 
 #ifdef _KERNEL
 static struct sockaddr_un zfs_socket = {
-   AF_UNIX, "/run/zfs_socket"
+	AF_UNIX, "/run/zfs_socket"
 };
 #endif
 
@@ -111,7 +111,8 @@ zfs_object_store_open(char *bucket_name, int mode, struct socket **sock)
 	struct socket *s = NULL;
 	int rc = sock_create(PF_UNIX, SOCK_STREAM, 0, &s);
 	if (rc != 0) {
-		zfs_dbgmsg("zfs_object_store_open unable to create socket: %d", rc);
+		zfs_dbgmsg("zfs_object_store_open unable to create "
+		    "socket: %d", rc);
 		return (rc);
 	}
 
@@ -168,14 +169,20 @@ agent_request_zio(vdev_object_store_t *vos, zio_t *zio, nvlist_t *nv)
 {
 	uint64_t req;
 
-	// XXX need locking on requests array since this could be called concurrently
+	/*
+	 * XXX need locking on requests array since this could be
+	 * called concurrently
+	 */
 	for (req = 0; req < VOS_MAXREQ; req++) {
 		if (vos->vos_outstanding_requests[req] == NULL) {
 			vos->vos_outstanding_requests[req] = zio;
 			break;
 		}
 	}
-	// XXX if all slots are full, need to block and wait for one to complete
+	/*
+	 * XXX if all slots are full, need to block and wait for
+	 * one to complete
+	 */
 	VERIFY3U(req, <, VOS_MAXREQ);
 	fnvlist_add_uint64(nv, AGENT_REQUEST_ID, req);
 	zio->io_vsd = (void *)(uintptr_t)req;
@@ -279,9 +286,11 @@ agent_reader(void *arg)
 		if (strcmp(type, "pool open done") == 0) {
 			zfs_dbgmsg("got pool open done");
 		} else if (strcmp(type, "read done") == 0) {
-			uint64_t req = fnvlist_lookup_uint64(nv, AGENT_REQUEST_ID);
+			uint64_t req = fnvlist_lookup_uint64(nv,
+			    AGENT_REQUEST_ID);
 			uint_t len;
-			void *data = fnvlist_lookup_uint8_array(nv, AGENT_DATA, &len);
+			void *data = fnvlist_lookup_uint8_array(nv,
+			    AGENT_DATA, &len);
 			zfs_dbgmsg("got read done req=%llu datalen=%u",
 			    req, len);
 			VERIFY3U(req, <, VOS_MAXREQ);
@@ -295,7 +304,8 @@ agent_reader(void *arg)
 			fnvlist_free(nv);
 			zio_delay_interrupt(zio);
 		} else if (strcmp(type, "write done") == 0) {
-			uint64_t req = fnvlist_lookup_uint64(nv, AGENT_REQUEST_ID);
+			uint64_t req = fnvlist_lookup_uint64(nv,
+			    AGENT_REQUEST_ID);
 			zfs_dbgmsg("got write done req=%llu", req);
 			VERIFY3U(req, <, VOS_MAXREQ);
 			zio_t *zio = vos->vos_outstanding_requests[req];
@@ -354,7 +364,8 @@ vdev_object_store_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	}
 	ASSERT(vd->vdev_path != NULL);
 
-	vos = vd->vdev_tsd = kmem_zalloc(sizeof (vdev_object_store_t), KM_SLEEP);
+	vos = vd->vdev_tsd = kmem_zalloc(sizeof (vdev_object_store_t),
+	    KM_SLEEP);
 
 	error = zfs_object_store_open(vd->vdev_path,
 	    vdev_object_store_open_mode(spa_mode(vd->vdev_spa)), &sock);
@@ -378,7 +389,11 @@ vdev_object_store_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 
 skip_open:
 
-	*max_psize = *psize = UINT64_MAX; /* XXX Set to max for now */
+	/*
+	 * XXX - We can only support ~1EB since the metaslab weights
+	 * use some of the high order bits.
+	 */
+	*max_psize = *psize = (1ULL << 60) - 1;
 	*logical_ashift = vdev_object_store_logical_ashift;
 	*physical_ashift = vdev_object_store_physical_ashift;
 
@@ -437,7 +452,7 @@ vdev_object_store_io_start(zio_t *zio)
 				break;
 
 			/*
-			 * XXX - may need a new ioctl sinc this will 
+			 * XXX - may need a new ioctl sinc this will
 			 * sync the entire object store.
 			 */
 			break;
@@ -464,7 +479,7 @@ vdev_object_store_io_done(zio_t *zio)
 {
 }
 
-vdev_ops_t vdev_object_storage_ops = {
+vdev_ops_t vdev_object_store_ops = {
 	.vdev_op_init = NULL,
 	.vdev_op_fini = NULL,
 	.vdev_op_open = vdev_object_store_open,
@@ -485,13 +500,13 @@ vdev_ops_t vdev_object_storage_ops = {
 	.vdev_op_config_generate = NULL,
 	.vdev_op_nparity = NULL,
 	.vdev_op_ndisks = NULL,
-	.vdev_op_type = VDEV_TYPE_OBJSTORE,		/* name of this vdev type */
+	.vdev_op_type = VDEV_TYPE_OBJSTORE,	/* name of this vdev type */
 	.vdev_op_leaf = B_TRUE			/* leaf vdev */
 };
 
 ZFS_MODULE_PARAM(zfs_vdev_object_store, vdev_object_store_,
-	logical_ashift, ULONG, ZMOD_RW,
+    logical_ashift, ULONG, ZMOD_RW,
 	"Logical ashift for object store based devices");
 ZFS_MODULE_PARAM(zfs_vdev_object_store, vdev_object_store_,
-	physical_ashift, ULONG, ZMOD_RW,
+    physical_ashift, ULONG, ZMOD_RW,
 	"Physical ashift for object store based devices");

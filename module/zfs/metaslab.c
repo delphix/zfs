@@ -1717,7 +1717,8 @@ metaslab_df_alloc(metaslab_t *msp, uint64_t size)
 }
 
 static metaslab_ops_t metaslab_df_ops = {
-	metaslab_df_alloc
+	metaslab_df_alloc,
+	B_TRUE
 };
 
 metaslab_ops_t *zfs_metaslab_ops = &metaslab_df_ops;
@@ -1767,7 +1768,8 @@ metaslab_cf_alloc(metaslab_t *msp, uint64_t size)
 }
 
 static metaslab_ops_t metaslab_cf_ops = {
-	metaslab_cf_alloc
+	metaslab_cf_alloc,
+	B_TRUE
 };
 
 metaslab_ops_t *zfs_metaslab_ops = &metaslab_cf_ops;
@@ -1831,12 +1833,28 @@ metaslab_ndf_alloc(metaslab_t *msp, uint64_t size)
 }
 
 static metaslab_ops_t metaslab_ndf_ops = {
-	metaslab_ndf_alloc
+	metaslab_ndf_alloc,
+	B_TRUE
 };
 
 metaslab_ops_t *zfs_metaslab_ops = &metaslab_ndf_ops;
 #endif /* WITH_NDF_BLOCK_ALLOCATOR */
 
+static uint64_t
+metaslab_sequential_alloc(metaslab_t *msp, uint64_t size)
+{
+	uint64_t *cursor = &msp->ms_lbas[0];
+	uint64_t offset = *cursor;
+	*cursor += size;
+	return (offset);
+}
+
+static metaslab_ops_t metaslab_sequential_ops = {
+	metaslab_sequential_alloc,
+	B_FALSE
+};
+
+metaslab_ops_t *zfs_objectstore_ops = &metaslab_sequential_ops;
 
 /*
  * ==========================================================================
@@ -4707,6 +4725,31 @@ metaslab_active_mask_verify(metaslab_t *msp)
 
 /* ARGSUSED */
 static uint64_t
+metaslab_group_alloc_object(metaslab_group_t *mg, zio_alloc_list_t *zal,
+    uint64_t asize, uint64_t txg, boolean_t want_unique, dva_t *dva, int d,
+    int allocator, boolean_t try_hard)
+{
+	metaslab_class_t *mc = mg->mg_class;
+
+	mutex_enter(&mg->mg_lock);
+	metaslab_t *msp = avl_first(&mg->mg_metaslab_tree);
+	mutex_exit(&mg->mg_lock);
+
+	mutex_enter(&msp->ms_lock);
+	int activation_error =
+	    metaslab_activate(msp, allocator, METASLAB_WEIGHT_PRIMARY);
+	VERIFY0(activation_error);
+
+	uint64_t offset = mc->mc_ops->msop_alloc(msp, 1);
+	zfs_dbgmsg("ALLOC: %llu, next %llu", offset, msp->ms_lbas[0]);
+	VERIFY3U(offset, !=, -1ULL);
+
+	mutex_exit(&msp->ms_lock);
+	return (offset);
+}
+
+/* ARGSUSED */
+static uint64_t
 metaslab_group_alloc_normal(metaslab_group_t *mg, zio_alloc_list_t *zal,
     uint64_t asize, uint64_t txg, boolean_t want_unique, dva_t *dva, int d,
     int allocator, boolean_t try_hard)
@@ -4727,8 +4770,8 @@ metaslab_group_alloc_normal(metaslab_group_t *mg, zio_alloc_list_t *zal,
 	}
 
 	/*
-	 * If we don't have enough metaslabs active to fill the entire array, we
-	 * just use the 0th slot.
+	 * If we don't have enough metaslabs active to fill the entire array,
+	 * we just use the 0th slot.
 	 */
 	if (mg->mg_ms_ready < mg->mg_allocators * 3)
 		allocator = 0;
@@ -5020,8 +5063,13 @@ metaslab_group_alloc(metaslab_group_t *mg, zio_alloc_list_t *zal,
 	uint64_t offset;
 	ASSERT(mg->mg_initialized);
 
-	offset = metaslab_group_alloc_normal(mg, zal, asize, txg, want_unique,
-	    dva, d, allocator, try_hard);
+	if (vdev_is_object_based(mg->mg_vd)) {
+		offset = metaslab_group_alloc_object(mg, zal, asize, txg,
+		    want_unique, dva, d, allocator, try_hard);
+	} else {
+		offset = metaslab_group_alloc_normal(mg, zal, asize, txg,
+		    want_unique, dva, d, allocator, try_hard);
+	}
 
 	mutex_enter(&mg->mg_lock);
 	if (offset == -1ULL) {
@@ -5260,8 +5308,13 @@ top:
 				mca->mca_aliquot = 0;
 			}
 
+			if (vdev_is_object_based(vd)) {
+				DVA_SET_OBJECTID(&dva[d], offset);
+			} else {
+				DVA_SET_OFFSET(&dva[d], offset);
+			}
+
 			DVA_SET_VDEV(&dva[d], vd->vdev_id);
-			DVA_SET_OFFSET(&dva[d], offset);
 			DVA_SET_GANG(&dva[d],
 			    ((flags & METASLAB_GANG_HEADER) ? 1 : 0));
 			DVA_SET_ASIZE(&dva[d], asize);

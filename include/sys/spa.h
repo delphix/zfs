@@ -428,6 +428,10 @@ typedef struct blkptr {
 	BF64_GET_SB((dva)->dva_word[1], 0, 63, SPA_MINBLOCKSHIFT, 0)
 #define	DVA_SET_OFFSET(dva, x)	\
 	BF64_SET_SB((dva)->dva_word[1], 0, 63, SPA_MINBLOCKSHIFT, 0, x)
+#define	DVA_GET_OBJECTID(dva)	\
+	BF64_GET((dva)->dva_word[1], 0, 63)
+#define	DVA_SET_OBJECTID(dva, x)	\
+	BF64_SET((dva)->dva_word[1], 0, 63, x)
 
 #define	DVA_GET_GANG(dva)	BF64_GET((dva)->dva_word[1], 63, 1)
 #define	DVA_SET_GANG(dva, x)	BF64_SET((dva)->dva_word[1], 63, 1, x)
