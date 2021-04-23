@@ -10,6 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
+use tokio::time::Duration;
 
 pub struct Server {
     input: OwnedReadHalf,
@@ -41,12 +42,26 @@ impl Server {
         };
         tokio::spawn(async move {
             loop {
-                let result = Self::get_next_request(&mut server.input).await;
-                if result.is_err() {
-                    println!("got error reading from connection: {:?}", result);
-                    return;
+                let req = Self::get_next_request(&mut server.input);
+                let result = tokio::time::timeout(Duration::from_millis(1000), req).await;
+                let nvl;
+                match result {
+                    Err(_) => {
+                        // timed out
+                        if server.pool.is_some() {
+                            server.flush_writes();
+                        }
+                        continue;
+                    }
+                    Ok(real_result) => {
+                        if real_result.is_err() {
+                            println!("got error reading from connection: {:?}", real_result);
+                            return;
+                        }
+                        nvl = real_result.unwrap();
+                    }
                 }
-                let nvl = result.unwrap();
+                //let nvl = result.unwrap();
                 let type_name = nvl.lookup_string("Type").unwrap();
                 match type_name.to_str().unwrap() {
                     "create pool" => {
@@ -90,8 +105,9 @@ impl Server {
                     "write block" => {
                         let block = BlockID(nvl.lookup_uint64("block").unwrap());
                         let data = nvl.lookup("data").unwrap().data();
+                        let id = nvl.lookup_uint64("request_id").unwrap();
                         if let NvData::Uint8Array(slice) = data {
-                            server.write_block(block, slice.to_vec());
+                            server.write_block(block, slice.to_vec(), id);
                         } else {
                             panic!("data not expected type")
                         }
@@ -165,13 +181,14 @@ impl Server {
 
     /// queue write, sends response when completed (persistent).  Does not block.
     /// completion may not happen until flush_pool() is called
-    fn write_block(&mut self, block: BlockID, data: Vec<u8>) {
+    fn write_block(&mut self, block: BlockID, data: Vec<u8>, request_id: u64) {
         let pool = self.pool.as_mut().unwrap();
         let output = self.output.clone();
         pool.write_block_cb(block, data, async move {
             let mut nvl = NvList::new_unique_names();
             nvl.insert("Type", "write done").unwrap();
             nvl.insert("BlockID", &block.0).unwrap();
+            nvl.insert("request_id", &request_id).unwrap();
             Self::send_response(&output, nvl).await;
         });
     }

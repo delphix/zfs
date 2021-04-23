@@ -696,6 +696,11 @@ impl Pool {
         // held. XXX change this to return an error to the client
         let syncing_state = &mut self.state.syncing_state.try_lock().unwrap();
 
+        // XXX because called when server times out waiting for request
+        if syncing_state.syncing_txg.is_none() {
+            return;
+        }
+
         let txg = syncing_state.syncing_txg.unwrap();
 
         if syncing_state
@@ -754,11 +759,10 @@ impl Pool {
         // write to object store
         let readonly_state = self.state.readonly_state.clone();
 
-        let handle = tokio::spawn(async move {
+        syncing_state.pending_flushes.push(tokio::spawn(async move {
             old_po.phys.put(&readonly_state.bucket).await;
             old_po.done.close();
-        });
-        syncing_state.pending_flushes.push(handle);
+        }));
 
         // add to in-memory block->object map
         self.state.objects.write().unwrap().insert(min_block, obj);
