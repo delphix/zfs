@@ -331,6 +331,7 @@ async fn do_server() {
         .nth(2)
         .unwrap_or("/run/zfs_socket".to_string());
 
+    let _ = std::fs::remove_file(&socket_name);
     let listener = UnixListener::bind(&socket_name).unwrap();
     println!("Listening on: {}", socket_name);
 

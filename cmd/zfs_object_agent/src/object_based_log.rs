@@ -68,9 +68,6 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLogChunk<T> {
 
 #[derive(Debug)]
 pub struct ObjectBasedLog<T: ObjectBasedLogEntry> {
-    // XXX maybe the bucket should not be in here; instead the caller should
-    // always provide it by passing in the PoolSharedState. That way the
-    // lifetime stuff (for this and Pool) is less complicated.
     pool: Arc<PoolSharedState>,
     name: String,
     generation: u64,
@@ -176,8 +173,8 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
             entries: self.pending_entries.split_off(0),
         };
 
-        // XXX cloning bucket/name, would be nice if we could find a way to
-        // reference them from the spawned task
+        // XXX cloning name, would be nice if we could find a way to
+        // reference them from the spawned task (use Arc)
         let pool = self.pool.clone();
         let name = self.name.clone();
         let generation = self.generation;
@@ -255,10 +252,10 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         for chunk in 0..self.num_chunks {
             let pool = self.pool.clone();
             let n = self.name.clone();
-            let fut2 = async move {
+            let fut = async move {
                 async move { ObjectBasedLogChunk::get(&pool.bucket, &n, generation, chunk).await }
             };
-            stream.push(fut2);
+            stream.push(fut);
         }
         // Note: buffered() is needed because rust-s3 creates one connection for
         // each request, rather than using a connection pool. If we created 1000

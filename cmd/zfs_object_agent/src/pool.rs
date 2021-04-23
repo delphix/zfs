@@ -1,8 +1,10 @@
 use crate::object_access;
 use crate::object_based_log::*;
+use core::future::Future;
 use futures::future;
 use futures::future::*;
 use futures::stream::*;
+use futures::task;
 use s3::bucket::Bucket;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -10,7 +12,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::mem;
 use std::ops::Bound::*;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
 use std::time::{Instant, SystemTime};
 use tokio::sync::*;
 use tokio::task::JoinHandle;
@@ -239,6 +244,7 @@ struct PoolSyncingState {
     pub last_txg: TXG,
     pub syncing_txg: Option<TXG>,
     stats: PoolStatsPhys,
+    reclaim_task: Option<JoinHandle<ReclaimFreesComplete>>,
 }
 
 #[derive(Debug)]
@@ -260,11 +266,16 @@ pub struct PoolSharedState {
     pub name: String,
 }
 
-// XXX no longer need explicit lifetime, since bucket is copied
+#[derive(Debug)]
+struct ReclaimFreesComplete {
+    freed_blocks_count: u64,
+    freed_blocks_bytes: u64,
+}
+
 impl Pool {
     pub async fn create(bucket: &Bucket, name: &str, guid: PoolGUID) {
         let phys = PoolPhys {
-            guid: guid,
+            guid,
             name: name.to_string(),
             last_txg: TXG(0),
         };
@@ -305,6 +316,7 @@ impl Pool {
                     pending_object_max_block: None,
                     pending_flushes: Vec::new(),
                     stats: phys.stats,
+                    reclaim_task: None,
                 }),
                 objects: std::sync::RwLock::new(BTreeMap::new()),
             }),
@@ -412,6 +424,7 @@ impl Pool {
                         pending_object_max_block: None,
                         pending_flushes: Vec::new(),
                         stats: PoolStatsPhys::default(),
+                        reclaim_task: None,
                     }),
                     objects: std::sync::RwLock::new(BTreeMap::new()),
                 }),
@@ -456,75 +469,127 @@ impl Pool {
         });
     }
 
-    async fn background_free(state: &PoolState, syncing_state: &mut PoolSyncingState) {
-        let shared_state = &state.readonly_state;
-        //let mut syncing_state = state.syncing_state.lock().await;
-
-        // load pending frees
-        let begin = Instant::now();
-        // XXX to save RAM, change to a Vec that we sort in-place
-        let mut frees: BTreeSet<BlockID> = BTreeSet::new();
-        syncing_state
-            .pending_frees_log
-            .iterate()
-            .for_each(|ent| {
-                let inserted = frees.insert(ent.block);
-                if !inserted {
-                    println!("duplicate free entry {:?}", ent.block);
-                }
-                assert!(inserted);
-                future::ready(())
-            })
-            .await;
-        println!(
-            "loaded {} freed blocks in {}ms",
-            frees.len(),
-            begin.elapsed().as_millis()
-        );
-
-        // rewrite objects, omitting freed blocks
-        // XXX want to consolidate adjacent small objects
-        let mut current_obj: Option<DataObjectPhys> = None;
-        let mut num_frees: u64 = 0;
-        {
-            let stats = &mut syncing_state.stats;
-            for f in frees {
-                let obj = Self::block_to_object(&state.objects.read().unwrap(), f);
-
-                if current_obj.is_none() || current_obj.as_ref().unwrap().object != obj {
-                    if current_obj.is_some() {
-                        let co = current_obj.unwrap();
-                        println!("rewriting {:?} to free {} blocks", co.object, num_frees);
-                        // XXX decrement stats.objects_bytes based on size change
-                        // XXX want to do lots of PUTs in parallel
-                        co.put(&shared_state.bucket).await;
-                    }
-                    println!("reading {:?} to free {:?}", obj, f);
-                    // XXX want to do lots of GETs in parallel
-                    current_obj = Some(
-                        DataObjectPhys::get(&shared_state.bucket, shared_state.guid, obj).await,
-                    );
-                    num_frees = 0;
-                }
-                let removed = current_obj.as_mut().unwrap().blocks.remove(&f);
+    fn reclaim_frees_object(
+        shared_state: Arc<PoolSharedState>,
+        obj: ObjectID,
+        blocks: Vec<BlockID>,
+    ) -> JoinHandle<u64> {
+        println!("rewriting {:?} to free {} blocks", obj, blocks.len());
+        tokio::spawn(async move {
+            let mut bytes_freed = 0u64;
+            let mut obj_phys =
+                DataObjectPhys::get(&shared_state.bucket, shared_state.guid, obj).await;
+            for b in blocks {
+                let removed = obj_phys.blocks.remove(&b);
+                // XXX if we crashed in the middle of this operation last time,
+                // the block may already have been removed (and the object
+                // rewritten). In this case we should ignore the fact that it
+                // isn't present, and count this block as removed for stats
+                // purposes, since the stats were not yet updated when we
+                // crashed. However, unclear how we would know how many bytes
+                // were freed.
                 assert!(removed.is_some());
-                stats.blocks_count -= 1;
-                stats.blocks_bytes -= removed.unwrap().len() as u64;
-                num_frees += 1;
+                bytes_freed += removed.unwrap().len() as u64;
             }
-            // update stats
-            stats.pending_frees_count = 0;
-            stats.pending_frees_bytes = 0;
-        }
-        if current_obj.is_some() {
-            let co = current_obj.unwrap();
-            println!("rewriting {:?} to free {} blocks", co.object, num_frees);
-            co.put(&shared_state.bucket).await;
+            obj_phys.put(&shared_state.bucket).await;
+            bytes_freed
+        })
+    }
+
+    fn try_reclaim_frees_async(&mut self) {
+        let mut syncing_state = self.state.syncing_state.try_lock().unwrap();
+
+        if syncing_state.reclaim_task.is_some() {
+            return;
         }
 
-        // clear log of frees
-        let txg = syncing_state.syncing_txg.unwrap();
-        syncing_state.pending_frees_log.clear(txg).await;
+        // XXX change this to be based on bytes, once those stats are working?
+        // XXX make this tunable?
+        if syncing_state.stats.pending_frees_count < syncing_state.stats.blocks_count / 100
+            && syncing_state.stats.pending_frees_count < 10_000
+        {
+            return;
+        }
+
+        let state = self.state.clone();
+
+        // XXX to save RAM, change to a Vec that we sort in-place
+        let stream = syncing_state.pending_frees_log.iterate();
+
+        syncing_state.reclaim_task = Some(tokio::spawn(async move {
+            let shared_state = &state.readonly_state;
+            let mut frees: BTreeSet<BlockID> = BTreeSet::new();
+
+            // load pending frees
+            let begin = Instant::now();
+            stream
+                .for_each(|ent| {
+                    let inserted = frees.insert(ent.block);
+                    if !inserted {
+                        panic!("duplicate free entry {:?}", ent.block);
+                    }
+                    future::ready(())
+                })
+                .await;
+            println!(
+                "loaded {} freed blocks in {}ms",
+                frees.len(),
+                begin.elapsed().as_millis()
+            );
+
+            // rewrite objects, omitting freed blocks
+            // XXX want to consolidate adjacent small objects
+            let mut complete = ReclaimFreesComplete {
+                freed_blocks_count: 0,
+                freed_blocks_bytes: 0,
+            };
+            let mut current_obj_state: Option<(ObjectID, Vec<BlockID>)> = None;
+            let mut join_handles = Vec::new();
+
+            let begin = Instant::now();
+            for free_block in frees {
+                let obj = Self::block_to_object(&state.objects.read().unwrap(), free_block);
+
+                if current_obj_state.is_some() && current_obj_state.as_ref().unwrap().0 != obj {
+                    let (myobj, myblocks) = current_obj_state.take().unwrap();
+                    join_handles.push(Self::reclaim_frees_object(
+                        shared_state.clone(),
+                        myobj,
+                        myblocks,
+                    ));
+                }
+                if current_obj_state.is_none() {
+                    current_obj_state = Some((obj, Vec::new()))
+                }
+
+                let (myobj, myblocks) = current_obj_state.as_mut().unwrap();
+                assert_eq!(*myobj, obj);
+                myblocks.push(free_block);
+                complete.freed_blocks_count += 1;
+            }
+            if current_obj_state.is_some() {
+                let (myobj, myblocks) = current_obj_state.unwrap();
+                join_handles.push(Self::reclaim_frees_object(
+                    shared_state.clone(),
+                    myobj,
+                    myblocks,
+                ));
+            }
+
+            let num_handles = join_handles.len();
+            for jh in join_handles {
+                complete.freed_blocks_bytes += jh.await.unwrap();
+            }
+
+            println!(
+                "rewrote {} objects in {}ms: {:?}",
+                num_handles,
+                begin.elapsed().as_millis(),
+                complete
+            );
+
+            complete
+        }));
     }
 
     pub fn end_txg_cb<F>(&mut self, uberblock: Vec<u8>, cb: F)
@@ -533,53 +598,72 @@ impl Pool {
     {
         self.initiate_flush_object();
 
+        self.try_reclaim_frees_async();
+
         let state = self.state.clone();
 
         tokio::spawn(async move {
-            {
-                // want to drop syncing_state mutex before sending response (in callback)
-                let mut syncing_state = state.syncing_state.try_lock().unwrap();
-                let txg = syncing_state.syncing_txg.unwrap();
-                Self::wait_for_pending_flushes(&mut syncing_state).await;
-                syncing_state.storage_object_log.flush(txg).await;
-                syncing_state.pending_frees_log.flush(txg).await;
+            let mut syncing_state = state.syncing_state.try_lock().unwrap();
+            let txg = syncing_state.syncing_txg.unwrap();
+            Self::wait_for_pending_flushes(&mut syncing_state).await;
+            syncing_state.storage_object_log.flush(txg).await;
+            syncing_state.pending_frees_log.flush(txg).await;
 
-                // XXX change this to be based on bytes, once those stats are working?
-                // XXX make this tunable?
-                // XXX do this over many txg's
-                if syncing_state.stats.pending_frees_count > syncing_state.stats.blocks_count / 100
-                    || syncing_state.stats.pending_frees_count > 10_000
-                {
-                    Self::background_free(&state, &mut *syncing_state).await;
+            if let Some(reclaim_task) = syncing_state.reclaim_task.as_mut() {
+                let waker = task::noop_waker();
+                let mut cx = Context::from_waker(&waker);
+                match Future::poll(Pin::new(reclaim_task), &mut cx) {
+                    Poll::Ready(out) => {
+                        let rfc = out.unwrap();
+                        syncing_state.stats.blocks_count -= rfc.freed_blocks_count;
+                        syncing_state.stats.blocks_bytes -= rfc.freed_blocks_bytes;
+
+                        // XXX other frees that occurred in the meantime need to
+                        // be preserved. rfc needs to tell us which frees need
+                        // to be transferred from current generation to next.
+                        syncing_state.stats.pending_frees_count = 0;
+                        syncing_state.stats.pending_frees_bytes = 0;
+
+                        // clear log of frees
+                        let txg = syncing_state.syncing_txg.unwrap();
+                        syncing_state.pending_frees_log.clear(txg).await;
+                    }
+                    Poll::Pending => {}
                 }
-
-                // write uberblock
-                let u = UberblockPhys {
-                    guid: state.readonly_state.guid,
-                    txg,
-                    date: SystemTime::now(),
-                    storage_object_log: syncing_state.storage_object_log.to_phys(),
-                    pending_frees_log: syncing_state.pending_frees_log.to_phys(),
-                    highest_block: BlockID(syncing_state.pending_object_min_block.0 - 1),
-                    zfs_uberblock: uberblock,
-                    stats: syncing_state.stats.clone(),
-                };
-                u.put(&state.readonly_state.bucket).await;
-
-                // write super
-                let s = PoolPhys {
-                    guid: state.readonly_state.guid,
-                    name: state.readonly_state.name.clone(),
-                    last_txg: txg,
-                };
-                s.put(&state.readonly_state.bucket).await;
-
-                // update txg
-                syncing_state.last_txg = txg;
-                syncing_state.syncing_txg = None;
-                syncing_state.pending_object = None;
             }
 
+            // write uberblock
+            let u = UberblockPhys {
+                guid: state.readonly_state.guid,
+                txg,
+                date: SystemTime::now(),
+                storage_object_log: syncing_state.storage_object_log.to_phys(),
+                pending_frees_log: syncing_state.pending_frees_log.to_phys(),
+                highest_block: BlockID(syncing_state.pending_object_min_block.0 - 1),
+                zfs_uberblock: uberblock,
+                stats: syncing_state.stats.clone(),
+            };
+            u.put(&state.readonly_state.bucket).await;
+
+            // write super
+            let s = PoolPhys {
+                guid: state.readonly_state.guid,
+                name: state.readonly_state.name.clone(),
+                last_txg: txg,
+            };
+            s.put(&state.readonly_state.bucket).await;
+
+            // update txg
+            syncing_state.last_txg = txg;
+            syncing_state.syncing_txg = None;
+            syncing_state.pending_object = None;
+
+            // We need to drop the mutex before sending respons (in callback).
+            // Otherwise we could send the response, and get another request
+            // which needs the mutex before we drop it. Since we are using
+            // try_enter().unwrap(), that would panic if we are still holding
+            // the mutex.
+            drop(syncing_state);
             cb.await;
         });
     }
@@ -706,22 +790,26 @@ impl Pool {
         // this function while in the middle of an end_txg(), so the lock
         // must not be held. XXX change this to return an error to the
         // client
-        let syncing_state = &mut self.state.syncing_state.try_lock().unwrap();
+        let mut syncing_state = self.state.syncing_state.try_lock().unwrap();
         assert!(syncing_state.syncing_txg.is_some());
-        assert!(syncing_state.pending_object.is_some());
         assert!(id >= Self::next_block_locked(&syncing_state));
-        let mut pending_object = syncing_state.pending_object.take().unwrap();
         assert_eq!(
             syncing_state.pending_object_max_block.is_none(),
-            pending_object.phys.blocks.is_empty()
+            syncing_state
+                .pending_object
+                .as_ref()
+                .unwrap()
+                .phys
+                .blocks
+                .is_empty()
         );
         syncing_state.pending_object_max_block = Some(id);
         syncing_state.stats.blocks_count += 1;
         syncing_state.stats.blocks_bytes += data.len() as u64;
+        let pending_object = syncing_state.pending_object.as_mut().unwrap();
         pending_object.phys.blocks.insert(id, data);
         let sem = pending_object.done.clone();
         let do_flush = pending_object.phys.blocks.len() >= 1000;
-        syncing_state.pending_object = Some(pending_object);
         (sem, do_flush)
     }
 
