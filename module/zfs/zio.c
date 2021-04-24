@@ -65,7 +65,11 @@ const char *zio_type_name[ZIO_TYPES] = {
 	"z_null", "z_rd", "z_wr", "z_fr", "z_cl", "z_ioctl", "z_trim"
 };
 
-int zio_dva_throttle_enabled = B_TRUE;
+/*
+ * XXX We should just set mc_alloc_throttle_enabled=0 on the normal class
+ * if it's object-store-based.
+ */
+int zio_dva_throttle_enabled = B_FALSE;
 int zio_deadman_log_all = B_FALSE;
 
 /*
@@ -1363,6 +1367,9 @@ zio_read_phys(zio_t *pio, vdev_t *vd, uint64_t offset, uint64_t size,
 	ASSERT(!labels || offset + size <= VDEV_LABEL_START_SIZE ||
 	    offset >= vd->vdev_psize - VDEV_LABEL_END_SIZE);
 	ASSERT3U(offset + size, <=, vd->vdev_psize);
+#ifdef _KERNEL
+	ASSERT3P(vd->vdev_ops, !=, &vdev_object_store_ops);
+#endif
 
 	zio = zio_create(pio, vd->vdev_spa, 0, NULL, data, size, size, done,
 	    private, ZIO_TYPE_READ, priority, flags | ZIO_FLAG_PHYSICAL, vd,
@@ -1384,6 +1391,9 @@ zio_write_phys(zio_t *pio, vdev_t *vd, uint64_t offset, uint64_t size,
 	ASSERT(!labels || offset + size <= VDEV_LABEL_START_SIZE ||
 	    offset >= vd->vdev_psize - VDEV_LABEL_END_SIZE);
 	ASSERT3U(offset + size, <=, vd->vdev_psize);
+#ifdef _KERNEL
+	ASSERT3P(vd->vdev_ops, !=, &vdev_object_store_ops);
+#endif
 
 	zio = zio_create(pio, vd->vdev_spa, 0, NULL, data, size, size, done,
 	    private, ZIO_TYPE_WRITE, priority, flags | ZIO_FLAG_PHYSICAL, vd,
@@ -3458,6 +3468,13 @@ zio_allocate_dispatch(spa_t *spa, int allocator)
 	zio_taskq_dispatch(zio, ZIO_TASKQ_ISSUE, B_TRUE);
 }
 
+static void
+object_store_child_done(zio_t *zio)
+{
+	zio_t *pio = zio->io_private;
+	pio->io_error = zio->io_error;
+}
+
 static zio_t *
 zio_object_allocate_and_issue(zio_t *zio)
 {
@@ -3480,16 +3497,49 @@ zio_object_allocate_and_issue(zio_t *zio)
 	 */
 	zio->io_pipeline &= ~ZIO_STAGE_VDEV_IO_START;
 
-	spa_config_enter(spa, SCL_ALLOC, FTAG, RW_READER);
+	/*
+	 * Lock ensures we allocate the next block ID and send it up to the
+	 * agent before any more allocations happen.  This way we fulfill the
+	 * write ordering constraint (write requests must be in order of
+	 * increasing block IDs).
+	 */
+	mutex_enter(&mc->mc_object_store_lock);
+	spa_config_enter(spa, SCL_ALLOC|SCL_ZIO, FTAG, RW_READER);
 
+	ASSERT3U(zio->io_prop.zp_copies, ==, 1);
 	int error = metaslab_alloc(spa, mc, zio->io_size, bp,
 	    zio->io_prop.zp_copies, zio->io_txg, NULL, flags,
 	    &zio->io_alloc_list, zio, zio->io_allocator);
 	VERIFY0(error);
 
-	spa_config_exit(spa, SCL_ALLOC, FTAG);
+	zfs_dbgmsg("zio=%px allocd %llu",
+	    zio, DVA_GET_OFFSET(&bp->blk_dva[0]));
 
-	return (zio_pipeline[highbit64(ZIO_STAGE_VDEV_IO_START) - 1](zio));
+	zio_t *child = zio_vdev_child_io(zio, zio->io_bp,
+	    spa->spa_root_vdev->vdev_child[0],
+	    DVA_GET_OFFSET(&bp->blk_dva[0]),
+	    zio->io_abd, zio->io_size, zio->io_type, zio->io_priority,
+	    ZIO_FLAG_DONT_QUEUE,
+	    object_store_child_done, zio);
+	zio_nowait(child);
+
+	zfs_dbgmsg("zio=%px child=%px stage=%llu",
+	    zio, child, child->io_stage);
+
+	// Keep SCL_ZIO held until io_assess()
+	spa_config_exit(spa, SCL_ALLOC, FTAG);
+	/*
+	 * Ensure that zio_vdev_io_start() will actually call
+	 * vdev_object_store_io_start() on this zio while we have the lock held.
+	 */
+#if 0
+	zio_t *next_zio =
+	    zio_pipeline[highbit64(ZIO_STAGE_VDEV_IO_START) - 1](zio);
+	zfs_dbgmsg("zio=%px completed io_start (off=%llu, next=%px)",
+	    zio, DVA_GET_OFFSET(&bp->blk_dva[0]), next_zio);
+#endif
+	mutex_exit(&mc->mc_object_store_lock);
+	return (zio);
 }
 
 static zio_t *
@@ -3750,6 +3800,7 @@ zio_vdev_io_start(zio_t *zio)
 	uint64_t align;
 	spa_t *spa = zio->io_spa;
 
+	//zfs_dbgmsg("zio_vdev_io_start(%px), vd=%px", zio, vd);
 	zio->io_delay = 0;
 
 	ASSERT(zio->io_error == 0);
@@ -3879,8 +3930,13 @@ zio_vdev_io_start(zio_t *zio)
 		if (zio->io_type == ZIO_TYPE_READ && vdev_cache_read(zio))
 			return (zio);
 
-		if ((zio = vdev_queue_io(zio)) == NULL)
+#if 0
+		if ((zio = vdev_queue_io(zio)) == NULL) {
+			zfs_dbgmsg("zio_vdev_io_start(%px), vdev_queue_io() returned NULL",
+				zio);
 			return (NULL);
+		}
+#endif
 
 		if (!vdev_accessible(vd, zio)) {
 			zio->io_error = SET_ERROR(ENXIO);
@@ -3889,6 +3945,8 @@ zio_vdev_io_start(zio_t *zio)
 		}
 		zio->io_delay = gethrtime();
 	}
+
+	//zfs_dbgmsg("zio_vdev_io_start(%px), vd=%px calling vdev_op_io_start()", zio, vd);
 
 	vd->vdev_ops->vdev_op_io_start(zio);
 	return (NULL);
@@ -3913,7 +3971,9 @@ zio_vdev_io_done(zio_t *zio)
 
 	if (vd != NULL && vd->vdev_ops->vdev_op_leaf &&
 	    vd->vdev_ops != &vdev_draid_spare_ops) {
+#if 0
 		vdev_queue_io_done(zio);
+#endif
 
 		if (zio->io_type == ZIO_TYPE_WRITE)
 			vdev_cache_write(zio);
@@ -4383,6 +4443,8 @@ zio_ready(zio_t *zio)
 	zio_t *pio, *pio_next;
 	zio_link_t *zl = NULL;
 
+	//zfs_dbgmsg("zio_ready(%px)", zio);
+
 	if (zio_wait_for_children(zio, ZIO_CHILD_GANG_BIT | ZIO_CHILD_DDT_BIT,
 	    ZIO_WAIT_READY)) {
 		return (NULL);
@@ -4448,6 +4510,8 @@ zio_ready(zio_t *zio)
 	if (zio_injection_enabled &&
 	    zio->io_spa->spa_syncing_txg == zio->io_txg)
 		zio_handle_ignored_writes(zio);
+
+	//zfs_dbgmsg("zio_ready(%px) complete", zio);
 
 	return (zio);
 }

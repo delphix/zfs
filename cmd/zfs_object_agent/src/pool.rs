@@ -43,7 +43,7 @@ impl fmt::Display for PoolGUID {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub struct ObjectID(pub u64);
 impl OnDisk for ObjectID {}
 impl fmt::Display for ObjectID {
@@ -245,6 +245,8 @@ struct PoolSyncingState {
     pub syncing_txg: Option<TXG>,
     stats: PoolStatsPhys,
     reclaim_task: Option<JoinHandle<ReclaimFreesComplete>>,
+    // Protects objects that are being overwritten for sync-to-convergence
+    rewriting_objects: HashMap<ObjectID, Arc<tokio::sync::Mutex<()>>>,
 }
 
 #[derive(Debug)]
@@ -266,10 +268,11 @@ pub struct PoolSharedState {
     pub name: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ReclaimFreesComplete {
     freed_blocks_count: u64,
     freed_blocks_bytes: u64,
+    num_chunks: u64,
 }
 
 impl Pool {
@@ -317,6 +320,7 @@ impl Pool {
                     pending_flushes: Vec::new(),
                     stats: phys.stats,
                     reclaim_task: None,
+                    rewriting_objects: HashMap::new(),
                 }),
                 objects: std::sync::RwLock::new(BTreeMap::new()),
             }),
@@ -425,6 +429,7 @@ impl Pool {
                         pending_flushes: Vec::new(),
                         stats: PoolStatsPhys::default(),
                         reclaim_task: None,
+                        rewriting_objects: HashMap::new(),
                     }),
                     objects: std::sync::RwLock::new(BTreeMap::new()),
                 }),
@@ -487,7 +492,7 @@ impl Pool {
                 // isn't present, and count this block as removed for stats
                 // purposes, since the stats were not yet updated when we
                 // crashed. However, unclear how we would know how many bytes
-                // were freed.
+                // were freed.  Unless the free log includes the size.
                 assert!(removed.is_some());
                 bytes_freed += removed.unwrap().len() as u64;
             }
@@ -506,7 +511,7 @@ impl Pool {
         // XXX change this to be based on bytes, once those stats are working?
         // XXX make this tunable?
         if syncing_state.stats.pending_frees_count < syncing_state.stats.blocks_count / 100
-            && syncing_state.stats.pending_frees_count < 10_000
+            || syncing_state.stats.pending_frees_count < 10_000
         {
             return;
         }
@@ -515,6 +520,7 @@ impl Pool {
 
         // XXX to save RAM, change to a Vec that we sort in-place
         let stream = syncing_state.pending_frees_log.iterate();
+        let num_chunks = syncing_state.pending_frees_log.num_chunks();
 
         syncing_state.reclaim_task = Some(tokio::spawn(async move {
             let shared_state = &state.readonly_state;
@@ -539,10 +545,7 @@ impl Pool {
 
             // rewrite objects, omitting freed blocks
             // XXX want to consolidate adjacent small objects
-            let mut complete = ReclaimFreesComplete {
-                freed_blocks_count: 0,
-                freed_blocks_bytes: 0,
-            };
+            let mut complete = ReclaimFreesComplete::default();
             let mut current_obj_state: Option<(ObjectID, Vec<BlockID>)> = None;
             let mut join_handles = Vec::new();
 
@@ -581,6 +584,8 @@ impl Pool {
                 complete.freed_blocks_bytes += jh.await.unwrap();
             }
 
+            complete.num_chunks = num_chunks;
+
             println!(
                 "rewrote {} objects in {}ms: {:?}",
                 num_handles,
@@ -608,6 +613,7 @@ impl Pool {
             Self::wait_for_pending_flushes(&mut syncing_state).await;
             syncing_state.storage_object_log.flush(txg).await;
             syncing_state.pending_frees_log.flush(txg).await;
+            syncing_state.rewriting_objects.clear();
 
             if let Some(reclaim_task) = syncing_state.reclaim_task.as_mut() {
                 let waker = task::noop_waker();
@@ -618,15 +624,33 @@ impl Pool {
                         syncing_state.stats.blocks_count -= rfc.freed_blocks_count;
                         syncing_state.stats.blocks_bytes -= rfc.freed_blocks_bytes;
 
-                        // XXX other frees that occurred in the meantime need to
-                        // be preserved. rfc needs to tell us which frees need
-                        // to be transferred from current generation to next.
                         syncing_state.stats.pending_frees_count = 0;
                         syncing_state.stats.pending_frees_bytes = 0;
 
-                        // clear log of frees
-                        let txg = syncing_state.syncing_txg.unwrap();
+                        // Clear log of frees, then transfer any frees that were
+                        // not processed to the new generation. Note that we
+                        // need to call iterate_after() before clear(),
+                        // otherwise we'd just be iterating the cleared (empty)
+                        // log. iterate_after() closes over the current
+                        // generation/length so it isn't affected by clear().
+                        let stream = syncing_state
+                            .pending_frees_log
+                            .iterate_after(rfc.num_chunks);
                         syncing_state.pending_frees_log.clear(txg).await;
+                        let begin = Instant::now();
+                        let mut count = 0u64;
+                        stream
+                            .for_each(|ent| {
+                                syncing_state.pending_frees_log.append(txg, ent);
+                                count += 1;
+                                future::ready(())
+                            })
+                            .await;
+                        println!(
+                            "transferred {} freed blocks in {}ms",
+                            count,
+                            begin.elapsed().as_millis()
+                        );
                     }
                     Poll::Pending => {}
                 }
@@ -658,7 +682,7 @@ impl Pool {
             syncing_state.syncing_txg = None;
             syncing_state.pending_object = None;
 
-            // We need to drop the mutex before sending respons (in callback).
+            // We need to drop the mutex before sending response (in callback).
             // Otherwise we could send the response, and get another request
             // which needs the mutex before we drop it. Since we are using
             // try_enter().unwrap(), that would panic if we are still holding
@@ -788,6 +812,7 @@ impl Pool {
         }
     }
 
+    // XXX change to return a Future rather than Arc<Sem>?
     fn do_write_impl(&mut self, id: BlockID, data: Vec<u8>) -> (Arc<Semaphore>, bool) {
         // the syncing_state is only held from the thread that owns the Pool
         // (i.e. this thread) and from end_txg(). It's not allowed to call
@@ -796,7 +821,44 @@ impl Pool {
         // client
         let mut syncing_state = self.state.syncing_state.try_lock().unwrap();
         assert!(syncing_state.syncing_txg.is_some());
-        assert!(id >= Self::next_block_locked(&syncing_state));
+        //assert!(id >= Self::next_block_locked(&syncing_state));
+        if id < Self::next_block_locked(&syncing_state) {
+            // XXX the design is for this to not happen. Writes must be received
+            // in blockID-order. However, for now we allow overwrites during
+            // sync to convergence via this slow path.
+            let obj = Self::block_to_object(&self.state.objects.read().unwrap(), id);
+            let shared_state = self.state.readonly_state.clone();
+            let txg = syncing_state.syncing_txg.unwrap();
+            let sem = Arc::new(Semaphore::new(0));
+            let sem2 = sem.clone();
+
+            // lock is needed because client could concurrently overwrite 2
+            // blocks in the same object. If the get/put's from the object store
+            // could run concurrently, the last put could clobber the earlier
+            // ones.
+            let mtx = syncing_state
+                .rewriting_objects
+                .entry(obj)
+                .or_default()
+                .clone();
+
+            tokio::spawn(async move {
+                let _guard = mtx.lock().await;
+                println!("rewriting {:?} to overwrite {}", obj, id);
+                let mut obj_phys =
+                    DataObjectPhys::get(&shared_state.bucket, shared_state.guid, obj).await;
+                // must have been written this txg
+                assert_eq!(obj_phys.txg, txg);
+                let removed = obj_phys.blocks.remove(&id);
+                // this blockID must have been written
+                assert!(removed.is_some());
+                obj_phys.blocks.insert(id, data);
+                obj_phys.put(&shared_state.bucket).await;
+                sem2.close();
+            });
+            return (sem, false);
+        }
+
         assert_eq!(
             syncing_state.pending_object_max_block.is_none(),
             syncing_state

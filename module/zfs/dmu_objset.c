@@ -488,8 +488,16 @@ dmu_objset_open_impl(spa_t *spa, dsl_dataset_t *ds, blkptr_t *bp,
 		os->os_phys = os->os_phys_buf->b_data;
 		os->os_flags = os->os_phys->os_flags;
 	} else {
+		/*
+		 * XXX disable user space accounting so we don't have to
+		 * overwrite blocks.
+		 */
+		int size = OBJSET_PHYS_SIZE_V1;
+
+#if 0
 		int size = spa_version(spa) >= SPA_VERSION_USERSPACE ?
 		    sizeof (objset_phys_t) : OBJSET_PHYS_SIZE_V1;
+#endif
 		os->os_phys_buf = arc_alloc_buf(spa, &os->os_phys_buf,
 		    ARC_BUFC_METADATA, size);
 		os->os_phys = os->os_phys_buf->b_data;

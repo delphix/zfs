@@ -23,13 +23,12 @@ impl Server {
     async fn get_next_request(pipe: &mut OwnedReadHalf) -> tokio::io::Result<NvList> {
         // XXX kernel sends this as host byte order
         let len64 = pipe.read_u64_le().await?;
-        println!("got request len: {}", len64);
+        //println!("got request len: {}", len64);
 
         let mut v = Vec::new();
         v.resize(len64 as usize, 0);
         pipe.read_exact(v.as_mut()).await?;
         let nvl = NvList::try_unpack(v.as_ref()).unwrap();
-        println!("got request: {:?}", nvl);
         Ok(nvl)
     }
 
@@ -42,10 +41,12 @@ impl Server {
         };
         tokio::spawn(async move {
             loop {
-                let req = Self::get_next_request(&mut server.input);
-                let result = tokio::time::timeout(Duration::from_millis(1000), req).await;
-                let nvl;
-                match result {
+                let nvl = match tokio::time::timeout(
+                    Duration::from_millis(1000),
+                    Self::get_next_request(&mut server.input),
+                )
+                .await
+                {
                     Err(_) => {
                         // timed out
                         if server.pool.is_some() {
@@ -53,18 +54,17 @@ impl Server {
                         }
                         continue;
                     }
-                    Ok(real_result) => {
-                        if real_result.is_err() {
-                            println!("got error reading from connection: {:?}", real_result);
+                    Ok(getreq_result) => match getreq_result {
+                        Err(_) => {
+                            println!("got error reading from connection: {:?}", getreq_result);
                             return;
                         }
-                        nvl = real_result.unwrap();
-                    }
-                }
-                //let nvl = result.unwrap();
-                let type_name = nvl.lookup_string("Type").unwrap();
-                match type_name.to_str().unwrap() {
+                        Ok(mynvl) => mynvl,
+                    },
+                };
+                match nvl.lookup_string("Type").unwrap().to_str().unwrap() {
                     "create pool" => {
+                        println!("got request: {:?}", nvl);
                         let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
                         let name = nvl.lookup_string("name").unwrap();
                         let bucket_name = nvl.lookup_string("bucket").unwrap();
@@ -78,6 +78,7 @@ impl Server {
                             .await;
                     }
                     "open pool" => {
+                        println!("got request: {:?}", nvl);
                         let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
                         let bucket_name = nvl.lookup_string("bucket").unwrap();
                         let region = Region::UsWest2;
@@ -88,13 +89,16 @@ impl Server {
                         server.open_pool(&bucket, guid).await;
                     }
                     "begin txg" => {
+                        println!("got request: {:?}", nvl);
                         let txg = TXG(nvl.lookup_uint64("TXG").unwrap());
                         server.begin_txg(txg);
                     }
                     "flush writes" => {
+                        println!("got request: {:?}", nvl);
                         server.flush_writes();
                     }
                     "end txg" => {
+                        println!("got request: {:?}", nvl);
                         let data = nvl.lookup("data").unwrap().data();
                         if let NvData::Uint8Array(slice) = data {
                             server.end_txg(slice.to_vec());
@@ -107,21 +111,27 @@ impl Server {
                         let data = nvl.lookup("data").unwrap().data();
                         let id = nvl.lookup_uint64("request_id").unwrap();
                         if let NvData::Uint8Array(slice) = data {
+                            println!("got write request id={}: {} len={}", id, block, slice.len());
                             server.write_block(block, slice.to_vec(), id);
                         } else {
                             panic!("data not expected type")
                         }
                     }
                     "free block" => {
+                        println!("got request: {:?}", nvl);
                         let block = BlockID(nvl.lookup_uint64("block").unwrap());
                         server.free_block(block);
                     }
                     "read block" => {
                         let block = BlockID(nvl.lookup_uint64("block").unwrap());
                         let id = nvl.lookup_uint64("request_id").unwrap();
+                        println!("got read request id={}: {}", id, block,);
                         server.read_block(block, id);
                     }
-                    _ => panic!("bad type {:?}", type_name),
+                    other => {
+                        println!("got request: {:?}", nvl);
+                        panic!("bad type {:?}", other);
+                    }
                 }
             }
         });
@@ -187,7 +197,7 @@ impl Server {
         pool.write_block_cb(block, data, async move {
             let mut nvl = NvList::new_unique_names();
             nvl.insert("Type", "write done").unwrap();
-            nvl.insert("BlockID", &block.0).unwrap();
+            nvl.insert("block", &block.0).unwrap();
             nvl.insert("request_id", &request_id).unwrap();
             Self::send_response(&output, nvl).await;
         });
@@ -205,7 +215,7 @@ impl Server {
         pool.read_block_cb(block, move |data| async move {
             let mut nvl = NvList::new_unique_names();
             nvl.insert("Type", "read done").unwrap();
-            nvl.insert("BlockID", &block.0).unwrap();
+            nvl.insert("block", &block.0).unwrap();
             nvl.insert("data", data.as_slice()).unwrap();
             nvl.insert("request_id", &request_id).unwrap();
             Self::send_response(&output, nvl).await;

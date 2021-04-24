@@ -199,13 +199,12 @@ agent_request_zio(vdev_object_store_t *vos, zio_t *zio, nvlist_t *nv)
 static void
 agent_read_block(vdev_object_store_t *vos, zio_t *zio)
 {
+	uint64_t blockid = zio->io_offset >> 9;
 	nvlist_t *nv = fnvlist_alloc();
 	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_READ_BLOCK);
-	fnvlist_add_uint64(nv, AGENT_GUID, spa_guid(zio->io_spa));
-	fnvlist_add_uint64(nv, AGENT_BLKID, zio->io_offset);
+	fnvlist_add_uint64(nv, AGENT_BLKID, blockid);
 	zfs_dbgmsg("agent_read_block(guid=%llu blkid=%llu)",
-	    spa_guid(zio->io_spa),
-	    zio->io_offset);
+	    spa_guid(zio->io_spa), blockid);
 	agent_request_zio(vos, zio, nv);
 	fnvlist_free(nv);
 }
@@ -213,16 +212,16 @@ agent_read_block(vdev_object_store_t *vos, zio_t *zio)
 static void
 agent_write_block(vdev_object_store_t *vos, zio_t *zio)
 {
+	uint64_t blockid = zio->io_offset >> 9;
 	nvlist_t *nv = fnvlist_alloc();
 	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_WRITE_BLOCK);
-	fnvlist_add_uint64(nv, AGENT_GUID, spa_guid(zio->io_spa));
-	fnvlist_add_uint64(nv, AGENT_BLKID, zio->io_offset);
+	fnvlist_add_uint64(nv, AGENT_BLKID, blockid);
 	void *buf = abd_borrow_buf_copy(zio->io_abd, zio->io_size);
 	fnvlist_add_uint8_array(nv, AGENT_DATA, buf, zio->io_size);
 	abd_return_buf(zio->io_abd, buf, zio->io_size);
 	zfs_dbgmsg("agent_write_block(guid=%llu blkid=%llu len=%llu)",
 	    spa_guid(zio->io_spa),
-	    zio->io_offset,
+	    blockid,
 	    zio->io_size);
 	agent_request_zio(vos, zio, nv);
 	fnvlist_free(nv);
@@ -270,6 +269,19 @@ agent_begin_txg(vdev_object_store_t *vos, uint64_t txg)
 	fnvlist_free(nv);
 }
 
+static void
+agent_end_txg(vdev_object_store_t *vos, uint64_t txg, void *buf, size_t len)
+{
+	nvlist_t *nv = fnvlist_alloc();
+	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_END_TXG);
+	fnvlist_add_uint64(nv, AGENT_TXG, txg);
+	fnvlist_add_uint8_array(nv, AGENT_DATA, buf, len);
+	zfs_dbgmsg("agent_end_txg(%llu)",
+	    txg);
+	agent_request(vos, nv);
+	fnvlist_free(nv);
+}
+
 void
 object_store_begin_txg(spa_t *spa, uint64_t txg)
 {
@@ -277,6 +289,22 @@ object_store_begin_txg(spa_t *spa, uint64_t txg)
 	ASSERT3P(vd->vdev_ops, ==, &vdev_object_store_ops);
 	vdev_object_store_t *vos = vd->vdev_tsd;
 	agent_begin_txg(vos, txg);
+}
+
+void
+object_store_end_txg(spa_t *spa, uint64_t txg)
+{
+	vdev_t *vd = spa->spa_root_vdev->vdev_child[0];
+	ASSERT3P(vd->vdev_ops, ==, &vdev_object_store_ops);
+	vdev_object_store_t *vos = vd->vdev_tsd;
+	//size_t nvlen;
+	//char *nvbuf = fnvlist_pack(spa->spa_config_syncing, &nvlen);
+	agent_end_txg(vos, txg,
+	    &spa->spa_uberblock, sizeof (spa->spa_uberblock));
+	// XXX wait for response
+	delay(hz * 5);
+
+	//fnvlist_pack_free(nvbuf, nvlen);
 }
 
 static void
@@ -323,6 +351,8 @@ agent_reader(void *arg)
 			VERIFY3U(req, <, VOS_MAXREQ);
 			zio_t *zio = vos->vos_outstanding_requests[req];
 			VERIFY3U((uintptr_t)zio->io_vsd, ==, req);
+			VERIFY3U(fnvlist_lookup_uint64(nv, AGENT_BLKID), ==,
+			    zio->io_offset >> 9);
 			zio->io_vsd = NULL;
 			vos->vos_outstanding_requests[req] = NULL;
 			VERIFY3U(len, ==, zio->io_size);
@@ -337,6 +367,8 @@ agent_reader(void *arg)
 			VERIFY3U(req, <, VOS_MAXREQ);
 			zio_t *zio = vos->vos_outstanding_requests[req];
 			VERIFY3U((uintptr_t)zio->io_vsd, ==, req);
+			VERIFY3U(fnvlist_lookup_uint64(nv, AGENT_BLKID), ==,
+			    zio->io_offset >> 9);
 			zio->io_vsd = NULL;
 			vos->vos_outstanding_requests[req] = NULL;
 			fnvlist_free(nv);
