@@ -3464,6 +3464,15 @@ zio_object_allocate_and_issue(zio_t *zio)
 	spa_t *spa = zio->io_spa;
 	metaslab_class_t *mc = spa_normal_class(spa);
 	blkptr_t *bp = zio->io_bp;
+	int flags = 0;
+
+	flags |= (zio->io_flags & ZIO_FLAG_FASTWRITE) ? METASLAB_FASTWRITE : 0;
+	if (zio->io_flags & ZIO_FLAG_NODATA)
+		flags |= METASLAB_DONT_THROTTLE;
+	if (zio->io_flags & ZIO_FLAG_GANG_CHILD)
+		flags |= METASLAB_GANG_CHILD;
+	if (zio->io_priority == ZIO_PRIORITY_ASYNC_WRITE)
+		flags |= METASLAB_ASYNC_ALLOC;
 
 	/*
 	 * For object allocation, we will issue the I/O directly
@@ -3474,7 +3483,7 @@ zio_object_allocate_and_issue(zio_t *zio)
 	spa_config_enter(spa, SCL_ALLOC, FTAG, RW_READER);
 
 	int error = metaslab_alloc(spa, mc, zio->io_size, bp,
-	    zio->io_prop.zp_copies, zio->io_txg, NULL, 0,
+	    zio->io_prop.zp_copies, zio->io_txg, NULL, flags,
 	    &zio->io_alloc_list, zio, zio->io_allocator);
 	VERIFY0(error);
 
