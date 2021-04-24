@@ -256,9 +256,10 @@ extern int find_shares_object(differ_info_t *di);
 extern void libzfs_set_pipe_max(int infd);
 extern void zfs_commit_proto(zfs_share_proto_t *);
 
-extern int get_key_material(libzfs_handle_t *hdl, boolean_t do_verify, boolean_t newkey,
-    zfs_keyformat_t keyformat, char *keylocation, const char *fsname,
-    uint8_t **km_out, size_t *kmlen_out, boolean_t *can_retry_out);
+extern int get_key_material(libzfs_handle_t *hdl, boolean_t do_verify,
+    boolean_t newkey, zfs_keyformat_t keyformat, char *keylocation,
+    const char *fsname, uint8_t **km_out, size_t *kmlen_out,
+    boolean_t *can_retry_out);
 
 #ifdef	__cplusplus
 }

@@ -1561,6 +1561,12 @@ zpool_do_create(int argc, char **argv)
 	if (nvroot == NULL)
 		goto errout;
 
+	/*
+	 * We dont' store the creds as a normal property, so remove
+	 * it now that is has been consumed.
+	 */
+	fnvlist_remove(props, ZPOOL_CONFIG_OBJSTORE_CREDENTIALS);
+
 	/* make_root_vdev() allows 0 toplevel children if there are spares */
 	if (!zfs_allocatable_devs(nvroot)) {
 		(void) fprintf(stderr, gettext("invalid vdev "

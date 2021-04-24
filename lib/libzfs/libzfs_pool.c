@@ -4955,6 +4955,6 @@ zpool_get_objstore_credentials(libzfs_handle_t *hdl, nvlist_t *props,
 	fnvlist_add_string(props,
 	    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, creds_buf);
 	free(creds_buf);
-	
+
 	return (err);
 }
