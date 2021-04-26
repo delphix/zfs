@@ -5357,6 +5357,18 @@ metaslab_free_concrete(vdev_t *vd, uint64_t offset, uint64_t asize,
 	metaslab_t *msp;
 	spa_t *spa = vd->vdev_spa;
 
+#ifdef _KERNEL
+	if (vd->vdev_ops == &vdev_object_store_ops) {
+		/*
+		 * XXX might be better to put it in ms_freeing and then send up
+		 * the whole rangetree in metaslab_sync().
+		 * XXX need to think about how to handle checkpoint.
+		 */
+		object_store_free_block(vd, offset, asize);
+		return;
+	}
+#endif
+
 	ASSERT(vdev_is_concrete(vd));
 	ASSERT3U(spa_config_held(spa, SCL_ALL, RW_READER), !=, 0);
 	ASSERT3U(offset >> vd->vdev_ms_shift, <, vd->vdev_ms_count);
@@ -6036,6 +6048,11 @@ metaslab_check_free_impl(vdev_t *vd, uint64_t offset, uint64_t size)
 
 	if ((zfs_flags & ZFS_DEBUG_ZIO_FREE) == 0)
 		return;
+
+#ifdef _KERNEL
+	if (vd->vdev_ops == &vdev_object_store_ops)
+		return;
+#endif
 
 	if (vd->vdev_ops->vdev_op_remap != NULL) {
 		vd->vdev_ops->vdev_op_remap(vd, offset, size,

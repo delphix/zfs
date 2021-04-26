@@ -192,10 +192,6 @@ agent_request_zio(vdev_object_store_t *vos, zio_t *zio, nvlist_t *nv)
 	return (req);
 }
 
-/*
- * Send read request to agent; returns request ID (index in
- * vos_outstanding_requests).
- */
 static void
 agent_read_block(vdev_object_store_t *vos, zio_t *zio)
 {
@@ -206,6 +202,20 @@ agent_read_block(vdev_object_store_t *vos, zio_t *zio)
 	zfs_dbgmsg("agent_read_block(guid=%llu blkid=%llu)",
 	    spa_guid(zio->io_spa), blockid);
 	agent_request_zio(vos, zio, nv);
+	fnvlist_free(nv);
+}
+
+static void
+agent_free_block(vdev_object_store_t *vos, uint64_t offset, uint64_t asize)
+{
+	uint64_t blockid = offset >> 9;
+	nvlist_t *nv = fnvlist_alloc();
+	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_FREE_BLOCK);
+	fnvlist_add_uint64(nv, AGENT_BLKID, blockid);
+	fnvlist_add_uint64(nv, AGENT_SIZE, asize);
+	zfs_dbgmsg("agent_free_block(blkid=%llu, asize=%llu)",
+	    blockid, asize);
+	agent_request(vos, nv);
 	fnvlist_free(nv);
 }
 
@@ -305,6 +315,14 @@ object_store_end_txg(spa_t *spa, uint64_t txg)
 	delay(hz * 5);
 
 	//fnvlist_pack_free(nvbuf, nvlen);
+}
+
+void
+object_store_free_block(vdev_t *vd, uint64_t offset, uint64_t asize)
+{
+	ASSERT3P(vd->vdev_ops, ==, &vdev_object_store_ops);
+	vdev_object_store_t *vos = vd->vdev_tsd;
+	agent_free_block(vos, offset, asize);
 }
 
 static void

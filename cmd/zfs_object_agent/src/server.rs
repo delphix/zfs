@@ -111,7 +111,12 @@ impl Server {
                         let data = nvl.lookup("data").unwrap().data();
                         let id = nvl.lookup_uint64("request_id").unwrap();
                         if let NvData::Uint8Array(slice) = data {
-                            println!("got write request id={}: {} len={}", id, block, slice.len());
+                            println!(
+                                "got write request id={}: {:?} len={}",
+                                id,
+                                block,
+                                slice.len()
+                            );
                             server.write_block(block, slice.to_vec(), id);
                         } else {
                             panic!("data not expected type")
@@ -123,9 +128,10 @@ impl Server {
                         server.free_block(block);
                     }
                     "read block" => {
+                        println!("got request: {:?}", nvl);
                         let block = BlockID(nvl.lookup_uint64("block").unwrap());
                         let id = nvl.lookup_uint64("request_id").unwrap();
-                        println!("got read request id={}: {}", id, block,);
+                        let _size = nvl.lookup_uint64("size").unwrap();
                         server.read_block(block, id);
                     }
                     other => {
