@@ -73,14 +73,17 @@
 unsigned long vdev_object_store_logical_ashift = SPA_MINBLOCKSHIFT;
 unsigned long vdev_object_store_physical_ashift = SPA_MINBLOCKSHIFT;
 
-#define	VOS_MAXREQ	100
+#define	VOS_MAXREQ	1000
 
 typedef struct vdev_object_store {
 	char *vos_access_id;
 	char *vos_secrete_key;
 	struct socket *vos_sock;
-	zio_t *vos_outstanding_requests[VOS_MAXREQ];
 	kthread_t *vos_reader;
+
+	kmutex_t vos_outstanding_lock;
+	kcondvar_t vos_outstanding_cv;
+	zio_t *vos_outstanding_requests[VOS_MAXREQ];
 } vdev_object_store_t;
 
 static mode_t
@@ -173,23 +176,41 @@ agent_request_zio(vdev_object_store_t *vos, zio_t *zio, nvlist_t *nv)
 	 * XXX need locking on requests array since this could be
 	 * called concurrently
 	 */
+	mutex_enter(&vos->vos_outstanding_lock);
+again:
 	for (req = 0; req < VOS_MAXREQ; req++) {
 		if (vos->vos_outstanding_requests[req] == NULL) {
 			vos->vos_outstanding_requests[req] = zio;
 			break;
 		}
 	}
-	/*
-	 * XXX if all slots are full, need to block and wait for
-	 * one to complete
-	 */
+
+	if (req == VOS_MAXREQ) {
+		cv_wait(&vos->vos_outstanding_cv, &vos->vos_outstanding_lock);
+		goto again;
+	}
 	VERIFY3U(req, <, VOS_MAXREQ);
 	fnvlist_add_uint64(nv, AGENT_REQUEST_ID, req);
 	zio->io_vsd = (void *)(uintptr_t)req;
 	zfs_dbgmsg("agent_request_zio(req=%llu)",
 	    req);
+	mutex_exit(&vos->vos_outstanding_lock);
 	agent_request(vos, nv);
 	return (req);
+}
+
+static zio_t *
+agent_complete_zio(vdev_object_store_t *vos, uint64_t req)
+{
+	VERIFY3U(req, <, VOS_MAXREQ);
+	mutex_enter(&vos->vos_outstanding_lock);
+	zio_t *zio = vos->vos_outstanding_requests[req];
+	VERIFY3U((uintptr_t)zio->io_vsd, ==, req);
+	zio->io_vsd = NULL;
+	vos->vos_outstanding_requests[req] = NULL;
+	cv_signal(&vos->vos_outstanding_cv);
+	mutex_exit(&vos->vos_outstanding_lock);
+	return (zio);
 }
 
 static void
@@ -358,6 +379,8 @@ agent_reader(void *arg)
 			zfs_dbgmsg("got pool create done");
 		} else if (strcmp(type, "pool open done") == 0) {
 			zfs_dbgmsg("got pool open done");
+		} else if (strcmp(type, "end txg done") == 0) {
+			zfs_dbgmsg("got end txg done");
 		} else if (strcmp(type, "read done") == 0) {
 			uint64_t req = fnvlist_lookup_uint64(nv,
 			    AGENT_REQUEST_ID);
@@ -367,12 +390,9 @@ agent_reader(void *arg)
 			zfs_dbgmsg("got read done req=%llu datalen=%u",
 			    req, len);
 			VERIFY3U(req, <, VOS_MAXREQ);
-			zio_t *zio = vos->vos_outstanding_requests[req];
-			VERIFY3U((uintptr_t)zio->io_vsd, ==, req);
+			zio_t *zio = agent_complete_zio(vos, req);
 			VERIFY3U(fnvlist_lookup_uint64(nv, AGENT_BLKID), ==,
 			    zio->io_offset >> 9);
-			zio->io_vsd = NULL;
-			vos->vos_outstanding_requests[req] = NULL;
 			VERIFY3U(len, ==, zio->io_size);
 			VERIFY3U(len, ==, abd_get_size(zio->io_abd));
 			abd_copy_from_buf(zio->io_abd, data, len);
@@ -383,12 +403,9 @@ agent_reader(void *arg)
 			    AGENT_REQUEST_ID);
 			zfs_dbgmsg("got write done req=%llu", req);
 			VERIFY3U(req, <, VOS_MAXREQ);
-			zio_t *zio = vos->vos_outstanding_requests[req];
-			VERIFY3U((uintptr_t)zio->io_vsd, ==, req);
+			zio_t *zio = agent_complete_zio(vos, req);
 			VERIFY3U(fnvlist_lookup_uint64(nv, AGENT_BLKID), ==,
 			    zio->io_offset >> 9);
-			zio->io_vsd = NULL;
-			vos->vos_outstanding_requests[req] = NULL;
 			fnvlist_free(nv);
 			zio_delay_interrupt(zio);
 		} else {
@@ -443,6 +460,8 @@ vdev_object_store_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 
 	vos = vd->vdev_tsd = kmem_zalloc(sizeof (vdev_object_store_t),
 	    KM_SLEEP);
+	mutex_init(&vos->vos_outstanding_lock, NULL, MUTEX_DEFAULT, NULL);
+	cv_init(&vos->vos_outstanding_cv, NULL, CV_DEFAULT, NULL);
 
 	error = zfs_object_store_open(vd->vdev_path,
 	    vdev_object_store_open_mode(spa_mode(vd->vdev_spa)), &sock);
@@ -491,6 +510,8 @@ vdev_object_store_close(vdev_t *vd)
 	}
 
 	vd->vdev_delayed_close = B_FALSE;
+	mutex_destroy(&vos->vos_outstanding_lock);
+	cv_destroy(&vos->vos_outstanding_cv);
 	kmem_free(vos, sizeof (vdev_object_store_t));
 	vd->vdev_tsd = NULL;
 }

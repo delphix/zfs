@@ -875,7 +875,7 @@ impl Pool {
         let pending_object = syncing_state.pending_object.as_mut().unwrap();
         pending_object.phys.blocks.insert(id, data);
         let sem = pending_object.done.clone();
-        let do_flush = pending_object.phys.blocks.len() >= 1000;
+        let do_flush = pending_object.phys.blocks.len() >= 100;
         (sem, do_flush)
     }
 
