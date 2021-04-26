@@ -4,7 +4,6 @@ use core::future::Future;
 use futures::future;
 use futures::future::*;
 use futures::stream::*;
-use futures::task;
 use s3::bucket::Bucket;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -12,10 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::mem;
 use std::ops::Bound::*;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::Context;
-use std::task::Poll;
 use std::time::{Instant, SystemTime};
 use tokio::sync::*;
 use tokio::task::JoinHandle;
@@ -244,7 +240,7 @@ struct PoolSyncingState {
     pub last_txg: TXG,
     pub syncing_txg: Option<TXG>,
     stats: PoolStatsPhys,
-    reclaim_task: Option<JoinHandle<ReclaimFreesComplete>>,
+    reclaim_task: Option<oneshot::Receiver<ReclaimFreesComplete>>,
     // Protects objects that are being overwritten for sync-to-convergence
     rewriting_objects: HashMap<ObjectID, Arc<tokio::sync::Mutex<()>>>,
 }
@@ -511,10 +507,12 @@ impl Pool {
         // XXX change this to be based on bytes, once those stats are working?
         // XXX make this tunable?
         if syncing_state.stats.pending_frees_count < syncing_state.stats.blocks_count / 100
-            || syncing_state.stats.pending_frees_count < 10_000
+            || syncing_state.stats.pending_frees_count < 1000
         {
             return;
         }
+        println!("starting to reclaim space (process pending frees) pending_frees_count={} blocks_count={}",
+            syncing_state.stats.pending_frees_count, syncing_state.stats.blocks_count);
 
         let state = self.state.clone();
 
@@ -522,7 +520,10 @@ impl Pool {
         let stream = syncing_state.pending_frees_log.iterate();
         let num_chunks = syncing_state.pending_frees_log.num_chunks();
 
-        syncing_state.reclaim_task = Some(tokio::spawn(async move {
+        let (s, r) = oneshot::channel();
+
+        syncing_state.reclaim_task = Some(r);
+        tokio::spawn(async move {
             let shared_state = &state.readonly_state;
             let mut frees: BTreeSet<BlockID> = BTreeSet::new();
 
@@ -555,6 +556,7 @@ impl Pool {
 
                 if current_obj_state.is_some() && current_obj_state.as_ref().unwrap().0 != obj {
                     let (myobj, myblocks) = current_obj_state.take().unwrap();
+                    // XXX limit amount of outstanding get/put requests?
                     join_handles.push(Self::reclaim_frees_object(
                         shared_state.clone(),
                         myobj,
@@ -593,8 +595,8 @@ impl Pool {
                 complete
             );
 
-            complete
-        }));
+            s.send(complete).unwrap();
+        });
     }
 
     pub fn end_txg_cb<F>(&mut self, uberblock: Vec<u8>, cb: F)
@@ -615,44 +617,42 @@ impl Pool {
             syncing_state.pending_frees_log.flush(txg).await;
             syncing_state.rewriting_objects.clear();
 
-            if let Some(reclaim_task) = syncing_state.reclaim_task.as_mut() {
-                let waker = task::noop_waker();
-                let mut cx = Context::from_waker(&waker);
-                match Future::poll(Pin::new(reclaim_task), &mut cx) {
-                    Poll::Ready(out) => {
-                        let rfc = out.unwrap();
-                        syncing_state.stats.blocks_count -= rfc.freed_blocks_count;
-                        syncing_state.stats.blocks_bytes -= rfc.freed_blocks_bytes;
+            if let Some(rt) = syncing_state.reclaim_task.as_mut() {
+                if let Ok(rfc) = rt.try_recv() {
+                    syncing_state.stats.blocks_count -= rfc.freed_blocks_count;
+                    syncing_state.stats.blocks_bytes -= rfc.freed_blocks_bytes;
 
-                        syncing_state.stats.pending_frees_count = 0;
-                        syncing_state.stats.pending_frees_bytes = 0;
+                    syncing_state.stats.pending_frees_count = 0;
+                    syncing_state.stats.pending_frees_bytes = 0;
 
-                        // Clear log of frees, then transfer any frees that were
-                        // not processed to the new generation. Note that we
-                        // need to call iterate_after() before clear(),
-                        // otherwise we'd just be iterating the cleared (empty)
-                        // log. iterate_after() closes over the current
-                        // generation/length so it isn't affected by clear().
-                        let stream = syncing_state
-                            .pending_frees_log
-                            .iterate_after(rfc.num_chunks);
-                        syncing_state.pending_frees_log.clear(txg).await;
-                        let begin = Instant::now();
-                        let mut count = 0u64;
-                        stream
-                            .for_each(|ent| {
-                                syncing_state.pending_frees_log.append(txg, ent);
-                                count += 1;
-                                future::ready(())
-                            })
-                            .await;
-                        println!(
-                            "transferred {} freed blocks in {}ms",
-                            count,
-                            begin.elapsed().as_millis()
-                        );
-                    }
-                    Poll::Pending => {}
+                    println!("reclaim complete; transferring tail of frees to new generation");
+
+                    // Clear log of frees, then transfer any frees that were
+                    // not processed to the new generation. Note that we
+                    // need to call iterate_after() before clear(),
+                    // otherwise we'd just be iterating the cleared (empty)
+                    // log. iterate_after() closes over the current
+                    // generation/length so it isn't affected by clear().
+                    let stream = syncing_state
+                        .pending_frees_log
+                        .iterate_after(rfc.num_chunks);
+                    syncing_state.pending_frees_log.clear(txg).await;
+                    let begin = Instant::now();
+                    let mut count = 0u64;
+                    stream
+                        .for_each(|ent| {
+                            syncing_state.pending_frees_log.append(txg, ent);
+                            count += 1;
+                            future::ready(())
+                        })
+                        .await;
+                    println!(
+                        "transferred {} freed blocks in {}ms",
+                        count,
+                        begin.elapsed().as_millis()
+                    );
+                    syncing_state.stats.pending_frees_count += count;
+                    syncing_state.reclaim_task = None;
                 }
             }
 

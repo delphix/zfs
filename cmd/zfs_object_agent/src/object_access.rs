@@ -1,3 +1,4 @@
+use core::time::Duration;
 use s3::bucket::Bucket;
 use std::env;
 use std::fs;
@@ -20,7 +21,24 @@ pub async fn get_object(bucket: &Bucket, key: &str) -> Vec<u8> {
     let prefixed_key = prefixed(key);
     println!("getting {}", prefixed_key);
     let begin = Instant::now();
-    let (data, code) = bucket.get_object(&prefixed_key).await.unwrap();
+    let data = loop {
+        let (mydata, code) = bucket.get_object(&prefixed_key).await.unwrap();
+        if code == 200 {
+            break mydata;
+        } else if code >= 500 && code < 600 {
+            println!(
+                "{}: get returned http code {}; retrying in 1 second",
+                prefixed_key, code
+            );
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            continue;
+        } else {
+            panic!(
+                "{}: get returned invalid http code {} while getting",
+                prefixed_key, code
+            );
+        }
+    };
 
     println!(
         "{}: got {} bytes in {}ms",
@@ -28,7 +46,6 @@ pub async fn get_object(bucket: &Bucket, key: &str) -> Vec<u8> {
         data.len(),
         begin.elapsed().as_millis()
     );
-    assert_eq!(code, 200);
     data
 }
 
@@ -36,28 +53,54 @@ pub async fn put_object(bucket: &Bucket, key: &str, data: &[u8]) {
     let prefixed_key = prefixed(key);
     println!("putting {}", prefixed_key);
     let begin = Instant::now();
-    let (_, code) = bucket.put_object(&prefixed_key, data).await.unwrap();
+    loop {
+        let (_, code) = bucket.put_object(&prefixed_key, data).await.unwrap();
+        if code == 200 {
+            break;
+        } else if code >= 500 && code < 600 {
+            println!(
+                "{}: put returned http code {}; retrying in 1 second",
+                prefixed_key, code
+            );
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            continue;
+        } else {
+            panic!("{}: put returned invalid http code {}", prefixed_key, code);
+        }
+    }
+
     println!(
         "{}: put {} bytes in {}ms",
         prefixed_key,
         data.len(),
         begin.elapsed().as_millis()
     );
-    assert_eq!(code, 200);
 }
 
 pub async fn delete_object(bucket: &Bucket, key: &str) {
     let prefixed_key = prefixed(key);
     println!("deleting {}", prefixed_key);
     let begin = Instant::now();
-    let (_, code) = bucket.delete_object(&prefixed_key).await.unwrap();
+    loop {
+        let (_, code) = bucket.delete_object(&prefixed_key).await.unwrap();
+        if code == 200 {
+            break;
+        } else if code >= 500 && code < 600 {
+            println!(
+                "{}: put returned http code {}; retrying in 1 second",
+                prefixed_key, code
+            );
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            continue;
+        } else {
+            panic!("{}: put returned invalid http code {}", prefixed_key, code);
+        }
+    }
     println!(
-        "{}: deletion got code={} in {}ms",
+        "{}: deleted in {}ms",
         prefixed_key,
-        code,
         begin.elapsed().as_millis()
     );
-    assert_eq!(code, 204);
 }
 
 pub async fn object_exists(bucket: &Bucket, key: &str) -> bool {

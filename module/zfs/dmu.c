@@ -2068,7 +2068,7 @@ dmu_write_policy(objset_t *os, dnode_t *dn, int level, int wp, zio_prop_t *zp)
 	zp->zp_checksum = checksum;
 	zp->zp_type = (wp & WP_SPILL) ? dn->dn_bonustype : type;
 	zp->zp_level = level;
-	//zp->zp_copies = MIN(copies, spa_max_replication(os->os_spa));
+	// zp->zp_copies = MIN(copies, spa_max_replication(os->os_spa));
 	zp->zp_copies = 1; // XXX for object store
 	zp->zp_dedup = dedup;
 	zp->zp_dedup_verify = dedup && dedup_verify;

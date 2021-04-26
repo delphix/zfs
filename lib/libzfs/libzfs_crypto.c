@@ -416,7 +416,7 @@ get_key_material_raw(FILE *fd, zfs_keyformat_t keyformat,
 	if (keyformat == ZFS_KEYFORMAT_RAW || keyformat == ZFS_KEYFORMAT_INI) {
 		size_t n;
 		size_t buf_len = (keyformat == ZFS_KEYFORMAT_INI)
-			? MAX_INI_FILE_LEN : WRAPPING_KEY_LEN + 1;
+		    ? MAX_INI_FILE_LEN : WRAPPING_KEY_LEN + 1;
 
 		/*
 		 * Raw keys may have newline characters in them and so can't

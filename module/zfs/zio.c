@@ -3800,7 +3800,6 @@ zio_vdev_io_start(zio_t *zio)
 	uint64_t align;
 	spa_t *spa = zio->io_spa;
 
-	//zfs_dbgmsg("zio_vdev_io_start(%px), vd=%px", zio, vd);
 	zio->io_delay = 0;
 
 	ASSERT(zio->io_error == 0);
@@ -3932,8 +3931,6 @@ zio_vdev_io_start(zio_t *zio)
 
 #if 0
 		if ((zio = vdev_queue_io(zio)) == NULL) {
-			zfs_dbgmsg("zio_vdev_io_start(%px), vdev_queue_io() returned NULL",
-				zio);
 			return (NULL);
 		}
 #endif
@@ -3945,8 +3942,6 @@ zio_vdev_io_start(zio_t *zio)
 		}
 		zio->io_delay = gethrtime();
 	}
-
-	//zfs_dbgmsg("zio_vdev_io_start(%px), vd=%px calling vdev_op_io_start()", zio, vd);
 
 	vd->vdev_ops->vdev_op_io_start(zio);
 	return (NULL);
@@ -4443,8 +4438,6 @@ zio_ready(zio_t *zio)
 	zio_t *pio, *pio_next;
 	zio_link_t *zl = NULL;
 
-	//zfs_dbgmsg("zio_ready(%px)", zio);
-
 	if (zio_wait_for_children(zio, ZIO_CHILD_GANG_BIT | ZIO_CHILD_DDT_BIT,
 	    ZIO_WAIT_READY)) {
 		return (NULL);
@@ -4510,8 +4503,6 @@ zio_ready(zio_t *zio)
 	if (zio_injection_enabled &&
 	    zio->io_spa->spa_syncing_txg == zio->io_txg)
 		zio_handle_ignored_writes(zio);
-
-	//zfs_dbgmsg("zio_ready(%px) complete", zio);
 
 	return (zio);
 }

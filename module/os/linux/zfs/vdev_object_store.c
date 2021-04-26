@@ -82,12 +82,15 @@ typedef struct vdev_object_store {
 	char *vos_endpoint;
 	char *vos_region;
 	char *vos_credentials;
-	struct socket *vos_sock;
 	kthread_t *vos_reader;
+
+	kmutex_t vos_sock_lock;
+	struct socket *vos_sock;
 
 	kmutex_t vos_outstanding_lock;
 	kcondvar_t vos_outstanding_cv;
 	zio_t *vos_outstanding_requests[VOS_MAXREQ];
+	boolean_t vos_serial_done;
 } vdev_object_store_t;
 
 static mode_t
@@ -161,8 +164,17 @@ agent_request(vdev_object_store_t *vos, nvlist_t *nv)
 	iov[1].iov_len = iov_size;
 	uint64_t total_size = sizeof (size64) + iov_size;
 	// XXX need locking on socket?
-	VERIFY3U(kernel_sendmsg(vos->vos_sock, &msg, iov,
-	    2, total_size), ==, total_size);
+	mutex_enter(&vos->vos_sock_lock);
+	size_t sent = kernel_sendmsg(vos->vos_sock, &msg, iov,
+	    2, total_size);
+	mutex_exit(&vos->vos_sock_lock);
+	if (sent != total_size) {
+		zfs_dbgmsg("sent wrong length to agent socket: "
+		    "expected %d got %d",
+		    (int)total_size, (int)sent);
+		for (;;)
+			delay(hz);
+	}
 
 	fnvlist_pack_free(iov_buf, iov_size);
 }
@@ -215,6 +227,20 @@ agent_complete_zio(vdev_object_store_t *vos, uint64_t req)
 	cv_signal(&vos->vos_outstanding_cv);
 	mutex_exit(&vos->vos_outstanding_lock);
 	return (zio);
+}
+
+/*
+ * Wait for a one-at-a-time operation to complete
+ * (pool create, pool open, txg end).
+ */
+static void
+agent_wait_serial(vdev_object_store_t *vos)
+{
+	mutex_enter(&vos->vos_outstanding_lock);
+	while (!vos->vos_serial_done)
+		cv_wait(&vos->vos_outstanding_cv, &vos->vos_outstanding_lock);
+	vos->vos_serial_done = B_FALSE;
+	mutex_exit(&vos->vos_outstanding_lock);
 }
 
 static void
@@ -338,14 +364,12 @@ object_store_end_txg(spa_t *spa, uint64_t txg)
 	vdev_t *vd = spa->spa_root_vdev->vdev_child[0];
 	ASSERT3P(vd->vdev_ops, ==, &vdev_object_store_ops);
 	vdev_object_store_t *vos = vd->vdev_tsd;
-	//size_t nvlen;
-	//char *nvbuf = fnvlist_pack(spa->spa_config_syncing, &nvlen);
+	// size_t nvlen;
+	// char *nvbuf = fnvlist_pack(spa->spa_config_syncing, &nvlen);
 	agent_end_txg(vos, txg,
 	    &spa->spa_uberblock, sizeof (spa->spa_uberblock));
-	// XXX wait for response
-	delay(hz * 5);
-
-	//fnvlist_pack_free(nvbuf, nvlen);
+	agent_wait_serial(vos);
+	// fnvlist_pack_free(nvbuf, nvlen);
 }
 
 void
@@ -359,14 +383,37 @@ object_store_free_block(vdev_t *vd, uint64_t offset, uint64_t asize)
 static void
 agent_read_all(vdev_object_store_t *vos, void *buf, size_t len)
 {
-	struct msghdr msg = {};
-	struct kvec iov = {};
+	size_t recvd_total = 0;
+	while (recvd_total < len) {
+		struct msghdr msg = {};
+		struct kvec iov = {};
 
-	iov.iov_base = buf;
-	iov.iov_len = len;
+		iov.iov_base = buf + recvd_total;
+		iov.iov_len = len - recvd_total;
 
-	// XXX need a loop to keep trying to read?
-	VERIFY3S(kernel_recvmsg(vos->vos_sock, &msg, &iov, 1, len, 0), ==, len);
+		size_t recvd = kernel_recvmsg(vos->vos_sock,
+		    &msg, &iov, 1, len - recvd_total, 0);
+		if (recvd > 0) {
+			recvd_total += recvd;
+			if (recvd_total < len) {
+				zfs_dbgmsg("incomplete recvmsg but trying for "
+				    "more len=%d recvd=%d recvd_total=%d",
+				    (int)len,
+				    (int)recvd,
+				    (int)recvd_total);
+			}
+		} else {
+			zfs_dbgmsg("got wrong length from agent socket: "
+			    "for total size %d, already received %d, "
+			    "expected up to %d got %d",
+			    (int)len,
+			    (int)recvd_total,
+			    (int)(len - recvd_total),
+			    (int)recvd);
+			for (;;)
+				delay(hz);
+		}
+	}
 }
 
 static void
@@ -379,18 +426,28 @@ agent_reader(void *arg)
 		agent_read_all(vos, &nvlist_len, sizeof (nvlist_len));
 		void *buf = kmem_alloc(nvlist_len, KM_SLEEP);
 		agent_read_all(vos, buf, nvlist_len);
-		nvlist_t *nv = fnvlist_unpack(buf, nvlist_len);
+		nvlist_t *nv;
+		int err = nvlist_unpack(buf, nvlist_len, &nv, KM_SLEEP);
+		if (err != 0) {
+			zfs_dbgmsg("got error %d from nvlist_unpack(len=%d)",
+			    err, (int)nvlist_len);
+			for (;;)
+				delay(hz);
+		}
+		// nvlist_t *nv = fnvlist_unpack(buf, nvlist_len);
 		kmem_free(buf, nvlist_len);
 
 		const char *type = fnvlist_lookup_string(nv, AGENT_TYPE);
 		zfs_dbgmsg("got response from agent type=%s", type);
 		// XXX debug message the nvlist
-		if (strcmp(type, "pool create done") == 0) {
-			zfs_dbgmsg("got pool create done");
-		} else if (strcmp(type, "pool open done") == 0) {
-			zfs_dbgmsg("got pool open done");
-		} else if (strcmp(type, "end txg done") == 0) {
-			zfs_dbgmsg("got end txg done");
+		if (strcmp(type, "pool create done") == 0 ||
+		    strcmp(type, "pool open done") == 0 ||
+		    strcmp(type, "end txg done") == 0) {
+			mutex_enter(&vos->vos_outstanding_lock);
+			ASSERT(!vos->vos_serial_done);
+			vos->vos_serial_done = B_TRUE;
+			cv_broadcast(&vos->vos_outstanding_cv);
+			mutex_exit(&vos->vos_outstanding_lock);
 		} else if (strcmp(type, "read done") == 0) {
 			uint64_t req = fnvlist_lookup_uint64(nv,
 			    AGENT_REQUEST_ID);
@@ -431,20 +488,24 @@ vdev_object_store_init(spa_t *spa, nvlist_t *nv, void **tsd)
 	char *val = NULL;
 
 	vos = *tsd = kmem_zalloc(sizeof (vdev_object_store_t), KM_SLEEP);
+	mutex_init(&vos->vos_sock_lock, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&vos->vos_outstanding_lock, NULL, MUTEX_DEFAULT, NULL);
 	cv_init(&vos->vos_outstanding_cv, NULL, CV_DEFAULT, NULL);
 
-	if (!nvlist_lookup_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_ENDPOINT), &val)) {
+	if (!nvlist_lookup_string(nv,
+	    zpool_prop_to_name(ZPOOL_PROP_OBJ_ENDPOINT), &val)) {
 		vos->vos_endpoint = kmem_strdup(val);
 	} else {
 		return (SET_ERROR(EINVAL));
 	}
-	if (!nvlist_lookup_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_REGION), &val)) {
+	if (!nvlist_lookup_string(nv,
+	    zpool_prop_to_name(ZPOOL_PROP_OBJ_REGION), &val)) {
 		vos->vos_region = kmem_strdup(val);
 	} else {
 		return (SET_ERROR(EINVAL));
 	}
-	if (!nvlist_lookup_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), &val)) {
+	if (!nvlist_lookup_string(nv,
+	    zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), &val)) {
 		vos->vos_credentials = kmem_strdup(val);
 	} else {
 		return (SET_ERROR(EINVAL));
@@ -461,6 +522,7 @@ vdev_object_store_fini(vdev_t *vd)
 {
 	vdev_object_store_t *vos = vd->vdev_tsd;
 
+	mutex_destroy(&vos->vos_sock_lock);
 	mutex_destroy(&vos->vos_outstanding_lock);
 	cv_destroy(&vos->vos_outstanding_cv);
 	if (vos->vos_endpoint != NULL) {
@@ -537,12 +599,10 @@ vdev_object_store_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 
 	if (vd->vdev_spa->spa_load_state == SPA_LOAD_CREATE) {
 		agent_create_pool(vd, vos);
-		// XXX wait for response from agent
-		delay(hz * 5);
+		agent_wait_serial(vos);
 	}
 	agent_open_pool(vd, vos);
-	// XXX wait for response from agent
-	delay(hz * 5);
+	agent_wait_serial(vos);
 
 skip_open:
 

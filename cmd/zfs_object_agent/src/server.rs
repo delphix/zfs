@@ -17,13 +17,18 @@ pub struct Server {
     output: Arc<tokio::sync::Mutex<OwnedWriteHalf>>,
     // Pool is Some once we get a "open pool" request
     pool: Option<Pool>,
+    num_outstanding_writes: Arc<std::sync::Mutex<usize>>,
 }
 
 impl Server {
     async fn get_next_request(pipe: &mut OwnedReadHalf) -> tokio::io::Result<NvList> {
         // XXX kernel sends this as host byte order
         let len64 = pipe.read_u64_le().await?;
-        //println!("got request len: {}", len64);
+        println!("got request len: {}", len64);
+        if len64 > 20_000_000 {
+            // max zfs block size is 16MB
+            panic!("got unreasonable request length {} ({:#x})", len64, len64);
+        }
 
         let mut v = Vec::new();
         v.resize(len64 as usize, 0);
@@ -38,6 +43,7 @@ impl Server {
             input: r,
             output: Arc::new(Mutex::new(w)),
             pool: None,
+            num_outstanding_writes: Arc::new(std::sync::Mutex::new(0)),
         };
         tokio::spawn(async move {
             loop {
@@ -48,8 +54,13 @@ impl Server {
                 .await
                 {
                     Err(_) => {
-                        // timed out
-                        if server.pool.is_some() {
+                        // timed out. Note that we can not call flush_writes()
+                        // while in the middle of a end_txg(). So we only do it
+                        // while there are writes in progress, which can't be
+                        // the case during an end_txg().
+                        if server.pool.is_some()
+                            && *server.num_outstanding_writes.lock().unwrap() > 0
+                        {
                             server.flush_writes();
                         }
                         continue;
@@ -115,13 +126,13 @@ impl Server {
                     "free block" => {
                         println!("got request: {:?}", nvl);
                         let block = BlockID(nvl.lookup_uint64("block").unwrap());
+                        let _size = nvl.lookup_uint64("size").unwrap();
                         server.free_block(block);
                     }
                     "read block" => {
                         println!("got request: {:?}", nvl);
                         let block = BlockID(nvl.lookup_uint64("block").unwrap());
                         let id = nvl.lookup_uint64("request_id").unwrap();
-                        let _size = nvl.lookup_uint64("size").unwrap();
                         server.read_block(block, id);
                     }
                     other => {
@@ -134,12 +145,13 @@ impl Server {
     }
 
     async fn send_response(output: &Mutex<OwnedWriteHalf>, nvl: NvList) {
-        println!("sending response: {:?}", nvl);
+        //println!("sending response: {:?}", nvl);
         let buf = nvl.pack(NvEncoding::Native).unwrap();
         drop(nvl);
         let len64 = buf.len() as u64;
         let mut w = output.lock().await;
         // XXX kernel expects this as host byte order
+        println!("sending response of {} bytes", len64);
         w.write_u64_le(len64).await.unwrap();
         w.write(buf.as_slice()).await.unwrap();
     }
@@ -202,6 +214,7 @@ impl Server {
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "pool create done").unwrap();
         nvl.insert("GUID", &guid.0).unwrap();
+        println!("sending response: {:?}", nvl);
         Self::send_response(&self.output, nvl).await;
     }
 
@@ -214,6 +227,7 @@ impl Server {
         nvl.insert("GUID", &guid.0).unwrap();
         nvl.insert("next txg", &(last_txg.0 + 1)).unwrap();
         nvl.insert("next block", &next_block.0).unwrap();
+        println!("sending response: {:?}", nvl);
         Self::send_response(&self.output, nvl).await;
     }
 
@@ -234,6 +248,7 @@ impl Server {
         pool.end_txg_cb(uberblock, async move {
             let mut nvl = NvList::new_unique_names();
             nvl.insert("Type", "end txg done").unwrap();
+            println!("sending response: {:?}", nvl);
             Self::send_response(&output, nvl).await;
         });
     }
@@ -243,11 +258,21 @@ impl Server {
     fn write_block(&mut self, block: BlockID, data: Vec<u8>, request_id: u64) {
         let pool = self.pool.as_mut().unwrap();
         let output = self.output.clone();
+        let now = self.num_outstanding_writes.clone();
+        let mut count = now.lock().unwrap();
+        *count += 1;
+        drop(count);
         pool.write_block_cb(block, data, async move {
+            // Note: {braces} needed so that count goes away before the .await
+            {
+                let mut count = now.lock().unwrap();
+                *count -= 1;
+            }
             let mut nvl = NvList::new_unique_names();
             nvl.insert("Type", "write done").unwrap();
             nvl.insert("block", &block.0).unwrap();
             nvl.insert("request_id", &request_id).unwrap();
+            println!("sending response: {:?}", nvl);
             Self::send_response(&output, nvl).await;
         });
     }
@@ -267,6 +292,12 @@ impl Server {
             nvl.insert("block", &block.0).unwrap();
             nvl.insert("data", data.as_slice()).unwrap();
             nvl.insert("request_id", &request_id).unwrap();
+            println!(
+                "sending read done response: block={} req={} data=[{} bytes]",
+                block,
+                request_id,
+                data.len()
+            );
             Self::send_response(&output, nvl).await;
         });
     }

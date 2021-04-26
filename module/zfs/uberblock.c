@@ -70,6 +70,6 @@ uberblock_update(uberblock_t *ub, vdev_t *rvd, uint64_t txg, uint64_t mmp_delay)
 	}
 	ub->ub_checkpoint_txg = 0;
 
-	//return (ub->ub_rootbp.blk_birth == txg);
+	// return (ub->ub_rootbp.blk_birth == txg);
 	return (B_TRUE); // XXX no noop txg's for objectstore
 }
