@@ -54,6 +54,7 @@
 #define	MIN_PASSPHRASE_LEN 8
 #define	MAX_PASSPHRASE_LEN 512
 #define	MAX_KEY_PROMPT_ATTEMPTS 3
+#define	MAX_INI_FILE_LEN 1024
 
 static int caught_interrupt;
 
@@ -412,7 +413,35 @@ get_key_material_raw(FILE *fd, zfs_keyformat_t keyformat,
 	*len_out = 0;
 
 	/* read the key material */
-	if (keyformat != ZFS_KEYFORMAT_RAW) {
+	if (keyformat == ZFS_KEYFORMAT_RAW || keyformat == ZFS_KEYFORMAT_INI) {
+		size_t n;
+		size_t buf_len = (keyformat == ZFS_KEYFORMAT_INI)
+			? MAX_INI_FILE_LEN : WRAPPING_KEY_LEN + 1;
+
+		/*
+		 * Raw keys may have newline characters in them and so can't
+		 * use getline(). Here we attempt to read 33 bytes so that we
+		 * can properly check the key length (the file should only have
+		 * 32 bytes). For INI files, we read MAX_INI_FILE_LEN bytes.
+		 */
+		*buf = malloc(buf_len * sizeof (uint8_t));
+		if (*buf == NULL) {
+			ret = ENOMEM;
+			goto out;
+		}
+
+		n = fread(*buf, 1, buf_len, fd);
+		if (n == 0 || ferror(fd)) {
+			/* size errors are handled by the calling function */
+			free(*buf);
+			*buf = NULL;
+			ret = errno;
+			errno = 0;
+			goto out;
+		}
+
+		*len_out = n;
+	} else {
 		ssize_t bytes;
 
 		bytes = getline((char **)buf, &buflen, fd);
@@ -429,32 +458,6 @@ get_key_material_raw(FILE *fd, zfs_keyformat_t keyformat,
 		}
 
 		*len_out = bytes;
-	} else {
-		size_t n;
-
-		/*
-		 * Raw keys may have newline characters in them and so can't
-		 * use getline(). Here we attempt to read 33 bytes so that we
-		 * can properly check the key length (the file should only have
-		 * 32 bytes).
-		 */
-		*buf = malloc((WRAPPING_KEY_LEN + 1) * sizeof (uint8_t));
-		if (*buf == NULL) {
-			ret = ENOMEM;
-			goto out;
-		}
-
-		n = fread(*buf, 1, WRAPPING_KEY_LEN + 1, fd);
-		if (n == 0 || ferror(fd)) {
-			/* size errors are handled by the calling function */
-			free(*buf);
-			*buf = NULL;
-			ret = errno;
-			errno = 0;
-			goto out;
-		}
-
-		*len_out = n;
 	}
 out:
 	return (ret);

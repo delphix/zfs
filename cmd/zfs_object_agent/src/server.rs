@@ -67,12 +67,7 @@ impl Server {
                         println!("got request: {:?}", nvl);
                         let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
                         let name = nvl.lookup_string("name").unwrap();
-                        let bucket_name = nvl.lookup_string("bucket").unwrap();
-                        let region = Region::UsWest2;
-                        let credentials = Credentials::default().unwrap();
-                        let bucket =
-                            Bucket::new(bucket_name.to_str().unwrap(), region, credentials)
-                                .unwrap();
+                        let bucket = Self::get_bucket(nvl.as_ref());
                         server
                             .create_pool(&bucket, guid, name.to_str().unwrap())
                             .await;
@@ -80,12 +75,7 @@ impl Server {
                     "open pool" => {
                         println!("got request: {:?}", nvl);
                         let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
-                        let bucket_name = nvl.lookup_string("bucket").unwrap();
-                        let region = Region::UsWest2;
-                        let credentials = Credentials::default().unwrap();
-                        let bucket =
-                            Bucket::new(bucket_name.to_str().unwrap(), region, credentials)
-                                .unwrap();
+                        let bucket = Self::get_bucket(nvl.as_ref());
                         server.open_pool(&bucket, guid).await;
                     }
                     "begin txg" => {
@@ -152,6 +142,59 @@ impl Server {
         // XXX kernel expects this as host byte order
         w.write_u64_le(len64).await.unwrap();
         w.write(buf.as_slice()).await.unwrap();
+    }
+
+    // Construct a custom Region.
+    fn get_region(region_str: &str, endpoint: &str) -> Region {
+        let region = Region::Custom {
+            region: region_str.to_owned(),
+            endpoint: endpoint.to_owned(),
+        };
+
+        region
+    }
+
+    fn get_credentials(nvl: &nvpair::NvListRef) -> Credentials {
+        let mut access_key_id = "";
+        let mut secret_access_key = "";
+
+        let credentials = nvl.lookup_string("credentials").unwrap();
+        for line in credentials.to_str().unwrap().lines() {
+            if !line.starts_with("#") {
+                let mut iter = line.split("=");
+                let name = iter.next().unwrap().trim().to_lowercase();
+                let value = iter.next().unwrap().trim();
+                if name.eq("objectstore-access-key-id") {
+                    access_key_id = value;
+                } else if name.eq("objectstore-secret-access-key") {
+                    secret_access_key = value;
+                }
+            }
+        }
+        let credentials = Credentials::new(
+            Some(access_key_id),
+            Some(secret_access_key),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        credentials
+    }
+
+    fn get_bucket(nvl: &nvpair::NvListRef) -> s3::bucket::Bucket {
+        let bucket_name = nvl.lookup_string("bucket").unwrap();
+        let region_str = nvl.lookup_string("region").unwrap();
+        let endpoint = nvl.lookup_string("endpoint").unwrap();
+        let region: Region =
+            Self::get_region(region_str.to_str().unwrap(), endpoint.to_str().unwrap());
+        println!("region: {:?}", region);
+        println!("Endpoint: {}", region.endpoint());
+
+        let credentials = Self::get_credentials(nvl);
+
+        Bucket::new(bucket_name.to_str().unwrap(), region, credentials).unwrap()
     }
 
     async fn create_pool(&mut self, bucket: &Bucket, guid: PoolGUID, name: &str) {

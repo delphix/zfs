@@ -263,7 +263,7 @@ static nvlist_t *
 make_objstore_vdev(nvlist_t *props, const char *arg)
 {
 	nvlist_t *vdev = fnvlist_alloc();
-	char *endpoint, *creds;
+	char *endpoint, *region, *creds;
 	fnvlist_add_string(vdev, ZPOOL_CONFIG_PATH, arg);
 	fnvlist_add_string(vdev, ZPOOL_CONFIG_TYPE, VDEV_TYPE_OBJSTORE);
 
@@ -276,6 +276,16 @@ make_objstore_vdev(nvlist_t *props, const char *arg)
 	}
 	fnvlist_add_string(vdev, zpool_prop_to_name(ZPOOL_PROP_OBJ_ENDPOINT),
 	    endpoint);
+
+	if ((nvlist_lookup_string(props,
+	    zpool_prop_to_name(ZPOOL_PROP_OBJ_REGION), &region)) != 0) {
+		fprintf(stderr, gettext("No region provided for objstore "
+		    "vdev %s\n"), arg);
+		fnvlist_free(vdev);
+		return (NULL);
+	}
+	fnvlist_add_string(vdev, zpool_prop_to_name(ZPOOL_PROP_OBJ_REGION),
+	    region);
 
 	if ((nvlist_lookup_string(props,
 	    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, &creds)) != 0) {

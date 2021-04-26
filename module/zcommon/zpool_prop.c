@@ -77,6 +77,8 @@ zpool_prop_init(void)
 	    "<file[,file...]> | off | legacy", "COMPATIBILITY");
 	zprop_register_string(ZPOOL_PROP_OBJ_ENDPOINT, "object-endpoint", NULL,
 	    PROP_DEFAULT, ZFS_TYPE_POOL, "<uri>", "OBJ_ENDPOINT");
+	zprop_register_string(ZPOOL_PROP_OBJ_REGION, "object-region", NULL,
+	    PROP_DEFAULT, ZFS_TYPE_POOL, "<uri>", "OBJ_REGION");
 	zprop_register_string(ZPOOL_PROP_OBJ_CREDENTIALS,
 	    "object-credentials-location", NULL, PROP_DEFAULT, ZFS_TYPE_POOL,
 	    "<uri>", "OBJ_CREDENTIALS");

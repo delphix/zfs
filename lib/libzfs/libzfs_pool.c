@@ -4944,7 +4944,7 @@ zpool_get_objstore_credentials(libzfs_handle_t *hdl, nvlist_t *props,
 	char *creds_buf;
 	size_t creds_len;
 	int err = get_key_material(hdl, B_FALSE, B_FALSE,
-	    ZFS_KEYFORMAT_PASSPHRASE, creds, NULL, (uint8_t **)&creds_buf,
+	    ZFS_KEYFORMAT_INI, creds, NULL, (uint8_t **)&creds_buf,
 	    &creds_len, NULL);
 	if (err != 0) {
 		(void) zpool_standard_error_fmt(hdl, EINVAL,

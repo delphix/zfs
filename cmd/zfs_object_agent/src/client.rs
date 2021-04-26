@@ -62,20 +62,58 @@ impl Client {
         self.output.write_all(buf.as_ref()).await.unwrap();
     }
 
-    pub async fn create_pool(&mut self, bucket_name: &str, guid: PoolGUID, name: &str) {
+    fn get_credential_string(aws_key_id: &str, secret_key: &str) -> String {
+        let credentials = format!(
+            "objectstore-access-key-id = {} \n objectstore-secret-access-key = {} \n",
+            aws_key_id, secret_key
+        )
+        .to_string();
+
+        credentials
+    }
+
+    pub async fn create_pool(
+        &mut self,
+        aws_key_id: &str,
+        secret_key: &str,
+        region: &str,
+        endpoint: &str,
+        bucket_name: &str,
+        guid: PoolGUID,
+        name: &str,
+    ) {
         let mut nvl = NvList::new_unique_names();
+        let credentials = Self::get_credential_string(aws_key_id, secret_key);
+
         nvl.insert("Type", "create pool").unwrap();
-        nvl.insert("GUID", &guid.0).unwrap();
+        nvl.insert("credentials", credentials.as_str()).unwrap();
+        nvl.insert("region", region).unwrap();
+        nvl.insert("endpoint", endpoint).unwrap();
         nvl.insert("bucket", bucket_name).unwrap();
+        nvl.insert("GUID", &guid.0).unwrap();
         nvl.insert("name", name).unwrap();
+
         self.send_request(nvl.as_ref()).await;
     }
 
-    pub async fn open_pool(&mut self, bucket_name: &str, guid: PoolGUID) {
+    pub async fn open_pool(
+        &mut self,
+        aws_key_id: &str,
+        secret_key: &str,
+        region: &str,
+        endpoint: &str,
+        bucket_name: &str,
+        guid: PoolGUID,
+    ) {
         let mut nvl = NvList::new_unique_names();
+        let credentials = Self::get_credential_string(aws_key_id, secret_key);
+
         nvl.insert("Type", "open pool").unwrap();
-        nvl.insert("GUID", &guid.0).unwrap();
+        nvl.insert("credentials", credentials.as_str()).unwrap();
+        nvl.insert("region", region).unwrap();
+        nvl.insert("endpoint", endpoint).unwrap();
         nvl.insert("bucket", bucket_name).unwrap();
+        nvl.insert("GUID", &guid.0).unwrap();
         self.send_request(nvl.as_ref()).await;
     }
 

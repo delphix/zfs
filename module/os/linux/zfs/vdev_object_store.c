@@ -58,6 +58,9 @@
 #define	AGENT_TXG		"TXG"
 #define	AGENT_GUID		"GUID"
 #define	AGENT_BUCKET		"bucket"
+#define	AGENT_CREDENTIALS	"credentials"
+#define	AGENT_ENDPOINT	"endpoint"
+#define	AGENT_REGION	"region"
 #define	AGENT_BLKID		"block"
 #define	AGENT_DATA		"data"
 #define	AGENT_REQUEST_ID	"request_id"
@@ -76,8 +79,9 @@ unsigned long vdev_object_store_physical_ashift = SPA_MINBLOCKSHIFT;
 #define	VOS_MAXREQ	1000
 
 typedef struct vdev_object_store {
-	char *vos_access_id;
-	char *vos_secrete_key;
+	char *vos_endpoint;
+	char *vos_region;
+	char *vos_credentials;
 	struct socket *vos_sock;
 	kthread_t *vos_reader;
 
@@ -265,6 +269,9 @@ agent_create_pool(vdev_t *vd, vdev_object_store_t *vos)
 	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_CREATE_POOL);
 	fnvlist_add_string(nv, AGENT_NAME, spa_name(vd->vdev_spa));
 	fnvlist_add_uint64(nv, AGENT_GUID, spa_guid(vd->vdev_spa));
+	fnvlist_add_string(nv, AGENT_CREDENTIALS, vos->vos_credentials);
+	fnvlist_add_string(nv, AGENT_ENDPOINT, vos->vos_endpoint);
+	fnvlist_add_string(nv, AGENT_REGION, vos->vos_region);
 	fnvlist_add_string(nv, AGENT_BUCKET, vd->vdev_path);
 	zfs_dbgmsg("agent_create_pool(guid=%llu name=%s bucket=%s)",
 	    spa_guid(vd->vdev_spa),
@@ -280,6 +287,9 @@ agent_open_pool(vdev_t *vd, vdev_object_store_t *vos)
 	nvlist_t *nv = fnvlist_alloc();
 	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_OPEN_POOL);
 	fnvlist_add_uint64(nv, AGENT_GUID, spa_guid(vd->vdev_spa));
+	fnvlist_add_string(nv, AGENT_CREDENTIALS, vos->vos_credentials);
+	fnvlist_add_string(nv, AGENT_ENDPOINT, vos->vos_endpoint);
+	fnvlist_add_string(nv, AGENT_REGION, vos->vos_region);
 	fnvlist_add_string(nv, AGENT_BUCKET, vd->vdev_path);
 	zfs_dbgmsg("agent_open_pool(guid=%llu bucket=%s)",
 	    spa_guid(vd->vdev_spa),
@@ -415,6 +425,52 @@ agent_reader(void *arg)
 }
 
 static int
+vdev_object_store_init(spa_t *spa, nvlist_t *nv, void **tsd)
+{
+	vdev_object_store_t *vos;
+	char *val = NULL;
+
+	vos = *tsd = kmem_zalloc(sizeof (vdev_object_store_t), KM_SLEEP);
+	mutex_init(&vos->vos_outstanding_lock, NULL, MUTEX_DEFAULT, NULL);
+	cv_init(&vos->vos_outstanding_cv, NULL, CV_DEFAULT, NULL);
+
+	if (!nvlist_lookup_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_ENDPOINT), &val)) {
+		vos->vos_endpoint = kmem_strdup(val);
+	} else {
+		return (SET_ERROR(EINVAL));
+	}
+	if (!nvlist_lookup_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_REGION), &val)) {
+		vos->vos_region = kmem_strdup(val);
+	} else {
+		return (SET_ERROR(EINVAL));
+	}
+	if (!nvlist_lookup_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), &val)) {
+		vos->vos_credentials = kmem_strdup(val);
+	} else {
+		return (SET_ERROR(EINVAL));
+	}
+
+	zfs_dbgmsg("vdev_object_store_init, endpoint=%s region=%s cred=%s",
+	    vos->vos_endpoint, vos->vos_region, vos->vos_credentials);
+
+	return (0);
+}
+
+static void
+vdev_object_store_fini(vdev_t *vd)
+{
+	vdev_object_store_t *vos = vd->vdev_tsd;
+
+	mutex_destroy(&vos->vos_outstanding_lock);
+	cv_destroy(&vos->vos_outstanding_cv);
+	kmem_free(vd->vdev_tsd, sizeof (vdev_object_store_t));
+	vd->vdev_tsd = NULL;
+
+	zfs_dbgmsg("vdev_object_store_fini");
+}
+
+
+static int
 vdev_object_store_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
     uint64_t *logical_ashift, uint64_t *physical_ashift)
 {
@@ -447,21 +503,16 @@ vdev_object_store_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 		return (SET_ERROR(EINVAL));
 	}
 
+	vos = vd->vdev_tsd;
+
 	/*
 	 * Reopen the device if it's not currently open.  Otherwise,
 	 * just update the physical size of the device.
 	 */
-	if (vd->vdev_tsd != NULL) {
-		ASSERT(vd->vdev_reopening);
-		vos = vd->vdev_tsd;
+	if (vd->vdev_reopening) {
 		goto skip_open;
 	}
 	ASSERT(vd->vdev_path != NULL);
-
-	vos = vd->vdev_tsd = kmem_zalloc(sizeof (vdev_object_store_t),
-	    KM_SLEEP);
-	mutex_init(&vos->vos_outstanding_lock, NULL, MUTEX_DEFAULT, NULL);
-	cv_init(&vos->vos_outstanding_cv, NULL, CV_DEFAULT, NULL);
 
 	error = zfs_object_store_open(vd->vdev_path,
 	    vdev_object_store_open_mode(spa_mode(vd->vdev_spa)), &sock);
@@ -510,10 +561,6 @@ vdev_object_store_close(vdev_t *vd)
 	}
 
 	vd->vdev_delayed_close = B_FALSE;
-	mutex_destroy(&vos->vos_outstanding_lock);
-	cv_destroy(&vos->vos_outstanding_cv);
-	kmem_free(vos, sizeof (vdev_object_store_t));
-	vd->vdev_tsd = NULL;
 }
 
 static void
@@ -579,8 +626,8 @@ vdev_object_store_io_done(zio_t *zio)
 }
 
 vdev_ops_t vdev_object_store_ops = {
-	.vdev_op_init = NULL,
-	.vdev_op_fini = NULL,
+	.vdev_op_init = vdev_object_store_init,
+	.vdev_op_fini = vdev_object_store_fini,
 	.vdev_op_open = vdev_object_store_open,
 	.vdev_op_close = vdev_object_store_close,
 	.vdev_op_asize = vdev_default_asize,

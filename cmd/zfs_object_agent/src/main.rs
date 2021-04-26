@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryInto;
+use std::env;
 use std::error::Error;
 use std::fs;
 use std::fs::File;
@@ -27,6 +28,12 @@ mod server;
 
 //#[macro_use]
 //extern crate more_asserts;
+
+const ENDPOINT: &str = "https://s3-us-west-2.amazonaws.com";
+const REGION: &str = "us-west-2";
+const BUCKET_NAME: &str = "cloudburst-data-2";
+const POOL_NAME: &str = "testpool";
+const POOL_GUID: u64 = 1234;
 
 thread_local!(static RNG: RefCell<ThreadRng> = RefCell::new(rand::thread_rng()));
 
@@ -125,19 +132,37 @@ fn do_btree() {
     std::thread::sleep(Duration::from_secs(1000));
 }
 
-async fn do_create(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
+async fn do_create() -> Result<(), Box<dyn Error>> {
     let mut client = Client::connect().await;
-    let guid = PoolGUID(1234);
+    let aws_key_id = env::var("AWS_ACCESS_KEY_ID")
+        .expect("the AWS_ACCESS_KEY_ID environment variable must be set");
+    let secret_key = env::var("AWS_SECRET_ACCESS_KEY")
+        .expect("the AWS_SECRET_ACCESS_KEY environment variable must be set");
+    let endpoint = ENDPOINT;
+    let region = REGION;
+    let bucket_name = BUCKET_NAME;
+    let pool_name = POOL_NAME;
+    let guid = PoolGUID(POOL_GUID);
 
-    client.create_pool(&bucket.name(), guid, "testpool").await;
+    client
+        .create_pool(
+            &aws_key_id,
+            &secret_key,
+            &region,
+            &endpoint,
+            &bucket_name,
+            guid,
+            &pool_name,
+        )
+        .await;
     client.get_next_response().await;
 
     Ok(())
 }
 
-async fn do_write(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
+async fn do_write() -> Result<(), Box<dyn Error>> {
     let guid = PoolGUID(1234);
-    let (mut client, next_txg, mut next_block) = setup_client(bucket, guid).await;
+    let (mut client, next_txg, mut next_block) = setup_client(guid).await;
 
     let begin = Instant::now();
     let n = 5200;
@@ -169,10 +194,27 @@ async fn do_write(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn setup_client(bucket: &Bucket, guid: PoolGUID) -> (Client, TXG, BlockID) {
+async fn setup_client(guid: PoolGUID) -> (Client, TXG, BlockID) {
     let mut client = Client::connect().await;
 
-    client.open_pool(&bucket.name(), guid).await;
+    let bucket_name = BUCKET_NAME;
+    let aws_key_id = env::var("AWS_ACCESS_KEY_ID")
+        .expect("the AWS_ACCESS_KEY_ID environment variable must be set");
+    let secret_key = env::var("AWS_SECRET_ACCESS_KEY")
+        .expect("the AWS_SECRET_ACCESS_KEY environment variable must be set");
+    let endpoint = ENDPOINT;
+    let region = REGION;
+
+    client
+        .open_pool(
+            &aws_key_id,
+            &secret_key,
+            &region,
+            endpoint,
+            &bucket_name,
+            guid,
+        )
+        .await;
 
     let nvl = client.get_next_response().await;
     let txg = TXG(nvl.lookup_uint64("next txg").unwrap());
@@ -181,9 +223,9 @@ async fn setup_client(bucket: &Bucket, guid: PoolGUID) -> (Client, TXG, BlockID)
     (client, txg, block)
 }
 
-async fn do_read(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
+async fn do_read() -> Result<(), Box<dyn Error>> {
     let guid = PoolGUID(1234);
-    let (mut client, _, _) = setup_client(bucket, guid).await;
+    let (mut client, _, _) = setup_client(guid).await;
 
     let max = 1000;
     let begin = Instant::now();
@@ -203,9 +245,9 @@ async fn do_read(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn do_free(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
+async fn do_free() -> Result<(), Box<dyn Error>> {
     let guid = PoolGUID(1234);
-    let (mut client, mut next_txg, mut next_block) = setup_client(bucket, guid).await;
+    let (mut client, mut next_txg, mut next_block) = setup_client(guid).await;
 
     // write some blocks, which we will then free some of
 
@@ -353,20 +395,23 @@ async fn main() {
 
     // assumes that AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment
     // variables are set
-    let bucket_name = "cloudburst-data-2";
-    let region = Region::UsWest2;
+    let region_str = REGION;
+    let bucket_name = BUCKET_NAME;
+
+    let region: Region = region_str.parse().unwrap();
     let credentials = Credentials::default().unwrap();
     let bucket = Bucket::new(bucket_name, region, credentials).unwrap();
+    println!("bucket: {:?}", bucket);
 
     match &args[1][..] {
         "s3" => do_s3(&bucket).await.unwrap(),
         "list" => do_list(&bucket).await.unwrap(),
         "delete" => do_delete(&bucket).await.unwrap(),
         "obl" => do_obl(&bucket).await.unwrap(),
-        "create" => do_create(&bucket).await.unwrap(),
-        "write" => do_write(&bucket).await.unwrap(),
-        "read" => do_read(&bucket).await.unwrap(),
-        "free" => do_free(&bucket).await.unwrap(),
+        "create" => do_create().await.unwrap(),
+        "write" => do_write().await.unwrap(),
+        "read" => do_read().await.unwrap(),
+        "free" => do_free().await.unwrap(),
         "btree" => do_btree(),
         "nvpair" => do_nvpair(),
         "server" => do_server().await,
