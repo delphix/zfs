@@ -76,7 +76,7 @@ struct PoolPhys {
 impl OnDisk for PoolPhys {}
 
 #[derive(Serialize, Deserialize, Debug)]
-struct UberblockPhys {
+pub struct UberblockPhys {
     guid: PoolGUID,   // redundant with key, for verification
     txg: TXG,         // redundant with key, for verification
     date: SystemTime, // for debugging
@@ -88,7 +88,7 @@ struct UberblockPhys {
 }
 impl OnDisk for UberblockPhys {}
 
-#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy)]
 struct PoolStatsPhys {
     blocks_count: u64,
     blocks_bytes: u64,
@@ -160,6 +160,8 @@ impl UberblockPhys {
     fn key(guid: PoolGUID, txg: TXG) -> String {
         format!("zfs/{}/txg/{}", guid, txg)
     }
+
+    pub fn get_zfs_uberblock(&self) -> &Vec<u8> {&self.zfs_uberblock}
 
     async fn get(bucket: &Bucket, guid: PoolGUID, txg: TXG) -> Self {
         let buf = object_access::get_object(bucket, &Self::key(guid, txg)).await;
@@ -299,7 +301,7 @@ impl Pool {
         bucket: &Bucket,
         pool_phys: &PoolPhys,
         txg: TXG,
-    ) -> (Pool, TXG, BlockID) {
+    ) -> (Pool, Option<UberblockPhys>, BlockID) {
         let phys = UberblockPhys::get(bucket, pool_phys.guid, txg).await;
 
         let readonly_state = Arc::new(PoolSharedState {
@@ -401,16 +403,15 @@ impl Pool {
             begin.elapsed().as_millis()
         );
         //println!("{:#?}", frees);
-        let last_txg = syncing_state.last_txg;
         let next_block = Self::next_block_locked(&syncing_state);
         drop(syncing_state);
 
         println!("opened {:#?}", pool);
 
-        (pool, last_txg, next_block)
+        (pool, Some(phys), next_block)
     }
 
-    pub async fn open(bucket: &Bucket, guid: PoolGUID) -> (Pool, TXG, BlockID) {
+    pub async fn open(bucket: &Bucket, guid: PoolGUID) -> (Pool, Option<UberblockPhys>, BlockID) {
         let phys = PoolPhys::get(bucket, guid).await;
         if phys.last_txg.0 == 0 {
             let readonly_state = Arc::new(PoolSharedState {
@@ -444,10 +445,9 @@ impl Pool {
                 }),
             };
             let syncing_state = pool.state.syncing_state.try_lock().unwrap();
-            let last_txg = syncing_state.last_txg;
             let next_block = Self::next_block_locked(&syncing_state);
             drop(syncing_state);
-            (pool, last_txg, next_block)
+            (pool, None, next_block)
         } else {
             Pool::open_from_txg(bucket, &phys, phys.last_txg).await
         }

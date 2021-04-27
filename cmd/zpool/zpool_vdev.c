@@ -288,7 +288,7 @@ make_objstore_vdev(nvlist_t *props, const char *arg)
 	    region);
 
 	if ((nvlist_lookup_string(props,
-	    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, &creds)) != 0) {
+	    zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), &creds)) != 0) {
 		fprintf(stderr, gettext("No credentials location provided for "
 		    "objstore vdev %s\n"), arg);
 		fnvlist_free(vdev);
@@ -296,6 +296,15 @@ make_objstore_vdev(nvlist_t *props, const char *arg)
 	}
 	fnvlist_add_string(vdev, zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS),
 	    creds);
+
+	if ((nvlist_lookup_string(props, ZPOOL_CONFIG_OBJSTORE_CREDENTIALS,
+	    &creds)) != 0) {
+		fprintf(stderr, gettext("No credentials provided for "
+		    "objstore vdev %s\n"), arg);
+		fnvlist_free(vdev);
+		return (NULL);
+	}
+	fnvlist_add_string(vdev, ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, creds);
 
 	return (vdev);
 }

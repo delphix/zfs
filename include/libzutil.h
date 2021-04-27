@@ -68,6 +68,7 @@ typedef struct importargs {
 	boolean_t can_be_active; /* can the pool be active?		*/
 	boolean_t scan;		/* prefer scanning to libblkid cache    */
 	nvlist_t *policy;	/* load policy (max txg, rewind, etc.)	*/
+	int (*handle_creds)(void *, nvlist_t *, char *);
 } importargs_t;
 
 extern nvlist_t *zpool_search_import(void *, importargs_t *,

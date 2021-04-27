@@ -96,8 +96,8 @@ typedef void vdev_xlation_func_t(vdev_t *cvd, const range_seg64_t *logical,
     range_seg64_t *physical, range_seg64_t *remain);
 typedef uint64_t vdev_rebuild_asize_func_t(vdev_t *vd, uint64_t start,
     uint64_t size, uint64_t max_segment);
-typedef void vdev_metaslab_init_func_t(vdev_t *vd, uint64_t *startp,
-    uint64_t *sizep);
+typedef void vdev_metaslab_init_func_t(vdev_t *vd, metaslab_t *msp,
+    uint64_t *startp, uint64_t *sizep);
 typedef void vdev_config_generate_func_t(vdev_t *vd, nvlist_t *nv);
 typedef uint64_t vdev_nparity_func_t(vdev_t *vd);
 typedef uint64_t vdev_ndisks_func_t(vdev_t *vd);
@@ -652,6 +652,7 @@ extern int vdev_obsolete_counts_are_precise(vdev_t *vd, boolean_t *are_precise);
  */
 int vdev_checkpoint_sm_object(vdev_t *vd, uint64_t *sm_obj);
 void vdev_metaslab_group_create(vdev_t *vd);
+uberblock_t *vdev_object_store_get_uberblock(vdev_t *vd);
 
 /*
  * Vdev ashift optimization tunables

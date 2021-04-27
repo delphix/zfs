@@ -66,6 +66,7 @@
 #include <thread_pool.h>
 #include <libzutil.h>
 #include <libnvpair.h>
+#include <libzfs.h>
 
 #include "zutil_import.h"
 
@@ -1418,6 +1419,63 @@ discover_cached_paths(libpc_handle_t *hdl, nvlist_t *nv,
 	return (0);
 }
 
+static void
+copy_creds(nvlist_t *src, nvlist_t *dst)
+{
+	/*
+	 * If this is an objstore pool, we need to get the credentials.
+	 */
+	nvlist_t *tree, *dsttree;
+	uint_t c, c2, children, dstchildren;
+	nvlist_t **child, **dstchild;
+
+	tree = fnvlist_lookup_nvlist(src, ZPOOL_CONFIG_VDEV_TREE);
+	dsttree = fnvlist_lookup_nvlist(dst, ZPOOL_CONFIG_VDEV_TREE);
+	
+	if (nvlist_lookup_nvlist_array(tree, ZPOOL_CONFIG_CHILDREN,
+	    &child, &children) != 0) {
+		return;
+	}
+
+	VERIFY0(nvlist_lookup_nvlist_array(dsttree, ZPOOL_CONFIG_CHILDREN,
+	    &dstchild, &dstchildren));
+
+	for (c = 0; c < children; c++) {
+		char *type, *creds;
+		uint64_t guid;
+		if (nvlist_lookup_string(child[c], ZPOOL_CONFIG_TYPE,
+		    &type) != 0) {
+			continue;
+		}
+
+		if (strcmp(type, VDEV_TYPE_OBJSTORE) != 0)
+			continue;
+
+		creds = fnvlist_lookup_string(child[c],
+		    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS);
+		guid = fnvlist_lookup_uint64(child[c], ZPOOL_CONFIG_GUID);
+
+		for (c2 = 0; c2 < dstchildren; c2++) {
+			if (nvlist_lookup_string(dstchild[c2], ZPOOL_CONFIG_TYPE,
+				&type) != 0) {
+				continue;
+			}
+			
+			if (strcmp(type, VDEV_TYPE_OBJSTORE) != 0 ||
+			    fnvlist_lookup_uint64(dstchild[c2],
+			    ZPOOL_CONFIG_GUID) != guid) {
+				continue;
+			}
+			
+			fnvlist_add_string(dstchild[c2],
+			    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, creds);
+			break;
+		}
+		break;
+	}
+
+}
+
 /*
  * Given a cache file, return the contents as a list of importable pools.
  * poolname or guid (but not both) are provided by the caller when trying
@@ -1578,23 +1636,70 @@ zpool_find_import_cached(libpc_handle_t *hdl, importargs_t *iarg)
 			return (NULL);
 		}
 
-		if ((dst = zutil_refresh_config(hdl, src)) == NULL) {
-			nvlist_free(raw);
-			nvlist_free(pools);
-			return (NULL);
+		/*
+		 * If this is an objstore pool, we need to get the credentials.
+		 */
+		nvlist_t *tree;
+		uint_t c, children;
+		nvlist_t **child;
+		
+		tree = fnvlist_lookup_nvlist(src, ZPOOL_CONFIG_VDEV_TREE);
+		
+		if (nvlist_lookup_nvlist_array(tree, ZPOOL_CONFIG_CHILDREN,
+			&child, &children) != 0) {
+			fprintf(stderr, gettext("cannot import '%s': invalid "
+			    "configuration detected.\n"), name);
+			goto errout;
 		}
+		
+		for (c = 0; c < children; c++) {
+			char *type, *creds;
+			if (nvlist_lookup_string(child[c], ZPOOL_CONFIG_TYPE,
+				&type) != 0) {
+				fprintf(stderr, gettext("cannot import '%s': invalid "
+				    "configuration detected.\n"), name);
+				goto errout;
+			}
+			
+			if (strcmp(type, VDEV_TYPE_OBJSTORE) != 0)
+				continue;
+			
+			if ((nvlist_lookup_string(child[c],
+			    "object-credentials-location",
+			    &creds)) != 0) {
+				fprintf(stderr, gettext("cannot import '%s': No "
+				    "objstore credentials located.\n"), name);
+				goto errout;
+			}
+			
+			if (iarg->handle_creds(hdl->lpc_lib_handle, child[c],
+				creds) != 0) {
+				fprintf(stderr, gettext("cannot import '%s': Failed to "
+				    "retreive objstore credentials.\n"), name);
+				goto errout;
+			}
+			
+			break;
+		}
+		
+		if ((dst = zutil_refresh_config(hdl, src)) == NULL)
+			goto errout;
+
+		copy_creds(src, dst);
 
 		if (nvlist_add_nvlist(pools, nvpair_name(elem), dst) != 0) {
 			(void) zutil_no_memory(hdl);
 			nvlist_free(dst);
-			nvlist_free(raw);
-			nvlist_free(pools);
-			return (NULL);
+			goto errout;
 		}
 		nvlist_free(dst);
 	}
 	nvlist_free(raw);
 	return (pools);
+errout:
+	nvlist_free(raw);
+	nvlist_free(pools);
+	return (NULL);
 }
 
 static nvlist_t *

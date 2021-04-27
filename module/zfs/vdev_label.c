@@ -1461,17 +1461,12 @@ struct ubl_cbdata {
 };
 
 static void
-vdev_uberblock_load_done(zio_t *zio)
+vdev_uberblock_load_done_impl(spa_t *spa, vdev_t *vd, uberblock_t *ub,
+    zio_t *rio)
 {
-	vdev_t *vd = zio->io_vd;
-	spa_t *spa = zio->io_spa;
-	zio_t *rio = zio->io_private;
-	uberblock_t *ub = abd_to_buf(zio->io_abd);
 	struct ubl_cbdata *cbp = rio->io_private;
 
-	ASSERT3U(zio->io_size, ==, VDEV_UBERBLOCK_SIZE(vd));
-
-	if (zio->io_error == 0 && uberblock_verify(ub) == 0) {
+	if (uberblock_verify(ub) == 0) {
 		mutex_enter(&rio->io_lock);
 		if (ub->ub_txg <= spa->spa_load_max_txg &&
 		    vdev_uberblock_compare(ub, cbp->ubl_ubbest) > 0) {
@@ -1486,6 +1481,21 @@ vdev_uberblock_load_done(zio_t *zio)
 		}
 		mutex_exit(&rio->io_lock);
 	}
+}
+
+static void
+vdev_uberblock_load_done(zio_t *zio)
+{
+	vdev_t *vd = zio->io_vd;
+	spa_t *spa = zio->io_spa;
+	zio_t *rio = zio->io_private;
+	uberblock_t *ub = abd_to_buf(zio->io_abd);
+
+	ASSERT3U(zio->io_size, ==, VDEV_UBERBLOCK_SIZE(vd));
+
+	if (zio->io_error == 0) {
+		vdev_uberblock_load_done_impl(spa, vd, ub, rio);
+	}
 
 	abd_free(zio->io_abd);
 }
@@ -1497,7 +1507,12 @@ vdev_uberblock_load_impl(zio_t *zio, vdev_t *vd, int flags,
 	for (int c = 0; c < vd->vdev_children; c++)
 		vdev_uberblock_load_impl(zio, vd->vdev_child[c], flags, cbp);
 
-	if (vd->vdev_ops->vdev_op_leaf && vdev_readable(vd) &&
+	if (vdev_is_object_based(vd)) {
+#ifdef _KERNEL
+		uberblock_t *ub = vdev_object_store_get_uberblock(vd);
+		vdev_uberblock_load_done_impl(zio->io_spa, vd, ub, zio);
+#endif
+	} else if (vd->vdev_ops->vdev_op_leaf && vdev_readable(vd) &&
 	    vd->vdev_ops != &vdev_draid_spare_ops) {
 		for (int l = 0; l < VDEV_LABELS; l++) {
 			for (int n = 0; n < VDEV_UBERBLOCK_COUNT(vd); n++) {
@@ -1546,7 +1561,7 @@ vdev_uberblock_load(vdev_t *rvd, uberblock_t *ub, nvlist_t **config)
 	 * Search all labels on this vdev to find the configuration that
 	 * matches the txg for our uberblock.
 	 */
-	if (cb.ubl_vd != NULL) {
+	if (cb.ubl_vd != NULL && !vdev_is_object_based(cb.ubl_vd)) {
 		vdev_dbgmsg(cb.ubl_vd, "best uberblock found for spa %s. "
 		    "txg %llu", spa->spa_name, (u_longlong_t)ub->ub_txg);
 

@@ -32,6 +32,7 @@
 #include <sys/fm/fs/zfs.h>
 #include <sys/abd.h>
 #include <sys/fcntl.h>
+#include <sys/metaslab_impl.h>
 #ifdef _KERNEL
 #include <linux/un.h>
 #include <linux/net.h>
@@ -45,7 +46,6 @@
  */
 #define	AGENT_TYPE		"Type"
 #define	AGENT_TYPE_CREATE_POOL		"create pool"
-#define	AGENT_TYPE_OPEN_POOL		"open pool"
 #define	AGENT_TYPE_OPEN_POOL		"open pool"
 #define	AGENT_TYPE_READ_BLOCK		"read block"
 #define	AGENT_TYPE_WRITE_BLOCK		"write block"
@@ -64,6 +64,8 @@
 #define	AGENT_BLKID		"block"
 #define	AGENT_DATA		"data"
 #define	AGENT_REQUEST_ID	"request_id"
+#define	AGENT_UBERBLOCK		"uberblock"
+#define	AGENT_NEXT_BLOCK	"next_block"
 
 /*
  * By default, the logical/physical ashift for object store vdevs is set to
@@ -81,6 +83,7 @@ unsigned long vdev_object_store_physical_ashift = SPA_MINBLOCKSHIFT;
 typedef struct vdev_object_store {
 	char *vos_endpoint;
 	char *vos_region;
+	char *vos_credential_location;
 	char *vos_credentials;
 	kthread_t *vos_reader;
 
@@ -91,6 +94,9 @@ typedef struct vdev_object_store {
 	kcondvar_t vos_outstanding_cv;
 	zio_t *vos_outstanding_requests[VOS_MAXREQ];
 	boolean_t vos_serial_done;
+
+	uint64_t vos_next_block;
+	uberblock_t vos_uberblock;
 } vdev_object_store_t;
 
 static mode_t
@@ -249,6 +255,7 @@ agent_read_block(vdev_object_store_t *vos, zio_t *zio)
 	uint64_t blockid = zio->io_offset >> 9;
 	nvlist_t *nv = fnvlist_alloc();
 	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_READ_BLOCK);
+	fnvlist_add_uint64(nv, AGENT_SIZE, zio->io_size);
 	fnvlist_add_uint64(nv, AGENT_BLKID, blockid);
 	zfs_dbgmsg("agent_read_block(guid=%llu blkid=%llu)",
 	    spa_guid(zio->io_spa), blockid);
@@ -419,7 +426,8 @@ agent_read_all(vdev_object_store_t *vos, void *buf, size_t len)
 static void
 agent_reader(void *arg)
 {
-	vdev_object_store_t *vos = arg;
+	vdev_t *vd = arg;
+	vdev_object_store_t *vos = vd->vdev_tsd;
 
 	for (;;) {
 		uint64_t nvlist_len;
@@ -441,8 +449,27 @@ agent_reader(void *arg)
 		zfs_dbgmsg("got response from agent type=%s", type);
 		// XXX debug message the nvlist
 		if (strcmp(type, "pool create done") == 0 ||
-		    strcmp(type, "pool open done") == 0 ||
 		    strcmp(type, "end txg done") == 0) {
+			mutex_enter(&vos->vos_outstanding_lock);
+			ASSERT(!vos->vos_serial_done);
+			vos->vos_serial_done = B_TRUE;
+			cv_broadcast(&vos->vos_outstanding_cv);
+			mutex_exit(&vos->vos_outstanding_lock);
+		} else if (strcmp(type, "pool open done") == 0) {
+			uint_t len;
+			uint8_t *arr;
+			int err = nvlist_lookup_uint8_array(nv, AGENT_UBERBLOCK,
+			    &arr, &len);
+			if (err == 0)
+				bcopy(arr, &vos->vos_uberblock, len);
+
+			uint64_t next_block = fnvlist_lookup_uint64(nv,
+			    AGENT_NEXT_BLOCK);
+			vos->vos_next_block = next_block;
+
+			zfs_dbgmsg("got pool open done len=%llu block=%llu", len, next_block);
+
+			fnvlist_free(nv);
 			mutex_enter(&vos->vos_outstanding_lock);
 			ASSERT(!vos->vos_serial_done);
 			vos->vos_serial_done = B_TRUE;
@@ -504,8 +531,12 @@ vdev_object_store_init(spa_t *spa, nvlist_t *nv, void **tsd)
 	} else {
 		return (SET_ERROR(EINVAL));
 	}
-	if (!nvlist_lookup_string(nv,
-	    zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), &val)) {
+	if (!nvlist_lookup_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), &val)) {
+		vos->vos_credential_location = kmem_strdup(val);
+	} else {
+		return (SET_ERROR(EINVAL));
+	}
+	if (!nvlist_lookup_string(nv, ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, &val)) {
 		vos->vos_credentials = kmem_strdup(val);
 	} else {
 		return (SET_ERROR(EINVAL));
@@ -530,6 +561,9 @@ vdev_object_store_fini(vdev_t *vd)
 	}
 	if (vos->vos_region != NULL) {
 		kmem_strfree(vos->vos_region);
+	}
+	if (vos->vos_credential_location != NULL) {
+		kmem_strfree(vos->vos_credential_location);
 	}
 	if (vos->vos_credentials != NULL) {
 		kmem_strfree(vos->vos_credentials);
@@ -595,7 +629,7 @@ vdev_object_store_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	vos->vos_sock = sock;
 
 	vos->vos_reader = thread_create(NULL, 0, agent_reader,
-	    vos, 0, &p0, TS_RUN, defclsyspri);
+	    vd, 0, &p0, TS_RUN, defclsyspri);
 
 	if (vd->vdev_spa->spa_load_state == SPA_LOAD_CREATE) {
 		agent_create_pool(vd, vos);
@@ -627,6 +661,7 @@ vdev_object_store_close(vdev_t *vd)
 
 	if (vos->vos_sock != NULL) {
 		zfs_object_store_close(vos->vos_sock);
+		vos->vos_sock = NULL;
 	}
 
 	vd->vdev_delayed_close = B_FALSE;
@@ -694,6 +729,31 @@ vdev_object_store_io_done(zio_t *zio)
 {
 }
 
+static void
+vdev_object_store_config_generate(vdev_t *vd, nvlist_t *nv)
+{
+	vdev_object_store_t *vos = vd->vdev_tsd;
+
+	fnvlist_add_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), vos->vos_credential_location);
+	fnvlist_add_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_ENDPOINT), vos->vos_endpoint);
+	fnvlist_add_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_REGION), vos->vos_region);
+}
+
+static void
+vdev_object_store_metaslab_init(vdev_t *vd, metaslab_t *msp, uint64_t *ms_start,
+    uint64_t *ms_size)
+{
+	vdev_object_store_t *vos = vd->vdev_tsd;
+	msp->ms_lbas[0] = vos->vos_next_block;
+}
+
+uberblock_t *
+vdev_object_store_get_uberblock(vdev_t *vd)
+{
+	vdev_object_store_t *vos = vd->vdev_tsd;
+	return (&vos->vos_uberblock);
+}
+
 vdev_ops_t vdev_object_store_ops = {
 	.vdev_op_init = vdev_object_store_init,
 	.vdev_op_fini = vdev_object_store_fini,
@@ -711,8 +771,8 @@ vdev_ops_t vdev_object_store_ops = {
 	.vdev_op_remap = NULL,
 	.vdev_op_xlate = vdev_default_xlate,
 	.vdev_op_rebuild_asize = NULL,
-	.vdev_op_metaslab_init = NULL,
-	.vdev_op_config_generate = NULL,
+	.vdev_op_metaslab_init = vdev_object_store_metaslab_init,
+	.vdev_op_config_generate = vdev_object_store_config_generate,
 	.vdev_op_nparity = NULL,
 	.vdev_op_ndisks = NULL,
 	.vdev_op_type = VDEV_TYPE_OBJSTORE,	/* name of this vdev type */

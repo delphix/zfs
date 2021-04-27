@@ -212,13 +212,19 @@ impl Server {
 
     /// initiate pool opening.  Responds when pool is open
     async fn open_pool(&mut self, bucket: &Bucket, guid: PoolGUID) {
-        let (pool, last_txg, next_block) = Pool::open(bucket, guid).await;
+        let (pool, phys_opt, next_block) = Pool::open(bucket, guid).await;
         self.pool = Some(pool);
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "pool open done").unwrap();
         nvl.insert("GUID", &guid.0).unwrap();
-        nvl.insert("next txg", &(last_txg.0 + 1)).unwrap();
-        nvl.insert("next block", &next_block.0).unwrap();
+        match phys_opt {
+            Some(phys) => {
+                nvl.insert("uberblock", &phys.get_zfs_uberblock()[..]).unwrap();
+            }
+            None => {}
+        }
+        
+        nvl.insert("next_block", &next_block.0).unwrap();
         println!("sending response: {:?}", nvl);
         Self::send_response(&self.output, nvl).await;
     }

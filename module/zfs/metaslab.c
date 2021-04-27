@@ -2667,7 +2667,7 @@ metaslab_init(metaslab_group_t *mg, uint64_t id, uint64_t object,
 
 	vdev_ops_t *ops = vd->vdev_ops;
 	if (ops->vdev_op_metaslab_init != NULL)
-		ops->vdev_op_metaslab_init(vd, &ms->ms_start, &ms->ms_size);
+		ops->vdev_op_metaslab_init(vd, ms, &ms->ms_start, &ms->ms_size);
 
 	/*
 	 * We only open space map objects that already exist. All others

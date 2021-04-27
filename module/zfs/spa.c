@@ -3564,6 +3564,7 @@ spa_ld_select_uberblock(spa_t *spa, spa_import_type_t type)
 		return (spa_vdev_err(rvd, VDEV_AUX_VERSION_NEWER, ENOTSUP));
 	}
 
+#if 0
 	if (ub->ub_version >= SPA_VERSION_FEATURES) {
 		nvlist_t *features;
 
@@ -3627,7 +3628,8 @@ spa_ld_select_uberblock(spa_t *spa, spa_import_type_t type)
 
 		nvlist_free(unsup_feat);
 	}
-
+#endif
+	
 	if (type != SPA_IMPORT_ASSEMBLE && spa->spa_config_splitting) {
 		spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
 		spa_try_repair(spa, spa->spa_config);
@@ -3660,6 +3662,64 @@ spa_ld_open_rootbp(spa_t *spa)
 
 	return (0);
 }
+
+static void
+
+copy_objstore_credentials(nvlist_t *src, nvlist_t *dest)
+{
+	nvlist_t **schild, **dchild;
+	uint_t schildren, dchildren;
+	int error;
+
+	error = nvlist_lookup_nvlist_array(src, ZPOOL_CONFIG_CHILDREN,
+	    &schild, &schildren);
+
+	if (error != 0)
+		return;
+
+	error = nvlist_lookup_nvlist_array(dest, ZPOOL_CONFIG_CHILDREN,
+	    &dchild, &dchildren);
+
+	if (error != 0)
+		return;
+
+	for (int c1 = 0; c1 < schildren; c1++) {
+		char *type, *creds;
+		uint64_t guid;
+		if (nvlist_lookup_string(schild[c1], ZPOOL_CONFIG_TYPE,
+		    &type) != 0) {
+			continue;
+		}
+		
+		if (strcmp(type, VDEV_TYPE_OBJSTORE) != 0)
+			continue;
+		
+		creds = fnvlist_lookup_string(schild[c1],
+		    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS);
+		guid = fnvlist_lookup_uint64(schild[c1], ZPOOL_CONFIG_GUID);
+
+		for (int c2 = 0; c2 < dchildren; c2++) {
+			if (nvlist_lookup_string(dchild[c2], ZPOOL_CONFIG_TYPE,
+				&type) != 0) {
+				continue;
+			}
+			
+			if (strcmp(type, VDEV_TYPE_OBJSTORE) != 0 ||
+			    fnvlist_lookup_uint64(dchild[c2],
+			    ZPOOL_CONFIG_GUID) != guid) {
+				continue;
+			}
+			
+			fnvlist_add_string(dchild[c2],
+			    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, creds);
+			break;
+		}
+			
+		
+		break;
+	}
+}
+
 
 static int
 spa_ld_trusted_config(spa_t *spa, spa_import_type_t type,
@@ -3705,6 +3765,13 @@ spa_ld_trusted_config(spa_t *spa, spa_import_type_t type,
 	nv = fnvlist_lookup_nvlist(mos_config, ZPOOL_CONFIG_VDEV_TREE);
 
 	spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
+
+	/*
+	 * Before we build the new vdev tree, we have to copy the credentials
+	 * for any objstore vdevs from the untrusted config.
+	 */
+	copy_objstore_credentials(fnvlist_lookup_nvlist(spa->spa_config,
+	    ZPOOL_CONFIG_VDEV_TREE), nv);
 
 	/*
 	 * Build a new vdev tree from the trusted config

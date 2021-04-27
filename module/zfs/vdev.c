@@ -2208,7 +2208,7 @@ vdev_validate(vdev_t *vd)
 	uint64_t txg;
 	int children = vd->vdev_children;
 
-	if (vdev_validate_skip)
+	if (vdev_validate_skip || vdev_is_object_based(vd))
 		return (0);
 
 	if (children > 0) {
