@@ -463,6 +463,15 @@ vdev_object_store_fini(vdev_t *vd)
 
 	mutex_destroy(&vos->vos_outstanding_lock);
 	cv_destroy(&vos->vos_outstanding_cv);
+	if (vos->vos_endpoint != NULL) {
+		kmem_strfree(vos->vos_endpoint);
+	}
+	if (vos->vos_region != NULL) {
+		kmem_strfree(vos->vos_region);
+	}
+	if (vos->vos_credentials != NULL) {
+		kmem_strfree(vos->vos_credentials);
+	}
 	kmem_free(vd->vdev_tsd, sizeof (vdev_object_store_t));
 	vd->vdev_tsd = NULL;
 
