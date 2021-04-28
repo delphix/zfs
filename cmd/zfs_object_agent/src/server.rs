@@ -167,22 +167,12 @@ impl Server {
     }
 
     fn get_credentials(nvl: &nvpair::NvListRef) -> Credentials {
-        let mut access_key_id = "";
-        let mut secret_access_key = "";
+        // credentials should be <access-key-id>:<secret-access-key>
+        let credential_str = nvl.lookup_string("credentials").unwrap();
+        let mut iter = credential_str.to_str().unwrap().split(":");
+        let access_key_id = iter.next().unwrap().trim();
+        let secret_access_key = iter.next().unwrap().trim();
 
-        let credentials = nvl.lookup_string("credentials").unwrap();
-        for line in credentials.to_str().unwrap().lines() {
-            if !line.starts_with("#") {
-                let mut iter = line.split("=");
-                let name = iter.next().unwrap().trim().to_lowercase();
-                let value = iter.next().unwrap().trim();
-                if name.eq("objectstore-access-key-id") {
-                    access_key_id = value;
-                } else if name.eq("objectstore-secret-access-key") {
-                    secret_access_key = value;
-                }
-            }
-        }
         let credentials = Credentials::new(
             Some(access_key_id),
             Some(secret_access_key),
