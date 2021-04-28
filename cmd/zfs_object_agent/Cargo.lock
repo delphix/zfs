@@ -630,6 +630,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lru"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f374d42cdfc1d7dbf3d3dec28afab2eb97ffbf43a3234d795b5986dbf4b90ba"
+dependencies = [
+ "hashbrown",
+]
+
+[[package]]
 name = "matches"
 version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1607,6 +1616,8 @@ dependencies = [
  "bincode",
  "futures",
  "futures-core",
+ "lazy_static",
+ "lru",
  "nvpair",
  "rand",
  "rust-s3",

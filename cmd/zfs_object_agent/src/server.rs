@@ -58,6 +58,8 @@ impl Server {
                         // while in the middle of a end_txg(). So we only do it
                         // while there are writes in progress, which can't be
                         // the case during an end_txg().
+                        // XXX we should also be able to time out and flush even
+                        // if we are getting lots of reads.
                         if server.pool.is_some()
                             && *server.num_outstanding_writes.lock().unwrap() > 0
                         {

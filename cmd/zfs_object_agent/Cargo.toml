@@ -17,6 +17,8 @@ async-stream = "0.3.0"
 bincode = "1.3.2"
 futures = "0.3.13"
 futures-core = "0.3.13"
+lazy_static = "1.4.0"
+lru = "0.6.5"
 nvpair = { git = "https://github.com/ahrens/rust-libzfs", branch = "work"}
 rand = "0.8.3"
 rust-s3 = "0.27.0-rc1"
