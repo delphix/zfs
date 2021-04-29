@@ -16,6 +16,16 @@ use std::time::{Instant, SystemTime};
 use tokio::sync::*;
 use tokio::task::JoinHandle;
 
+// XXX need a real tunables infrastructure
+// start freeing when the pending frees are this % of the entire pool
+const FREE_HIGHWATER_PCT: f64 = 1.5;
+// stop freeing when the pending frees are this % of the entire pool
+const FREE_LOWWATER_PCT: f64 = 0.5;
+// don't bother freeing unless there are at least this number of free blocks
+const FREE_MIN_BLOCKS: u64 = 1000;
+// XXX change this to bytes
+const MAX_BLOCKS_PER_OBJECT: usize = 100;
+
 /*
  * Things that are stored on disk.
  */
@@ -103,6 +113,7 @@ impl OnDisk for DataObjectPhys {}
 enum StorageObjectLogEntry {
     Alloc {
         obj: ObjectID,
+        // XXX include object size in bytes/blocks?  And log when we rewrite it for background freeing?
         first_possible_block: BlockID,
     },
     Free {
@@ -115,6 +126,7 @@ impl ObjectBasedLogEntry for StorageObjectLogEntry {}
 
 #[derive(Debug, Serialize, Deserialize, Copy, Clone)]
 struct PendingFreesLogEntry {
+    // XXX add block's size, so we can do byte-wise accounting when processing frees?
     block: BlockID,
 }
 impl OnDisk for PendingFreesLogEntry {}
@@ -269,6 +281,7 @@ struct ReclaimFreesComplete {
     freed_blocks_count: u64,
     freed_blocks_bytes: u64,
     num_chunks: u64,
+    remaining_frees: Vec<BlockID>,
 }
 
 impl Pool {
@@ -506,8 +519,9 @@ impl Pool {
 
         // XXX change this to be based on bytes, once those stats are working?
         // XXX make this tunable?
-        if syncing_state.stats.pending_frees_count < syncing_state.stats.blocks_count / 100
-            || syncing_state.stats.pending_frees_count < 1000
+        if syncing_state.stats.pending_frees_count
+            < (syncing_state.stats.blocks_count as f64 * FREE_HIGHWATER_PCT / 100f64) as u64
+            || syncing_state.stats.pending_frees_count < FREE_MIN_BLOCKS
         {
             return;
         }
@@ -515,17 +529,24 @@ impl Pool {
             syncing_state.stats.pending_frees_count, syncing_state.stats.blocks_count);
 
         let state = self.state.clone();
-
-        // XXX to save RAM, change to a Vec that we sort in-place
         let stream = syncing_state.pending_frees_log.iterate();
         let num_chunks = syncing_state.pending_frees_log.num_chunks();
+
+        let required_frees = syncing_state.stats.pending_frees_count
+            - (syncing_state.stats.blocks_count as f64 * FREE_LOWWATER_PCT / 100f64) as u64;
 
         let (s, r) = oneshot::channel();
 
         syncing_state.reclaim_task = Some(r);
         tokio::spawn(async move {
             let shared_state = &state.readonly_state;
-            let mut frees: BTreeSet<BlockID> = BTreeSet::new();
+            let mut frees = BTreeSet::new();
+            // XXX The Vecs will grow by doubling, thus wasting ~1/4 of the
+            // memory used by it.  It would be better if we gathered the
+            // BlockID's into a single big Vec with the exact required size,
+            // then in-place sort, and then have this map to a slice of the one
+            // big Vec.
+            let mut frees_per_obj: HashMap<ObjectID, Vec<BlockID>> = HashMap::new();
 
             // load pending frees
             let begin = Instant::now();
@@ -535,6 +556,10 @@ impl Pool {
                     if !inserted {
                         panic!("duplicate free entry {:?}", ent.block);
                     }
+
+                    let obj = Self::block_to_object(&state.objects.read().unwrap(), ent.block);
+                    frees_per_obj.entry(obj).or_default().push(ent.block);
+
                     future::ready(())
                 })
                 .await;
@@ -544,11 +569,48 @@ impl Pool {
                 begin.elapsed().as_millis()
             );
 
+            // sort objects by number of free blocks
+            // XXX should be based on free space (bytes)?
+            let mut objs_by_frees: BTreeSet<(usize, ObjectID)> = BTreeSet::new();
+            for (obj, hs) in frees_per_obj.iter() {
+                objs_by_frees.insert((hs.len(), *obj));
+            }
+
+            let mut join_handles = Vec::new();
+            let mut complete = ReclaimFreesComplete::default();
+            for (num_frees, obj) in objs_by_frees.iter().rev() {
+                // XXX limit amount of outstanding get/put requests?
+                let frees = frees_per_obj.remove(&obj).unwrap();
+                assert_eq!(frees.len(), *num_frees);
+                complete.freed_blocks_count += *num_frees as u64;
+                // XXX would be nice to know if we are freeing the entire object
+                // in which case we wouldn't need to read it.  Would have to
+                // keep a count of blocks per object in RAM?
+                // XXX want to consolidate adjacent objects, but we don't really
+                // know if that's possible until we read the objects (unless we
+                // have object sizes in blocks/bytes in RAM).  Hard to
+                // coordinate reading of a string of adjacent objects and then
+                // evaluating them.  Maybe have a max adjacent batch size and
+                // issue/wait that as a group?
+                join_handles.push(Self::reclaim_frees_object(
+                    shared_state.clone(),
+                    *obj,
+                    frees,
+                ));
+                if complete.freed_blocks_count > required_frees {
+                    break;
+                }
+            }
+            for (_, mut frees) in frees_per_obj.drain() {
+                // XXX copying around the blocks, although maybe this is not huge???
+                // XXX could simply give the whole frees_per_obj and have syncing context iterate
+                complete.remaining_frees.append(&mut frees);
+            }
+
+            /*
             // rewrite objects, omitting freed blocks
             // XXX want to consolidate adjacent small objects
-            let mut complete = ReclaimFreesComplete::default();
             let mut current_obj_state: Option<(ObjectID, Vec<BlockID>)> = None;
-            let mut join_handles = Vec::new();
 
             let begin = Instant::now();
             for free_block in frees {
@@ -580,6 +642,7 @@ impl Pool {
                     myblocks,
                 ));
             }
+            */
 
             let num_handles = join_handles.len();
             for jh in join_handles {
@@ -637,8 +700,16 @@ impl Pool {
                         .pending_frees_log
                         .iterate_after(rfc.num_chunks);
                     syncing_state.pending_frees_log.clear(txg).await;
+
                     let begin = Instant::now();
                     let mut count = 0u64;
+                    for block in rfc.remaining_frees {
+                        syncing_state
+                            .pending_frees_log
+                            .append(txg, PendingFreesLogEntry { block });
+                        count += 1;
+                    }
+
                     stream
                         .for_each(|ent| {
                             syncing_state.pending_frees_log.append(txg, ent);
@@ -875,7 +946,7 @@ impl Pool {
         let pending_object = syncing_state.pending_object.as_mut().unwrap();
         pending_object.phys.blocks.insert(id, data);
         let sem = pending_object.done.clone();
-        let do_flush = pending_object.phys.blocks.len() >= 100;
+        let do_flush = pending_object.phys.blocks.len() >= MAX_BLOCKS_PER_OBJECT;
         (sem, do_flush)
     }
 
