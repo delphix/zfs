@@ -129,8 +129,8 @@ impl Server {
                     "free block" => {
                         println!("got request: {:?}", nvl);
                         let block = BlockID(nvl.lookup_uint64("block").unwrap());
-                        let _size = nvl.lookup_uint64("size").unwrap();
-                        server.free_block(block);
+                        let size = nvl.lookup_uint64("size").unwrap();
+                        server.free_block(block, size as u32);
                     }
                     "read block" => {
                         println!("got request: {:?}", nvl);
@@ -275,8 +275,8 @@ impl Server {
     }
 
     /// initiate free.  No response.  Does not block.  Completes when the current txg is ended.
-    fn free_block(&mut self, block: BlockID) {
-        self.pool.as_mut().unwrap().free_block(block);
+    fn free_block(&mut self, block: BlockID, size: u32) {
+        self.pool.as_mut().unwrap().free_block(block, size);
     }
 
     /// initiate read, sends response when completed.  Does not block.

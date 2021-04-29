@@ -246,37 +246,12 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         entries
     }
 
-    pub fn iterate(&self) -> impl Stream<Item = T> {
-        self.iterate_after(0)
-        /*
-        let mut stream = FuturesOrdered::new();
-        let generation = self.generation;
-        for chunk in 0..self.num_chunks {
-            let pool = self.pool.clone();
-            let n = self.name.clone();
-            let fut = async move {
-                async move { ObjectBasedLogChunk::get(&pool.bucket, &n, generation, chunk).await }
-            };
-            stream.push(fut);
-        }
-        // Note: buffered() is needed because rust-s3 creates one connection for
-        // each request, rather than using a connection pool. If we created 1000
-        // connections we'd run into the open file descriptor limit.
-        let mut buffered_stream = stream.buffered(50);
-        stream! {
-            while let Some(fut) = buffered_stream.next().await {
-                let chunk = fut;
-                println!("yielding entries of chunk {}", chunk.chunk);
-                for ent in chunk.entries {
-                    yield ent;
-                }
-            }
-        }
-        */
-    }
-
     pub fn num_chunks(&self) -> u64 {
         self.num_chunks
+    }
+
+    pub fn iterate(&self) -> impl Stream<Item = T> {
+        self.iterate_after(0)
     }
 
     pub fn iterate_after(&self, first_chunk: u64) -> impl Stream<Item = T> {

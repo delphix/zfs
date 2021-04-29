@@ -625,6 +625,7 @@ dependencies = [
  "rand",
  "rust-s3",
  "serde",
+ "stream-reduce",
  "tokio",
  "tokio-pipe",
  "tokio-stream",
@@ -1250,6 +1251,16 @@ checksum = "9e3dfc207c526015c632472a77be09cf1b6e46866581aecae5cc38fb4235dea2"
 dependencies = [
  "libc",
  "winapi",
+]
+
+[[package]]
+name = "stream-reduce"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47049626a7bcf00214826ee7860dfd5723dbda9d7238679a18e8f817afafc58e"
+dependencies = [
+ "futures",
+ "pin-utils",
 ]
 
 [[package]]
