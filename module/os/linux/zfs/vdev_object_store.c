@@ -460,6 +460,7 @@ agent_reader(void *arg)
 			uint8_t *arr;
 			int err = nvlist_lookup_uint8_array(nv, AGENT_UBERBLOCK,
 			    &arr, &len);
+			ASSERT3U (len, ==, sizeof (uberblock_t));
 			if (err == 0)
 				bcopy(arr, &vos->vos_uberblock, len);
 

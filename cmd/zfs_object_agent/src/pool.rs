@@ -161,7 +161,9 @@ impl UberblockPhys {
         format!("zfs/{}/txg/{}", guid, txg)
     }
 
-    pub fn get_zfs_uberblock(&self) -> &Vec<u8> {&self.zfs_uberblock}
+    pub fn get_zfs_uberblock(&self) -> &Vec<u8> {
+        &self.zfs_uberblock
+    }
 
     async fn get(bucket: &Bucket, guid: PoolGUID, txg: TXG) -> Self {
         let buf = object_access::get_object(bucket, &Self::key(guid, txg)).await;

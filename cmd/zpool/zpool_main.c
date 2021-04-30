@@ -3750,7 +3750,6 @@ zpool_do_import(int argc, char **argv)
 		    "with that name were found\n"));
 		err = 1;
 	} else if (pools == NULL) {
-		fprintf(stderr, "j\n");
 		if (argc != 0) {
 			(void) fprintf(stderr, gettext("cannot import '%s': "
 			    "no such pool available\n"), argv[0]);

@@ -3664,7 +3664,6 @@ spa_ld_open_rootbp(spa_t *spa)
 }
 
 static void
-
 copy_objstore_credentials(nvlist_t *src, nvlist_t *dest)
 {
 	nvlist_t **schild, **dchild;

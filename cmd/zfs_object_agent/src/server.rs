@@ -217,13 +217,11 @@ impl Server {
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "pool open done").unwrap();
         nvl.insert("GUID", &guid.0).unwrap();
-        match phys_opt {
-            Some(phys) => {
-                nvl.insert("uberblock", &phys.get_zfs_uberblock()[..]).unwrap();
-            }
-            None => {}
+        if let Some(phys) = phys_opt {
+            nvl.insert("uberblock", &phys.get_zfs_uberblock()[..])
+                .unwrap();
         }
-        
+
         nvl.insert("next_block", &next_block.0).unwrap();
         println!("sending response: {:?}", nvl);
         Self::send_response(&self.output, nvl).await;

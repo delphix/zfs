@@ -1675,7 +1675,7 @@ zpool_find_import_cached(libpc_handle_t *hdl, importargs_t *iarg)
 			if (iarg->handle_creds(hdl->lpc_lib_handle, child[c],
 				creds) != 0) {
 				fprintf(stderr, gettext("cannot import '%s': Failed to "
-				    "retreive objstore credentials.\n"), name);
+				    "retrieve objstore credentials.\n"), name);
 				goto errout;
 			}
 			
