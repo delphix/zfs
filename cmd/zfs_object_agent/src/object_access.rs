@@ -28,7 +28,13 @@ pub fn prefixed(key: &str) -> String {
     let prefix = match env::var("AWS_PREFIX") {
         Ok(val) => val,
         Err(_) => {
-            let raw_id = fs::read_to_string("/etc/machine-id").unwrap_or(env::var("USER").unwrap());
+            let raw_id = match fs::read_to_string("/etc/machine-id") {
+                Ok(machineid) => machineid,
+                Err(_) => env::var("USER").expect(
+                    "environment variable AWS_PREFIX or USER must be set \
+                    or file /etc/machine-id should be present",
+                ),
+            };
             raw_id[..std::cmp::min(10, raw_id.len())].to_string()
         }
     };

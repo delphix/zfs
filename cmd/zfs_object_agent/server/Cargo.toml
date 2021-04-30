@@ -20,4 +20,4 @@ serde = { version = "1.0.125", features = ["derive"] }
 tokio = { version = "1.4", features = ["full"] }
 tokio-pipe = "0.2.1"
 tokio-stream = "0.1.5"
-libzoa = { path = "../", version = "0.1.0"  }
+libzoa = { path = "../" }

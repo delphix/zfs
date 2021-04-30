@@ -1,0 +1,12 @@
+[Unit]
+Description=ZFS object agent
+After=local-fs.target
+Before=zfs-import-cache.service
+
+[Service]
+Environment="RUST_BACKTRACE=1"
+ExecStart=/sbin/zfs_object_agent
+Restart=on-abort
+
+[Install]
+WantedBy=zfs-import.target
