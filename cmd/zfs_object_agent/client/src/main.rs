@@ -1,8 +1,9 @@
 use client::Client;
 use futures::future::*;
+use libzoa::object_access;
+use libzoa::object_based_log::*;
+use libzoa::pool::*;
 use nvpair::*;
-use object_based_log::*;
-use pool::*;
 use rand::prelude::*;
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
@@ -19,12 +20,7 @@ use std::io::prelude::*;
 use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::net::UnixListener;
 mod client;
-mod object_access;
-mod object_based_log;
-mod pool;
-mod server;
 
 //#[macro_use]
 //extern crate more_asserts;
@@ -368,27 +364,6 @@ fn do_nvpair() {
     write_file_as_bytes("./zpool.cache.rust", &newbuf);
 }
 
-async fn do_server() {
-    let socket_name = std::env::args()
-        .nth(2)
-        .unwrap_or("/run/zfs_socket".to_string());
-
-    let _ = std::fs::remove_file(&socket_name);
-    let listener = UnixListener::bind(&socket_name).unwrap();
-    println!("Listening on: {}", socket_name);
-
-    loop {
-        match listener.accept().await {
-            Ok((socket, _)) => {
-                server::Server::start(socket);
-            }
-            Err(e) => {
-                println!("accept() failed: {}", e);
-            }
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -414,7 +389,6 @@ async fn main() {
         "free" => do_free().await.unwrap(),
         "btree" => do_btree(),
         "nvpair" => do_nvpair(),
-        "server" => do_server().await,
 
         _ => {
             println!("invalid argument: {}", args[1]);

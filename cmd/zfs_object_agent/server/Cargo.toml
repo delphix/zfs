@@ -1,16 +1,10 @@
 [package]
-name = "libzoa"
+name = "zfs_object_agent"
 version = "0.1.0"
 authors = ["Matthew Ahrens <mahrens@delphix.com>"]
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
 
 [dependencies]
 async-stream = "0.3.0"
@@ -26,9 +20,4 @@ serde = { version = "1.0.125", features = ["derive"] }
 tokio = { version = "1.4", features = ["full"] }
 tokio-pipe = "0.2.1"
 tokio-stream = "0.1.5"
-
-[workspace]
-members = [
-    "server",
-    "client"
-]
+libzoa = { path = "../", version = "0.1.0"  }

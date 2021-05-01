@@ -1,4 +1,4 @@
-use crate::pool::*;
+use libzoa::pool::*;
 use nvpair::NvEncoding;
 use nvpair::NvList;
 use nvpair::NvListRef;

@@ -8,6 +8,7 @@ use s3::Region;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::UnixListener;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
@@ -292,5 +293,26 @@ impl Server {
             );
             Self::send_response(&output, nvl).await;
         });
+    }
+}
+
+pub async fn do_server() {
+    let socket_name = std::env::args()
+        .nth(2)
+        .unwrap_or("/run/zfs_socket".to_string());
+
+    let _ = std::fs::remove_file(&socket_name);
+    let listener = UnixListener::bind(&socket_name).unwrap();
+    println!("Listening on: {}", socket_name);
+
+    loop {
+        match listener.accept().await {
+            Ok((socket, _)) => {
+                self::Server::start(socket);
+            }
+            Err(e) => {
+                println!("accept() failed: {}", e);
+            }
+        }
     }
 }
