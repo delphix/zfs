@@ -10,6 +10,7 @@ use s3::bucket::Bucket;
 use serde::{Deserialize, Serialize};
 use std::cmp::min;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::mem;
 use std::ops::Bound::*;
 use std::sync::Arc;
@@ -241,8 +242,20 @@ struct PoolSyncingState {
     pub syncing_txg: Option<TXG>,
     stats: PoolStatsPhys,
     reclaim_task: Option<oneshot::Receiver<ReclaimFreesComplete>>,
+    reclaim_cb: Option<oneshot::Receiver<SyncTask>>,
     // Protects objects that are being overwritten for sync-to-convergence
     rewriting_objects: HashMap<ObjectID, Arc<tokio::sync::Mutex<()>>>,
+}
+
+type SyncTask = Box<dyn FnOnce(&mut PoolSyncingState) + Send + 'static>;
+
+struct SyncTaskStruct {
+    cb: SyncTask,
+}
+impl fmt::Debug for SyncTaskStruct {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        "closure pointer".to_string()
+    }
 }
 
 #[derive(Debug)]
@@ -264,7 +277,9 @@ pub struct PoolSharedState {
     pub name: String,
 }
 
-#[derive(Debug, Default)]
+pub struct SyncTask {}
+
+#[derive(Debug)]
 struct ReclaimFreesComplete {
     freed_blocks_count: u64,
     freed_blocks_bytes: u64,
@@ -272,6 +287,7 @@ struct ReclaimFreesComplete {
     remaining_frees: Vec<PendingFreesLogEntry>,
     rewritten_object_sizes: Vec<(ObjectID, u32)>,
     deleted_objects: Vec<ObjectID>,
+    //sync_func: dyn FnOnce(&mut PoolSyncingState),
 }
 
 impl Pool {
