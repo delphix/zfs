@@ -460,15 +460,17 @@ agent_reader(void *arg)
 			uint8_t *arr;
 			int err = nvlist_lookup_uint8_array(nv, AGENT_UBERBLOCK,
 			    &arr, &len);
-			ASSERT3U (len, ==, sizeof (uberblock_t));
-			if (err == 0)
+			if (err == 0) {
+				ASSERT3U(len, ==, sizeof (uberblock_t));
 				bcopy(arr, &vos->vos_uberblock, len);
+			}
 
 			uint64_t next_block = fnvlist_lookup_uint64(nv,
 			    AGENT_NEXT_BLOCK);
 			vos->vos_next_block = next_block;
 
-			zfs_dbgmsg("got pool open done len=%llu block=%llu", len, next_block);
+			zfs_dbgmsg("got pool open done len=%llu block=%llu",
+			    len, next_block);
 
 			fnvlist_free(nv);
 			mutex_enter(&vos->vos_outstanding_lock);
