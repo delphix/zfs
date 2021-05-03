@@ -1924,7 +1924,7 @@ retry:
 	if (txg > spa_freeze_txg(spa))
 		return (0);
 
-	ASSERT(txg <= spa->spa_final_txg);
+	ASSERT3U(txg, <=, spa->spa_final_txg);
 
 #ifdef _KERNEL
 	if (spa->spa_root_vdev->vdev_child[0]->vdev_ops ==

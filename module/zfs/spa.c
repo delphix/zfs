@@ -1561,7 +1561,7 @@ spa_unload(spa_t *spa)
 	 */
 	spa_async_suspend(spa);
 
-	if (spa->spa_root_vdev) {
+	if (spa->spa_root_vdev && spa->spa_final_txg == UINT64_MAX) {
 		vdev_t *root_vdev = spa->spa_root_vdev;
 		vdev_initialize_stop_all(root_vdev, VDEV_INITIALIZE_ACTIVE);
 		vdev_trim_stop_all(root_vdev, VDEV_TRIM_ACTIVE);
