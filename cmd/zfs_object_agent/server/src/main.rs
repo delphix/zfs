@@ -1,7 +1,7 @@
 fn main() {
     let socket_path = std::env::args()
         .nth(2)
-        .unwrap_or("/run/zfs_socket".to_string());
+        .unwrap_or("/run/zfs_{}_socket".to_string());
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("zoa")

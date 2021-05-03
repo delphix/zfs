@@ -4938,23 +4938,18 @@ zpool_load_compat(const char *compat, boolean_t *features, char *report,
 }
 
 int
-zpool_get_objstore_credentials(libzfs_handle_t *hdl, nvlist_t *props,
-    char *creds)
+zpool_get_objstore_credentials(libzfs_handle_t *hdl,
+    char *credloc, char **creds)
 {
-	char *creds_buf;
 	size_t creds_len;
 	int err = get_key_material(hdl, B_FALSE, B_FALSE,
-	    ZFS_KEYFORMAT_INI, creds, NULL, (uint8_t **)&creds_buf,
+	    ZFS_KEYFORMAT_INI, credloc, NULL, (uint8_t **)creds,
 	    &creds_len, NULL);
 	if (err != 0) {
 		(void) zpool_standard_error_fmt(hdl, EINVAL,
 		    dgettext(TEXT_DOMAIN, "error getting pool credentials"));
 		return (err);
 	}
-
-	fnvlist_add_string(props,
-	    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, creds_buf);
-	free(creds_buf);
 
 	return (err);
 }

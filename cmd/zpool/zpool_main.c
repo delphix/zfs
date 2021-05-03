@@ -1548,11 +1548,16 @@ zpool_do_create(int argc, char **argv)
 		goto errout;
 	}
 
-	char *creds;
+	char *credloc, *credentials;
 	if ((nvlist_lookup_string(props,
-	    zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), &creds)) == 0) {
-		if (zpool_get_objstore_credentials(g_zfs, props, creds) != 0)
+	    zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), &credloc)) == 0) {
+		if (zpool_get_objstore_credentials(g_zfs, credloc,
+		    &credentials) != 0) {
 			goto errout;
+		}
+		fnvlist_add_string(props, ZPOOL_CONFIG_OBJSTORE_CREDENTIALS,
+		    credentials);
+		free(credentials);
 	}
 
 	/* pass off to make_root_vdev for bulk processing */
@@ -3729,8 +3734,9 @@ zpool_do_import(int argc, char **argv)
 	idata.cachefile = cachefile;
 	idata.scan = do_scan;
 	idata.policy = policy;
+	idata.props = props;
 	idata.handle_creds =
-	    (int (*)(void *, nvlist_t *, char *))zpool_get_objstore_credentials;
+	    (int (*)(void *, char *, char **))zpool_get_objstore_credentials;
 
 	pools = zpool_search_import(g_zfs, &idata, &libzfs_config_ops);
 

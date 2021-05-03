@@ -52,6 +52,8 @@ int label_paths(libpc_handle_t *hdl, nvlist_t *label, char **path,
     char **devid);
 int zpool_find_import_blkid(libpc_handle_t *hdl, pthread_mutex_t *lock,
     avl_tree_t **slice_cache);
+void zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
+    pthread_mutex_t *lock, avl_tree_t *cache);
 
 void * zutil_alloc(libpc_handle_t *hdl, size_t size);
 char *zutil_strdup(libpc_handle_t *hdl, const char *str);
@@ -67,6 +69,7 @@ typedef struct rdsk_node {
 	avl_node_t rn_node;
 	pthread_mutex_t *rn_lock;
 	boolean_t rn_labelpaths;
+	boolean_t rn_external;		/* True if the disk cannot be opened. */
 } rdsk_node_t;
 
 int slice_cache_compare(const void *, const void *);

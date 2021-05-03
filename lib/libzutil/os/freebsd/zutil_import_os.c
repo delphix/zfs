@@ -247,3 +247,11 @@ zfs_dev_flush(int fd __unused)
 {
 	return (0);
 }
+
+void
+zpool_find_import_agent(libpc_handle_t *hdl __unused,
+    importargs_t *iarg __unused, pthread_mutex_t *lock __unused,
+    avl_tree_t *cache __unused)
+{
+
+}

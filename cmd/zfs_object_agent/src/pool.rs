@@ -6,6 +6,7 @@ use core::future::Future;
 use futures::future;
 use futures::future::*;
 use futures::stream::*;
+use nvpair::NvList;
 use s3::bucket::Bucket;
 use serde::{Deserialize, Serialize};
 use std::cmp::min;
@@ -50,6 +51,7 @@ pub struct UberblockPhys {
     highest_block: BlockID, // highest blockID in use
     stats: PoolStatsPhys,
     zfs_uberblock: Vec<u8>,
+    zfs_config: Vec<u8>,
 }
 impl OnDisk for UberblockPhys {}
 
@@ -284,6 +286,12 @@ impl PoolSyncingState {
 }
 
 impl Pool {
+    pub async fn get_config(bucket: &Bucket, guid: PoolGUID) -> NvList {
+        let pool_phys = PoolPhys::get(bucket, guid).await;
+        let ubphys = UberblockPhys::get(bucket, pool_phys.guid, pool_phys.last_txg).await;
+        NvList::try_unpack(&ubphys.zfs_config).unwrap()
+    }
+
     pub async fn create(bucket: &Bucket, name: &str, guid: PoolGUID) {
         let phys = PoolPhys {
             guid,
@@ -487,7 +495,7 @@ impl Pool {
         });
     }
 
-    pub fn end_txg_cb<F>(&mut self, uberblock: Vec<u8>, cb: F)
+    pub fn end_txg_cb<F>(&mut self, uberblock: Vec<u8>, config: Vec<u8>, cb: F)
     where
         F: Future + Send + 'static,
     {
@@ -527,6 +535,7 @@ impl Pool {
                 highest_block: BlockID(syncing_state.pending_object_min_block.0 - 1),
                 zfs_uberblock: uberblock,
                 stats: syncing_state.stats.clone(),
+                zfs_config: config,
             };
             u.put(&state.readonly_state.bucket).await;
 

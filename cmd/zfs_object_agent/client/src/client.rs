@@ -13,7 +13,7 @@ pub struct Client {
 
 impl Client {
     pub async fn connect() -> Client {
-        let s = tokio::net::UnixStream::connect("/run/zfs_socket")
+        let s = tokio::net::UnixStream::connect("/run/zfs_kernel_socket")
             .await
             .unwrap();
 

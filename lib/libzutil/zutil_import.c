@@ -445,6 +445,63 @@ vdev_is_hole(uint64_t *hole_array, uint_t holes, uint_t id)
 	return (B_FALSE);
 }
 
+static void
+copy_creds(nvlist_t *src, nvlist_t *dst)
+{
+	/*
+	 * If this is an objstore pool, we need to get the credentials.
+	 */
+	nvlist_t *tree, *dsttree;
+	uint_t c, c2, children, dstchildren;
+	nvlist_t **child, **dstchild;
+
+	tree = fnvlist_lookup_nvlist(src, ZPOOL_CONFIG_VDEV_TREE);
+	dsttree = fnvlist_lookup_nvlist(dst, ZPOOL_CONFIG_VDEV_TREE);
+
+	if (nvlist_lookup_nvlist_array(tree, ZPOOL_CONFIG_CHILDREN,
+	    &child, &children) != 0) {
+		return;
+	}
+
+	VERIFY0(nvlist_lookup_nvlist_array(dsttree, ZPOOL_CONFIG_CHILDREN,
+	    &dstchild, &dstchildren));
+
+	for (c = 0; c < children; c++) {
+		char *type, *creds;
+		uint64_t guid;
+		if (nvlist_lookup_string(child[c], ZPOOL_CONFIG_TYPE,
+		    &type) != 0) {
+			continue;
+		}
+
+		if (strcmp(type, VDEV_TYPE_OBJSTORE) != 0)
+			continue;
+
+		creds = fnvlist_lookup_string(child[c],
+		    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS);
+		guid = fnvlist_lookup_uint64(child[c], ZPOOL_CONFIG_GUID);
+
+		for (c2 = 0; c2 < dstchildren; c2++) {
+			if (nvlist_lookup_string(dstchild[c2],
+			    ZPOOL_CONFIG_TYPE, &type) != 0) {
+				continue;
+			}
+
+			if (strcmp(type, VDEV_TYPE_OBJSTORE) != 0 ||
+			    fnvlist_lookup_uint64(dstchild[c2],
+			    ZPOOL_CONFIG_GUID) != guid) {
+				continue;
+			}
+
+			fnvlist_add_string(dstchild[c2],
+			    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, creds);
+			break;
+		}
+		break;
+	}
+
+}
+
 /*
  * Convert our list of pools into the definitive set of configurations.  We
  * start by picking the best config for each toplevel vdev.  Once that's done,
@@ -808,6 +865,8 @@ get_configs(libpc_handle_t *hdl, pool_list_t *pl, boolean_t active_ok,
 			continue;
 		}
 
+		copy_creds(config, nvl);
+
 		nvlist_free(config);
 		config = nvl;
 
@@ -1104,6 +1163,7 @@ zpool_find_import_scan_add_slice(libpc_handle_t *hdl, pthread_mutex_t *lock,
 	slice->rn_hdl = hdl;
 	slice->rn_order = order + IMPORT_ORDER_SCAN_OFFSET;
 	slice->rn_labelpaths = B_FALSE;
+	slice->rn_external = B_FALSE;
 
 	pthread_mutex_lock(lock);
 	if (avl_find(cache, slice, &where)) {
@@ -1348,7 +1408,8 @@ zpool_find_import_impl(libpc_handle_t *hdl, importargs_t *iarg,
 				 */
 				fd = open(slice->rn_name,
 				    O_RDONLY | O_EXCL | O_CLOEXEC);
-				if (fd >= 0 || iarg->can_be_active) {
+				if (fd >= 0 || iarg->can_be_active ||
+				    slice->rn_external) {
 					if (fd >= 0)
 						close(fd);
 					add_config(hdl, &pools,
@@ -1417,63 +1478,6 @@ discover_cached_paths(libpc_handle_t *hdl, nvlist_t *nv,
 		    dirname(path), 0));
 	}
 	return (0);
-}
-
-static void
-copy_creds(nvlist_t *src, nvlist_t *dst)
-{
-	/*
-	 * If this is an objstore pool, we need to get the credentials.
-	 */
-	nvlist_t *tree, *dsttree;
-	uint_t c, c2, children, dstchildren;
-	nvlist_t **child, **dstchild;
-
-	tree = fnvlist_lookup_nvlist(src, ZPOOL_CONFIG_VDEV_TREE);
-	dsttree = fnvlist_lookup_nvlist(dst, ZPOOL_CONFIG_VDEV_TREE);
-
-	if (nvlist_lookup_nvlist_array(tree, ZPOOL_CONFIG_CHILDREN,
-	    &child, &children) != 0) {
-		return;
-	}
-
-	VERIFY0(nvlist_lookup_nvlist_array(dsttree, ZPOOL_CONFIG_CHILDREN,
-	    &dstchild, &dstchildren));
-
-	for (c = 0; c < children; c++) {
-		char *type, *creds;
-		uint64_t guid;
-		if (nvlist_lookup_string(child[c], ZPOOL_CONFIG_TYPE,
-		    &type) != 0) {
-			continue;
-		}
-
-		if (strcmp(type, VDEV_TYPE_OBJSTORE) != 0)
-			continue;
-
-		creds = fnvlist_lookup_string(child[c],
-		    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS);
-		guid = fnvlist_lookup_uint64(child[c], ZPOOL_CONFIG_GUID);
-
-		for (c2 = 0; c2 < dstchildren; c2++) {
-			if (nvlist_lookup_string(dstchild[c2],
-			    ZPOOL_CONFIG_TYPE, &type) != 0) {
-				continue;
-			}
-
-			if (strcmp(type, VDEV_TYPE_OBJSTORE) != 0 ||
-			    fnvlist_lookup_uint64(dstchild[c2],
-			    ZPOOL_CONFIG_GUID) != guid) {
-				continue;
-			}
-
-			fnvlist_add_string(dstchild[c2],
-			    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, creds);
-			break;
-		}
-		break;
-	}
-
 }
 
 /*
@@ -1674,14 +1678,17 @@ zpool_find_import_cached(libpc_handle_t *hdl, importargs_t *iarg)
 				goto errout;
 			}
 
-			if (iarg->handle_creds(hdl->lpc_lib_handle, child[c],
-			    creds) != 0) {
+			char *credentials;
+			if (iarg->handle_creds(hdl->lpc_lib_handle,
+			    creds, &credentials) != 0) {
 				fprintf(stderr, gettext("cannot import '%s': "
 				    "Failed to "
 				    "retrieve objstore credentials.\n"), name);
 				goto errout;
 			}
-
+			fnvlist_add_string(child[c],
+			    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, credentials);
+			free(credentials);
 			break;
 		}
 
@@ -1739,9 +1746,11 @@ zpool_find_import(libpc_handle_t *hdl, importargs_t *iarg)
 			return (NULL);
 		}
 	}
+	zpool_find_import_agent(hdl, iarg, &lock, cache);
 
 	pools = zpool_find_import_impl(hdl, iarg, &lock, cache);
 	pthread_mutex_destroy(&lock);
+
 	return (pools);
 }
 

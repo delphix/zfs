@@ -65,6 +65,7 @@
 #define	AGENT_DATA		"data"
 #define	AGENT_REQUEST_ID	"request_id"
 #define	AGENT_UBERBLOCK		"uberblock"
+#define	AGENT_CONFIG		"config"
 #define	AGENT_NEXT_BLOCK	"next_block"
 
 /*
@@ -116,8 +117,8 @@ vdev_object_store_open_mode(spa_mode_t spa_mode)
 }
 
 #ifdef _KERNEL
-static struct sockaddr_un zfs_socket = {
-	AF_UNIX, "/run/zfs_socket"
+static struct sockaddr_un zfs_kernel_socket = {
+	AF_UNIX, "/run/zfs_kernel_socket"
 };
 #endif
 
@@ -132,8 +133,8 @@ zfs_object_store_open(char *bucket_name, int mode, struct socket **sock)
 		return (rc);
 	}
 
-	rc = s->ops->connect(s, (struct sockaddr *)&zfs_socket,
-	    sizeof (zfs_socket), 0);
+	rc = s->ops->connect(s, (struct sockaddr *)&zfs_kernel_socket,
+	    sizeof (zfs_kernel_socket), 0);
 	if (rc != 0) {
 		zfs_dbgmsg("zfs_object_store_open failed to connect: %d", rc);
 		sock_release(s);
@@ -357,12 +358,14 @@ agent_begin_txg(vdev_object_store_t *vos, uint64_t txg)
 }
 
 static void
-agent_end_txg(vdev_object_store_t *vos, uint64_t txg, void *buf, size_t len)
+agent_end_txg(vdev_object_store_t *vos, uint64_t txg, void *ub_buf,
+    size_t ub_len, void *config_buf, size_t config_len)
 {
 	nvlist_t *nv = fnvlist_alloc();
 	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_END_TXG);
 	fnvlist_add_uint64(nv, AGENT_TXG, txg);
-	fnvlist_add_uint8_array(nv, AGENT_DATA, buf, len);
+	fnvlist_add_uint8_array(nv, AGENT_UBERBLOCK, ub_buf, ub_len);
+	fnvlist_add_uint8_array(nv, AGENT_CONFIG, config_buf, config_len);
 	zfs_dbgmsg("agent_end_txg(%llu)",
 	    txg);
 	agent_request(vos, nv);
@@ -379,17 +382,17 @@ object_store_begin_txg(spa_t *spa, uint64_t txg)
 }
 
 void
-object_store_end_txg(spa_t *spa, uint64_t txg)
+object_store_end_txg(spa_t *spa, nvlist_t *config, uint64_t txg)
 {
 	vdev_t *vd = spa->spa_root_vdev->vdev_child[0];
 	ASSERT3P(vd->vdev_ops, ==, &vdev_object_store_ops);
 	vdev_object_store_t *vos = vd->vdev_tsd;
-	// size_t nvlen;
-	// char *nvbuf = fnvlist_pack(spa->spa_config_syncing, &nvlen);
+	size_t nvlen;
+	char *nvbuf = fnvlist_pack(config, &nvlen);
 	agent_end_txg(vos, txg,
-	    &spa->spa_uberblock, sizeof (spa->spa_uberblock));
+	    &spa->spa_uberblock, sizeof (spa->spa_uberblock), nvbuf, nvlen);
 	agent_wait_serial(vos);
-	// fnvlist_pack_free(nvbuf, nvlen);
+	fnvlist_pack_free(nvbuf, nvlen);
 }
 
 void

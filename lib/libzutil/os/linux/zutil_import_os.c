@@ -58,6 +58,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/dktp/fdisk.h>
 #include <sys/vdev_impl.h>
 #include <sys/fs/zfs.h>
@@ -130,6 +133,11 @@ zpool_open_func(void *arg)
 	if (stat64(rn->rn_name, &statbuf) != 0 ||
 	    (!S_ISREG(statbuf.st_mode) && !S_ISBLK(statbuf.st_mode)))
 		return;
+
+	if (rn->rn_config != NULL) {
+		rn->rn_num_labels = 4; /* TODO: Do we need to set this? */
+		return;
+	}
 
 	/*
 	 * Preferentially open using O_DIRECT to bypass the block device
@@ -215,6 +223,7 @@ zpool_open_func(void *arg)
 			slice->rn_hdl = hdl;
 			slice->rn_order = IMPORT_ORDER_PREFERRED_1;
 			slice->rn_labelpaths = B_FALSE;
+			slice->rn_external = B_FALSE;
 			pthread_mutex_lock(rn->rn_lock);
 			if (avl_find(rn->rn_avl, slice, &where)) {
 			pthread_mutex_unlock(rn->rn_lock);
@@ -241,6 +250,7 @@ zpool_open_func(void *arg)
 			slice->rn_hdl = hdl;
 			slice->rn_order = IMPORT_ORDER_PREFERRED_2;
 			slice->rn_labelpaths = B_FALSE;
+			slice->rn_external = B_FALSE;
 			pthread_mutex_lock(rn->rn_lock);
 			if (avl_find(rn->rn_avl, slice, &where)) {
 				pthread_mutex_unlock(rn->rn_lock);
@@ -365,6 +375,7 @@ zpool_find_import_blkid(libpc_handle_t *hdl, pthread_mutex_t *lock,
 		slice->rn_avl = *slice_cache;
 		slice->rn_hdl = hdl;
 		slice->rn_labelpaths = B_TRUE;
+		slice->rn_external = B_FALSE;
 
 		error = zfs_path_order(slice->rn_name, &slice->rn_order);
 		if (error == 0)
@@ -387,6 +398,148 @@ zpool_find_import_blkid(libpc_handle_t *hdl, pthread_mutex_t *lock,
 
 	return (0);
 }
+
+struct sockaddr_un zfs_user_socket = {
+	AF_UNIX, "/run/zfs_user_socket"
+};
+
+void
+zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
+    pthread_mutex_t *lock, avl_tree_t *cache)
+{
+	char *creds, *bucket, *endpoint, *region;
+	if ((nvlist_lookup_string(iarg->props,
+	    "object-credentials-location", &creds)) != 0) {
+		return;
+	}
+	// TODO: We don't handle not specifying the bucket name yet
+	if (iarg->path == NULL) {
+		return;
+	}
+	bucket = iarg->path[0];
+	if ((nvlist_lookup_string(iarg->props, "object-endpoint",
+	    &endpoint)) != 0) {
+		return;
+	}
+	if ((nvlist_lookup_string(iarg->props, "object-region",
+	    &region)) != 0) {
+		return;
+	}
+
+	nvlist_t *msg = fnvlist_alloc();
+	char *credentials;
+	if (iarg->handle_creds(hdl->lpc_lib_handle, creds, &credentials) != 0) {
+		fnvlist_free(msg);
+		return;
+	}
+	fnvlist_add_string(msg, "Type", "get pools");
+	fnvlist_add_string(msg, "bucket", bucket);
+	fnvlist_add_string(msg, "region", region);
+	fnvlist_add_string(msg, "endpoint", endpoint);
+	fnvlist_add_string(msg, "credentials", credentials);
+	int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+	int err = connect(sock, (struct sockaddr *)&zfs_user_socket,
+	    sizeof (zfs_user_socket));
+	if (err != 0) {
+		free(credentials);
+		fnvlist_free(msg);
+		close(sock);
+		return;
+	}
+
+	size_t len;
+	char *buf = fnvlist_pack(msg, &len);
+	fnvlist_free(msg);
+
+	uint64_t len_le = htole64(len);
+	ssize_t rv = write(sock, &len_le, sizeof (len_le));
+	if (rv < 0) {
+		fnvlist_pack_free(buf, len);
+		free(credentials);
+		close(sock);
+		return;
+	}
+	ASSERT3U(rv, ==, sizeof (len_le));
+
+	rv = write(sock, buf, len);
+	fnvlist_pack_free(buf, len);
+
+	if (rv < 0) {
+		free(credentials);
+		close(sock);
+		return;
+	}
+	ASSERT3U(rv, ==, len);
+
+	uint64_t resp_size;
+	size_t size;
+	rv = read(sock, &resp_size, sizeof (resp_size));
+	if (rv < 0) {
+		free(credentials);
+		close(sock);
+		return;
+	}
+	ASSERT3U(rv, ==, sizeof (resp_size));
+
+	size = le64toh(resp_size);
+	buf = malloc(size);
+
+	rv = read(sock, buf, size);
+	close(sock);
+	if (rv < 0) {
+		free(credentials);
+		free(buf);
+		return;
+	}
+	ASSERT3U(rv, ==, size);
+
+	nvlist_t *resp = fnvlist_unpack(buf, size);
+	free(buf);
+
+	nvpair_t *elem = NULL;
+	while ((elem = nvlist_next_nvpair(resp, elem)) != NULL) {
+		avl_index_t where;
+		rdsk_node_t *slice;
+		nvlist_t *config;
+		VERIFY0(nvpair_value_nvlist(elem, &config));
+
+		nvlist_t *tree = fnvlist_lookup_nvlist(config,
+		    ZPOOL_CONFIG_VDEV_TREE);
+		char *type;
+		if (nvlist_lookup_string(tree, ZPOOL_CONFIG_TYPE, &type) == 0 &&
+		    strcmp(type, VDEV_TYPE_OBJSTORE) == 0) {
+			fnvlist_add_string(tree,
+			    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, credentials);
+		}
+		slice = zutil_alloc(hdl, sizeof (rdsk_node_t));
+		if (asprintf(&slice->rn_name, "%s", fnvlist_lookup_string(tree,
+		    ZPOOL_CONFIG_PATH)) == -1) {
+			free(credentials);
+			free(slice);
+			return;
+		}
+		slice->rn_vdev_guid = 0;
+		slice->rn_lock = lock;
+		slice->rn_avl = cache;
+		slice->rn_hdl = hdl;
+		slice->rn_order = IMPORT_ORDER_PREFERRED_1;
+		slice->rn_labelpaths = B_FALSE;
+		slice->rn_config = fnvlist_dup(config);
+		slice->rn_external = B_TRUE;
+
+		pthread_mutex_lock(lock);
+		if (avl_find(cache, slice, &where)) {
+			free(slice->rn_name);
+			free(slice);
+		} else {
+			avl_insert(cache, slice, where);
+		}
+		pthread_mutex_unlock(lock);
+	}
+	free(credentials);
+	fnvlist_free(resp);
+}
+
 
 /*
  * Linux persistent device strings for vdev labels

@@ -1,8 +1,7 @@
 use crate::base_types::*;
-use crate::pool::*;
-use nvpair::NvData;
+use crate::{object_access, pool::*};
 use nvpair::NvEncoding;
-use nvpair::NvList;
+use nvpair::{NvData, NvList};
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::Region;
@@ -37,6 +36,47 @@ impl Server {
         pipe.read_exact(v.as_mut()).await?;
         let nvl = NvList::try_unpack(v.as_ref()).unwrap();
         Ok(nvl)
+    }
+
+    pub fn ustart(connection: UnixStream) {
+        let (r, w) = connection.into_split();
+        let mut server = Server {
+            input: r,
+            output: Arc::new(Mutex::new(w)),
+            pool: None,
+            num_outstanding_writes: Arc::new(std::sync::Mutex::new(0)),
+        };
+        tokio::spawn(async move {
+            loop {
+                let nvl = match tokio::time::timeout(
+                    Duration::from_millis(1000),
+                    Self::get_next_request(&mut server.input),
+                )
+                .await
+                {
+                    Err(_) => {
+                        continue;
+                    }
+                    Ok(getreq_result) => match getreq_result {
+                        Err(_) => {
+                            println!("got error reading from connection: {:?}", getreq_result);
+                            return;
+                        }
+                        Ok(mynvl) => mynvl,
+                    },
+                };
+                match nvl.lookup_string("Type").unwrap().to_str().unwrap() {
+                    "get pools" => {
+                        println!("got request: {:?}", nvl);
+                        server.get_pools(&nvl).await;
+                    }
+                    other => {
+                        println!("got request: {:?}", nvl);
+                        panic!("bad type {:?}", other);
+                    }
+                }
+            }
+        });
     }
 
     pub fn start(connection: UnixStream) {
@@ -104,11 +144,16 @@ impl Server {
                     }
                     "end txg" => {
                         println!("got request: {:?}", nvl);
-                        let data = nvl.lookup("data").unwrap().data();
-                        if let NvData::Uint8Array(slice) = data {
-                            server.end_txg(slice.to_vec());
+                        let uberblock = nvl.lookup("uberblock").unwrap().data();
+                        let config = nvl.lookup("config").unwrap().data();
+                        if let NvData::Uint8Array(slice) = uberblock {
+                            if let NvData::Uint8Array(slice2) = config {
+                                server.end_txg(slice.to_vec(), slice2.to_vec());
+                            } else {
+                                panic!("config not expected type")
+                            }
                         } else {
-                            panic!("data not expected type")
+                            panic!("uberblock not expected type")
                         }
                     }
                     "write block" => {
@@ -203,6 +248,29 @@ impl Server {
         Bucket::new(bucket_name.to_str().unwrap(), region, credentials).unwrap()
     }
 
+    async fn get_pools(&mut self, nvl: &nvpair::NvListRef) {
+        let bucket = Self::get_bucket(nvl);
+        let objs = object_access::list_objects(&bucket, "zfs/", Some("/super".to_string())).await;
+        let mut nvl = NvList::new_unique_names();
+        for res in objs {
+            if let Some(prefixes) = res.common_prefixes {
+                for prefix in prefixes {
+                    println!("prefix: {}", prefix.prefix);
+                    let vector: Vec<&str> = prefix.prefix.rsplitn(3, "/").collect();
+                    let guid: &str = vector[1];
+                    let pool_config =
+                        Pool::get_config(&bucket, PoolGUID(str::parse::<u64>(guid).unwrap())).await;
+                    nvl.insert(
+                        pool_config.lookup_string("name").unwrap(),
+                        pool_config.as_ref(),
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        Self::send_response(&self.output, nvl).await;
+    }
+
     async fn create_pool(&mut self, bucket: &Bucket, guid: PoolGUID, name: &str) {
         Pool::create(bucket, name, guid).await;
         let mut nvl = NvList::new_unique_names();
@@ -240,10 +308,10 @@ impl Server {
     }
 
     // sends response when completed
-    fn end_txg(&mut self, uberblock: Vec<u8>) {
+    fn end_txg(&mut self, uberblock: Vec<u8>, config: Vec<u8>) {
         let pool = self.pool.as_mut().unwrap();
         let output = self.output.clone();
-        pool.end_txg_cb(uberblock, async move {
+        pool.end_txg_cb(uberblock, config, async move {
             let mut nvl = NvList::new_unique_names();
             nvl.insert("Type", "end txg done").unwrap();
             println!("sending response: {:?}", nvl);
@@ -301,18 +369,39 @@ impl Server {
     }
 }
 
+fn create_listener(path: String) -> UnixListener {
+    let _ = std::fs::remove_file(&path);
+    println!("Listening on: {}", path);
+    UnixListener::bind(&path).unwrap()
+}
+
 pub async fn do_server(socket_path: &str) {
-    let _ = std::fs::remove_file(&socket_path);
-    let listener = UnixListener::bind(&socket_path).unwrap();
-    println!("Listening on: {}", socket_path);
+    let ksocket_name = str::replace(socket_path, "{}", "kernel");
+    let usocket_name = str::replace(socket_path, "{}", "user");
+
+    let klistener = create_listener(ksocket_name);
+    let ulistener = create_listener(usocket_name);
+
+    tokio::spawn(async move {
+        loop {
+            match ulistener.accept().await {
+                Ok((socket, _)) => {
+                    self::Server::ustart(socket);
+                }
+                Err(e) => {
+                    println!("user accept() failed: {}", e);
+                }
+            }
+        }
+    });
 
     loop {
-        match listener.accept().await {
+        match klistener.accept().await {
             Ok((socket, _)) => {
                 self::Server::start(socket);
             }
             Err(e) => {
-                println!("accept() failed: {}", e);
+                println!("kernel accept() failed: {}", e);
             }
         }
     }
