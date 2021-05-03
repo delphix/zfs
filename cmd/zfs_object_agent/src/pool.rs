@@ -1,5 +1,6 @@
 use crate::object_access;
 use crate::object_based_log::*;
+use crate::object_block_map::ObjectBlockMap;
 use core::future::Future;
 use futures::future;
 use futures::future::*;
@@ -121,7 +122,6 @@ enum StorageObjectLogEntry {
     },
     Free {
         obj: ObjectID,
-        first_possible_block: BlockID,
     },
 }
 impl OnDisk for StorageObjectLogEntry {}
@@ -252,7 +252,8 @@ pub struct PoolState {
     // thread.
     syncing_state: tokio::sync::Mutex<PoolSyncingState>,
 
-    block_to_obj: std::sync::RwLock<BTreeMap<BlockID, ObjectID>>,
+    //block_to_obj: std::sync::RwLock<BTreeMap<BlockID, ObjectID>>,
+    block_to_obj: std::sync::RwLock<ObjectBlockMap>,
 
     pub readonly_state: Arc<PoolSharedState>,
 }
@@ -311,9 +312,12 @@ struct ReclaimFreesComplete {
     freed_blocks_bytes: u64,
     num_chunks: u64,
     remaining_frees: Vec<PendingFreesLogEntry>,
-    object_sizes: Vec<(ObjectID, u32)>,
+    // XXX include deleted objects' firstblockid, so we can properly remove it from the obj mapping
+    rewritten_object_sizes: Vec<(ObjectID, u32)>,
+    deleted_objects: Vec<ObjectID>,
 }
 
+/*
 impl PoolState {
     fn block_to_object(&self, block: BlockID) -> ObjectID {
         // find entry equal or less than this blockID
@@ -327,6 +331,7 @@ impl PoolState {
             .1
     }
 }
+*/
 
 impl Pool {
     pub async fn create(bucket: &Bucket, name: &str, guid: PoolGUID) {
@@ -380,7 +385,7 @@ impl Pool {
                     reclaim_task: None,
                     rewriting_objects: HashMap::new(),
                 }),
-                block_to_obj: std::sync::RwLock::new(BTreeMap::new()),
+                block_to_obj: std::sync::RwLock::new(ObjectBlockMap::new()),
             }),
         };
 
@@ -393,6 +398,8 @@ impl Pool {
         // load block -> object mapping
         let begin = Instant::now();
         let objects_rwlock = &pool.state.block_to_obj;
+        let mut num_alloc_entries: u64 = 0;
+        let mut num_free_entries: u64 = 0;
         syncing_state
             .storage_object_log
             .iterate()
@@ -403,14 +410,12 @@ impl Pool {
                         obj,
                         first_possible_block,
                     } => {
-                        objects.insert(first_possible_block, obj);
+                        objects.insert(obj, first_possible_block);
+                        num_alloc_entries += 1;
                     }
-                    StorageObjectLogEntry::Free {
-                        obj,
-                        first_possible_block,
-                    } => {
-                        let (_, removed_obj) = objects.remove_entry(&first_possible_block).unwrap();
-                        assert_eq!(removed_obj, obj);
+                    StorageObjectLogEntry::Free { obj } => {
+                        objects.remove(obj);
+                        num_free_entries += 1;
                     }
                 }
 
@@ -418,17 +423,13 @@ impl Pool {
             })
             .await;
         println!(
-            "loaded mapping for {} objects in {}ms",
-            objects_rwlock.write().unwrap().len(),
+            "loaded mapping with {} allocs and {} frees in {}ms",
+            num_alloc_entries,
+            num_free_entries,
             begin.elapsed().as_millis()
         );
 
-        // verify that object ID's are increasing as block ID's are increasing
-        let mut max_obj = ObjectID(0);
-        for v in objects_rwlock.write().unwrap().values() {
-            assert!(*v > max_obj);
-            max_obj = *v;
-        }
+        objects_rwlock.read().unwrap().verify();
 
         assert_eq!(
             objects_rwlock.read().unwrap().len() as u64,
@@ -498,7 +499,7 @@ impl Pool {
                         reclaim_task: None,
                         rewriting_objects: HashMap::new(),
                     }),
-                    block_to_obj: std::sync::RwLock::new(BTreeMap::new()),
+                    block_to_obj: std::sync::RwLock::new(ObjectBlockMap::new()),
                 }),
             };
             let syncing_state = pool.state.syncing_state.try_lock().unwrap();
@@ -520,14 +521,7 @@ impl Pool {
         assert!(syncing_state.syncing_txg.is_none());
         assert!(txg.0 > syncing_state.last_txg.0);
         syncing_state.syncing_txg = Some(txg);
-        let last_obj = *self
-            .state
-            .block_to_obj
-            .read()
-            .unwrap()
-            .values()
-            .next_back()
-            .unwrap_or(&ObjectID(0));
+        let last_obj = self.state.block_to_obj.read().unwrap().last_obj();
 
         syncing_state.pending_object = Some(PendingObject {
             done: Arc::new(Semaphore::new(0)),
@@ -589,7 +583,7 @@ impl Pool {
                 assert!(a.txg.0 <= b.txg.0); // XXX how to reduce?
                 a.blocks_size += b.blocks_size;
                 println!(
-                    "moving {} blocks from {} to {}",
+                    "moving {} blocks from {:?} to {:?}",
                     b.blocks.len(),
                     b.object,
                     a.object
@@ -653,7 +647,7 @@ impl Pool {
             let begin = Instant::now();
             pending_frees_log_stream
                 .for_each(|ent| {
-                    let obj = state.block_to_object(ent.block);
+                    let obj = state.block_to_obj.read().unwrap().block_to_obj(ent.block);
                     frees_per_obj.entry(obj).or_default().push(ent);
                     count += 1;
                     future::ready(())
@@ -681,7 +675,12 @@ impl Pool {
             object_size_log_stream
                 .for_each(|ent| {
                     // overwrite existing value, if any
-                    object_sizes.insert(ent.obj, ent.num_bytes);
+                    if ent.num_bytes == 0 {
+                        // XXX use an enum
+                        object_sizes.remove(&ent.obj);
+                    } else {
+                        object_sizes.insert(ent.obj, ent.num_bytes);
+                    }
                     future::ready(())
                 })
                 .await;
@@ -741,7 +740,8 @@ impl Pool {
 
                 // all but the first object need to be deleted by syncing context
                 for (obj, _) in objs_to_consolidate.iter().skip(1) {
-                    complete.object_sizes.push((*obj, 0));
+                    //complete.rewritten_object_sizes.push((*obj, 0));
+                    complete.deleted_objects.push(*obj);
                 }
                 // Note: we could calculate the new object's size here as well,
                 // but that would be based on the object_sizes map/log, which
@@ -770,7 +770,7 @@ impl Pool {
             let num_handles = join_handles.len();
             for jh in join_handles {
                 let (obj, size) = jh.await.unwrap();
-                complete.object_sizes.push((obj, size));
+                complete.rewritten_object_sizes.push((obj, size));
             }
 
             complete.num_chunks = num_chunks;
@@ -848,17 +848,22 @@ impl Pool {
                     syncing_state.stats.pending_frees_count += count;
                     syncing_state.reclaim_task = None;
 
-                    for (obj, size) in rfc.object_sizes {
-                        if size == 0 {
-                            syncing_state.storage_object_log.append(
-                                txg,
-                                StorageObjectLogEntry::Free {
-                                    obj,
-                                    first_possible_block: BlockID(0), // XXX
-                                },
-                            );
-                        }
+                    for obj in rfc.deleted_objects {
+                        syncing_state
+                            .storage_object_log
+                            .append(txg, StorageObjectLogEntry::Free { obj });
+                        state.block_to_obj.write().unwrap().remove(obj);
+                        syncing_state.object_size_log.append(
+                            txg,
+                            ObjectSizeLogEntry {
+                                obj,
+                                num_blocks: 0,
+                                num_bytes: 0,
+                            },
+                        );
+                    }
 
+                    for (obj, size) in rfc.rewritten_object_sizes {
                         // log to on-disk size
                         syncing_state.object_size_log.append(
                             txg,
@@ -871,6 +876,10 @@ impl Pool {
                     }
                 }
             }
+
+            syncing_state.storage_object_log.flush(txg).await;
+            syncing_state.object_size_log.flush(txg).await;
+            syncing_state.pending_frees_log.flush(txg).await;
 
             // write uberblock
             let u = UberblockPhys {
@@ -982,14 +991,7 @@ impl Pool {
                 },
             },
         );
-        let last_obj = *self
-            .state
-            .block_to_obj
-            .read()
-            .unwrap()
-            .values()
-            .next_back()
-            .unwrap_or(&ObjectID(0));
+        let last_obj = self.state.block_to_obj.read().unwrap().last_obj();
         let obj = ObjectID(last_obj.0 + 1);
         assert_eq!(obj, old_po.phys.object);
 
@@ -1010,7 +1012,7 @@ impl Pool {
             .block_to_obj
             .write()
             .unwrap()
-            .insert(min_block, obj);
+            .insert(obj, min_block);
 
         // log to on-disk block->object map
         syncing_state.storage_object_log.append(
@@ -1064,7 +1066,7 @@ impl Pool {
             // XXX the design is for this to not happen. Writes must be received
             // in blockID-order. However, for now we allow overwrites during
             // sync to convergence via this slow path.
-            let obj = self.state.block_to_object(id);
+            let obj = self.state.block_to_obj.read().unwrap().block_to_obj(id);
             let shared_state = self.state.readonly_state.clone();
             let txg = syncing_state.syncing_txg.unwrap();
             let sem = Arc::new(Semaphore::new(0));
@@ -1084,7 +1086,7 @@ impl Pool {
 
             tokio::spawn(async move {
                 let _guard = mtx.lock().await;
-                println!("rewriting {:?} to overwrite {}", obj, id);
+                println!("rewriting {:?} to overwrite {:?}", obj, id);
                 let mut obj_phys =
                     DataObjectPhys::get(&shared_state.bucket, shared_state.guid, obj).await;
                 // must have been written this txg
@@ -1170,7 +1172,7 @@ impl Pool {
     where
         F: Future + Send + 'static,
     {
-        let obj = self.state.block_to_object(id);
+        let obj = self.state.block_to_obj.read().unwrap().block_to_obj(id);
         let readonly_state = self.state.readonly_state.clone();
         //let state = self.state.clone();
 
