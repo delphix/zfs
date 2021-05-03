@@ -1,3 +1,4 @@
+use crate::base_types::*;
 use crate::object_access;
 use crate::object_based_log::*;
 use crate::object_block_map::ObjectBlockMap;
@@ -6,11 +7,9 @@ use futures::future;
 use futures::future::*;
 use futures::stream::*;
 use s3::bucket::Bucket;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::cmp::min;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fmt;
 use std::mem;
 use std::ops::Bound::*;
 use std::sync::Arc;
@@ -30,47 +29,6 @@ const FREE_MIN_BLOCKS: u64 = 1000;
 const MAX_BLOCKS_PER_OBJECT: usize = 100;
 // XXX increase
 const MAX_BYTES_PER_OBJECT: u32 = 128 * 1024;
-
-/*
- * Things that are stored on disk.
- */
-pub trait OnDisk: Serialize + DeserializeOwned {}
-
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
-pub struct TXG(pub u64);
-impl OnDisk for TXG {}
-impl fmt::Display for TXG {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
-pub struct PoolGUID(pub u64);
-impl OnDisk for PoolGUID {}
-impl fmt::Display for PoolGUID {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
-pub struct ObjectID(pub u64);
-impl OnDisk for ObjectID {}
-impl fmt::Display for ObjectID {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
-pub struct BlockID(pub u64);
-impl OnDisk for BlockID {}
-impl fmt::Display for BlockID {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
 
 #[derive(Serialize, Deserialize, Debug)]
 struct PoolPhys {

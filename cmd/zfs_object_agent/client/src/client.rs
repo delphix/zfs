@@ -1,4 +1,4 @@
-use libzoa::pool::*;
+use libzoa::base_types::*;
 use nvpair::NvEncoding;
 use nvpair::NvList;
 use nvpair::NvListRef;

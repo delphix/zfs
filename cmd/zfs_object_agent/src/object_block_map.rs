@@ -1,4 +1,4 @@
-use crate::pool::*;
+use crate::base_types::*;
 use std::borrow::Borrow;
 use std::collections::BTreeSet;
 use std::ops::Bound::*;

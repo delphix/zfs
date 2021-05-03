@@ -1,9 +1,10 @@
+use crate::base_types::*;
 use crate::object_access;
-use crate::pool::{OnDisk, PoolGUID, PoolSharedState, TXG};
+use crate::pool::PoolSharedState;
 use async_stream::stream;
 use futures::future;
-use futures::future::*;
-use futures::stream::*;
+use futures::future::join_all;
+use futures::stream::{FuturesOrdered, StreamExt};
 use futures_core::Stream;
 use s3::bucket::Bucket;
 use serde::de::DeserializeOwned;

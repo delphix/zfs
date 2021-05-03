@@ -1,37 +1,27 @@
 use client::Client;
 use futures::future::*;
+use libzoa::base_types::*;
 use libzoa::object_access;
-use libzoa::object_based_log::*;
-use libzoa::pool::*;
 use nvpair::*;
 use rand::prelude::*;
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::Region;
-use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
-use std::convert::TryInto;
+use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
 use std::fs;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::Read;
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 mod client;
-
-//#[macro_use]
-//extern crate more_asserts;
 
 const ENDPOINT: &str = "https://s3-us-west-2.amazonaws.com";
 const REGION: &str = "us-west-2";
 const BUCKET_NAME: &str = "cloudburst-data-2";
 const POOL_NAME: &str = "testpool";
 const POOL_GUID: u64 = 1234;
-
-thread_local!(static RNG: RefCell<ThreadRng> = RefCell::new(rand::thread_rng()));
 
 async fn do_s3(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
     let key = "mahrens/test.file2";
@@ -54,67 +44,6 @@ async fn do_s3(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
     }
 
     return std::result::Result::Ok(());
-}
-
-fn subsec_nanos() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos()
-        .into()
-}
-
-#[derive(Serialize, Deserialize, Debug, Ord, Eq, PartialEq, PartialOrd, Copy, Clone)]
-pub struct MyEntry(u128);
-impl OnDisk for MyEntry {}
-impl ObjectBasedLogEntry for MyEntry {}
-
-async fn do_obl(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
-    let obl_name = "mahrens/obl";
-    let fake_guid = PoolGUID(1234);
-    let fake_state = PoolSharedState {
-        bucket: bucket.clone(),
-        guid: fake_guid,
-        name: "obltest".to_string(),
-    };
-    let mut obl: ObjectBasedLog<MyEntry> = ObjectBasedLog::create(Arc::new(fake_state), obl_name);
-    let fake_txg = TXG(1);
-
-    println!("{:#?}", obl);
-
-    let entries = obl.read().await;
-    /*
-    let mut i = 0;
-    for e in entries {
-        println!("entry {}: {}", i, e);
-        i = i + 1;
-    }
-    */
-    println!("read {} entries", entries.len());
-
-    let mut bt = BTreeMap::new();
-    let mut i: i32 = 0;
-    let begin = Instant::now();
-    //for ent in &obl {
-    for ent in obl.read().await {
-        let e = bt.entry(ent).or_insert(0);
-        *e += 1;
-        i += 1;
-    }
-    println!(
-        "iterated {} entries in {}ms, btree has {} entries",
-        i,
-        begin.elapsed().as_millis(),
-        bt.len()
-    );
-
-    //obl.append(5u32);
-    for _ in 1..1500000 {
-        obl.append(fake_txg, MyEntry(subsec_nanos().try_into().unwrap()));
-    }
-    obl.flush(fake_txg).await;
-
-    Ok(())
 }
 
 fn do_btree() {
@@ -382,7 +311,6 @@ async fn main() {
         "s3" => do_s3(&bucket).await.unwrap(),
         "list" => do_list(&bucket).await.unwrap(),
         "delete" => do_delete(&bucket).await.unwrap(),
-        "obl" => do_obl(&bucket).await.unwrap(),
         "create" => do_create().await.unwrap(),
         "write" => do_write().await.unwrap(),
         "read" => do_read().await.unwrap(),

@@ -1,3 +1,4 @@
+use crate::base_types::*;
 use crate::pool::*;
 use nvpair::NvData;
 use nvpair::NvEncoding;
@@ -300,14 +301,10 @@ impl Server {
     }
 }
 
-pub async fn do_server() {
-    let socket_name = std::env::args()
-        .nth(2)
-        .unwrap_or("/run/zfs_socket".to_string());
-
-    let _ = std::fs::remove_file(&socket_name);
-    let listener = UnixListener::bind(&socket_name).unwrap();
-    println!("Listening on: {}", socket_name);
+pub async fn do_server(socket_path: &str) {
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    println!("Listening on: {}", socket_path);
 
     loop {
         match listener.accept().await {
