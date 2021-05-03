@@ -3729,7 +3729,8 @@ zpool_do_import(int argc, char **argv)
 	idata.cachefile = cachefile;
 	idata.scan = do_scan;
 	idata.policy = policy;
-	idata.handle_creds = (int (*)(void *, nvlist_t *, char *))zpool_get_objstore_credentials;
+	idata.handle_creds =
+	    (int (*)(void *, nvlist_t *, char *))zpool_get_objstore_credentials;
 
 	pools = zpool_search_import(g_zfs, &idata, &libzfs_config_ops);
 

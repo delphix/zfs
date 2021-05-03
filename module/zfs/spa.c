@@ -3629,7 +3629,7 @@ spa_ld_select_uberblock(spa_t *spa, spa_import_type_t type)
 		nvlist_free(unsup_feat);
 	}
 #endif
-	
+
 	if (type != SPA_IMPORT_ASSEMBLE && spa->spa_config_splitting) {
 		spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
 		spa_try_repair(spa, spa->spa_config);
@@ -3689,32 +3689,31 @@ copy_objstore_credentials(nvlist_t *src, nvlist_t *dest)
 		    &type) != 0) {
 			continue;
 		}
-		
+
 		if (strcmp(type, VDEV_TYPE_OBJSTORE) != 0)
 			continue;
-		
+
 		creds = fnvlist_lookup_string(schild[c1],
 		    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS);
 		guid = fnvlist_lookup_uint64(schild[c1], ZPOOL_CONFIG_GUID);
 
 		for (int c2 = 0; c2 < dchildren; c2++) {
 			if (nvlist_lookup_string(dchild[c2], ZPOOL_CONFIG_TYPE,
-				&type) != 0) {
+			    &type) != 0) {
 				continue;
 			}
-			
+
 			if (strcmp(type, VDEV_TYPE_OBJSTORE) != 0 ||
 			    fnvlist_lookup_uint64(dchild[c2],
 			    ZPOOL_CONFIG_GUID) != guid) {
 				continue;
 			}
-			
+
 			fnvlist_add_string(dchild[c2],
 			    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, creds);
 			break;
 		}
-			
-		
+
 		break;
 	}
 }

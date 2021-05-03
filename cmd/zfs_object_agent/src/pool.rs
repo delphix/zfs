@@ -8,6 +8,7 @@ use futures::stream::*;
 use s3::bucket::Bucket;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::cmp::min;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::mem;
@@ -35,7 +36,7 @@ const MAX_BYTES_PER_OBJECT: u32 = 128 * 1024;
  */
 pub trait OnDisk: Serialize + DeserializeOwned {}
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
 pub struct TXG(pub u64);
 impl OnDisk for TXG {}
 impl fmt::Display for TXG {
@@ -521,14 +522,15 @@ impl Pool {
         shared_state: Arc<PoolSharedState>,
         objs: Vec<(ObjectID, Vec<PendingFreesLogEntry>)>,
     ) -> (ObjectID, u32) {
+        let first_obj = objs[0].0;
         println!(
             "rewriting {} objects starting with {:?} to free {} blocks",
             objs.len(),
-            objs[0].0,
+            first_obj,
             objs.iter().map(|x| x.1.len()).sum::<usize>()
         );
 
-        let mut stream = FuturesOrdered::new();
+        let stream = FuturesUnordered::new();
         let mut to_delete = Vec::new();
         let mut first = true;
         for (obj, frees) in objs {
@@ -561,8 +563,8 @@ impl Pool {
         let new_obj = stream
             .reduce(|mut a, mut b| async move {
                 assert_eq!(a.guid, b.guid);
-                assert!(a.object < b.object);
-                assert!(a.txg.0 <= b.txg.0); // XXX how to reduce?
+                a.object = min(a.object, b.object);
+                a.txg = min(a.txg, b.txg); // XXX maybe should track min & max txg?
                 a.blocks_size += b.blocks_size;
                 println!(
                     "moving {} blocks from {:?} to {:?}",
@@ -579,6 +581,7 @@ impl Pool {
             .await
             .unwrap();
 
+        assert_eq!(new_obj.object, first_obj);
         new_obj.put(&shared_state.bucket).await;
 
         (new_obj.object, new_obj.blocks_size)
@@ -811,10 +814,10 @@ impl Pool {
                     let begin = Instant::now();
                     let mut count = 0u64;
                     let mut bytes = 0u64;
-                    for ent in rfc.remaining_frees {
+                    for pfle in rfc.remaining_frees {
                         count += 1;
-                        bytes += ent.size as u64;
-                        syncing_state.pending_frees_log.append(txg, ent);
+                        bytes += pfle.size as u64;
+                        syncing_state.pending_frees_log.append(txg, pfle);
                     }
 
                     stream

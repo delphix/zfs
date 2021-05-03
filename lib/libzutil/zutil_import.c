@@ -1431,7 +1431,7 @@ copy_creds(nvlist_t *src, nvlist_t *dst)
 
 	tree = fnvlist_lookup_nvlist(src, ZPOOL_CONFIG_VDEV_TREE);
 	dsttree = fnvlist_lookup_nvlist(dst, ZPOOL_CONFIG_VDEV_TREE);
-	
+
 	if (nvlist_lookup_nvlist_array(tree, ZPOOL_CONFIG_CHILDREN,
 	    &child, &children) != 0) {
 		return;
@@ -1456,17 +1456,17 @@ copy_creds(nvlist_t *src, nvlist_t *dst)
 		guid = fnvlist_lookup_uint64(child[c], ZPOOL_CONFIG_GUID);
 
 		for (c2 = 0; c2 < dstchildren; c2++) {
-			if (nvlist_lookup_string(dstchild[c2], ZPOOL_CONFIG_TYPE,
-				&type) != 0) {
+			if (nvlist_lookup_string(dstchild[c2],
+			    ZPOOL_CONFIG_TYPE, &type) != 0) {
 				continue;
 			}
-			
+
 			if (strcmp(type, VDEV_TYPE_OBJSTORE) != 0 ||
 			    fnvlist_lookup_uint64(dstchild[c2],
 			    ZPOOL_CONFIG_GUID) != guid) {
 				continue;
 			}
-			
+
 			fnvlist_add_string(dstchild[c2],
 			    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, creds);
 			break;
@@ -1642,46 +1642,49 @@ zpool_find_import_cached(libpc_handle_t *hdl, importargs_t *iarg)
 		nvlist_t *tree;
 		uint_t c, children;
 		nvlist_t **child;
-		
+
 		tree = fnvlist_lookup_nvlist(src, ZPOOL_CONFIG_VDEV_TREE);
-		
+
 		if (nvlist_lookup_nvlist_array(tree, ZPOOL_CONFIG_CHILDREN,
-			&child, &children) != 0) {
+		    &child, &children) != 0) {
 			fprintf(stderr, gettext("cannot import '%s': invalid "
 			    "configuration detected.\n"), name);
 			goto errout;
 		}
-		
+
 		for (c = 0; c < children; c++) {
 			char *type, *creds;
 			if (nvlist_lookup_string(child[c], ZPOOL_CONFIG_TYPE,
-				&type) != 0) {
-				fprintf(stderr, gettext("cannot import '%s': invalid "
+			    &type) != 0) {
+				fprintf(stderr, gettext(
+				    "cannot import '%s': invalid "
 				    "configuration detected.\n"), name);
 				goto errout;
 			}
-			
+
 			if (strcmp(type, VDEV_TYPE_OBJSTORE) != 0)
 				continue;
-			
+
 			if ((nvlist_lookup_string(child[c],
 			    "object-credentials-location",
 			    &creds)) != 0) {
-				fprintf(stderr, gettext("cannot import '%s': No "
-				    "objstore credentials located.\n"), name);
+				fprintf(stderr, gettext("cannot import '%s': "
+				    "No objstore credentials located.\n"),
+				    name);
 				goto errout;
 			}
-			
+
 			if (iarg->handle_creds(hdl->lpc_lib_handle, child[c],
-				creds) != 0) {
-				fprintf(stderr, gettext("cannot import '%s': Failed to "
+			    creds) != 0) {
+				fprintf(stderr, gettext("cannot import '%s': "
+				    "Failed to "
 				    "retrieve objstore credentials.\n"), name);
 				goto errout;
 			}
-			
+
 			break;
 		}
-		
+
 		if ((dst = zutil_refresh_config(hdl, src)) == NULL)
 			goto errout;
 

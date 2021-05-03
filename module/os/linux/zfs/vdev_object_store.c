@@ -534,12 +534,14 @@ vdev_object_store_init(spa_t *spa, nvlist_t *nv, void **tsd)
 	} else {
 		return (SET_ERROR(EINVAL));
 	}
-	if (!nvlist_lookup_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), &val)) {
+	if (!nvlist_lookup_string(nv,
+	    zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), &val)) {
 		vos->vos_credential_location = kmem_strdup(val);
 	} else {
 		return (SET_ERROR(EINVAL));
 	}
-	if (!nvlist_lookup_string(nv, ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, &val)) {
+	if (!nvlist_lookup_string(nv,
+	    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, &val)) {
 		vos->vos_credentials = kmem_strdup(val);
 	} else {
 		return (SET_ERROR(EINVAL));
@@ -737,9 +739,13 @@ vdev_object_store_config_generate(vdev_t *vd, nvlist_t *nv)
 {
 	vdev_object_store_t *vos = vd->vdev_tsd;
 
-	fnvlist_add_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), vos->vos_credential_location);
-	fnvlist_add_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_ENDPOINT), vos->vos_endpoint);
-	fnvlist_add_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_REGION), vos->vos_region);
+	fnvlist_add_string(nv,
+	    zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS),
+	    vos->vos_credential_location);
+	fnvlist_add_string(nv,
+	    zpool_prop_to_name(ZPOOL_PROP_OBJ_ENDPOINT), vos->vos_endpoint);
+	fnvlist_add_string(nv,
+	    zpool_prop_to_name(ZPOOL_PROP_OBJ_REGION), vos->vos_region);
 }
 
 static void
