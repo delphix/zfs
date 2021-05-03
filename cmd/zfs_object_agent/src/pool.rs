@@ -810,15 +810,18 @@ impl Pool {
 
                     let begin = Instant::now();
                     let mut count = 0u64;
-                    for pfle in rfc.remaining_frees {
-                        syncing_state.pending_frees_log.append(txg, pfle);
+                    let mut bytes = 0u64;
+                    for ent in rfc.remaining_frees {
                         count += 1;
+                        bytes += ent.size as u64;
+                        syncing_state.pending_frees_log.append(txg, ent);
                     }
 
                     stream
                         .for_each(|ent| {
-                            syncing_state.pending_frees_log.append(txg, ent);
                             count += 1;
+                            bytes += ent.size as u64;
+                            syncing_state.pending_frees_log.append(txg, ent);
                             future::ready(())
                         })
                         .await;
@@ -828,6 +831,7 @@ impl Pool {
                         begin.elapsed().as_millis()
                     );
                     syncing_state.stats.pending_frees_count += count;
+                    syncing_state.stats.pending_frees_bytes += bytes;
                     syncing_state.reclaim_task = None;
 
                     for obj in rfc.deleted_objects {
@@ -1064,8 +1068,6 @@ impl Pool {
                 .or_default()
                 .clone();
 
-            //let state = self.state.clone();
-
             tokio::spawn(async move {
                 let _guard = mtx.lock().await;
                 println!("rewriting {:?} to overwrite {:?}", obj, id);
@@ -1082,28 +1084,6 @@ impl Pool {
                 // ObjectSizeLog, which is not allowed in this (async) context.
                 // XXX this may be problematic if we switch to ashift=0
                 assert_eq!(removed.unwrap().len(), data.len());
-
-                /*
-                obj_phys.blocks_size -= removed.unwrap().len() as u32;
-                obj_phys.blocks_size += data.len() as u32;
-
-                // add to in-memory size
-                state
-                    .object_sizes
-                    .write()
-                    .unwrap()
-                    .insert(obj, obj_phys.blocks_size);
-
-                // log to on-disk size
-                syncing_state.object_size_log.append(
-                    txg,
-                    ObjectSizeLogEntry {
-                        obj,
-                        num_blocks: obj_phys.blocks.len() as u32,
-                        num_bytes: obj_phys.blocks_size,
-                    },
-                );
-                */
 
                 obj_phys.blocks.insert(id, data);
                 obj_phys.put(&shared_state.bucket).await;
@@ -1161,13 +1141,6 @@ impl Pool {
         tokio::spawn(async move {
             println!("reading {:?} for {:?}", obj, id);
             let block = DataObjectPhys::get(&readonly_state.bucket, readonly_state.guid, obj).await;
-            // XXX object_sizes does not reflect compaction for frees :(
-            /*
-            assert_eq!(
-                block.blocks_size,
-                *state.object_sizes.read().unwrap().get(&obj).unwrap()
-            );
-            */
             // XXX consider using debug_assert_eq
             assert_eq!(
                 block.blocks_size as usize,
@@ -1194,7 +1167,6 @@ impl Pool {
             .pending_frees_log
             .append(txg, PendingFreesLogEntry { block, size });
         syncing_state.stats.pending_frees_count += 1;
-        // XXX make caller pass in size of block?
-        //self.stats.pending_frees_bytes += size;
+        syncing_state.stats.pending_frees_bytes += size as u64;
     }
 }

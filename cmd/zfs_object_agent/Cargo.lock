@@ -627,7 +627,6 @@ dependencies = [
  "serde",
  "stream-reduce",
  "tokio",
- "tokio-pipe",
  "tokio-stream",
 ]
 
@@ -1381,16 +1380,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-pipe"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5ffd0cce0950fbb0807ad67e22c3724c6cf3ea6c0a235b740c4a3e54d4a6977"
-dependencies = [
- "libc",
- "tokio",
-]
-
-[[package]]
 name = "tokio-stream"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1642,39 +1631,19 @@ checksum = "b07db065a5cf61a7e4ba64f29e67db906fb1787316516c4e6e5ff0fea1efcd8a"
 name = "zfs_object_agent"
 version = "0.1.0"
 dependencies = [
- "async-stream",
- "bincode",
- "futures",
- "futures-core",
- "lazy_static",
  "libzoa",
- "lru",
- "nvpair",
- "rand",
- "rust-s3",
- "serde",
- "stream-reduce",
  "tokio",
- "tokio-pipe",
- "tokio-stream",
 ]
 
 [[package]]
 name = "zoa_test"
 version = "0.1.0"
 dependencies = [
- "async-stream",
- "bincode",
  "futures",
- "futures-core",
- "lazy_static",
  "libzoa",
- "lru",
  "nvpair",
  "rand",
  "rust-s3",
  "serde",
  "tokio",
- "tokio-pipe",
- "tokio-stream",
 ]
