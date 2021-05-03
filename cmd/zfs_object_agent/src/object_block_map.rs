@@ -10,23 +10,18 @@ pub struct ObjectBlockMap {
 
 #[derive(Debug, Ord, PartialOrd, PartialEq, Eq, Copy, Clone)]
 struct ObjectBlockMapEntry {
-    obj: OBMEObject,
-    block: OBMEBlock,
+    obj: ObjectID,
+    block: BlockID,
 }
 
-#[derive(Debug, Ord, PartialOrd, PartialEq, Eq, Copy, Clone)]
-struct OBMEObject(ObjectID);
-
-impl Borrow<OBMEObject> for ObjectBlockMapEntry {
-    fn borrow(&self) -> &OBMEObject {
+impl Borrow<ObjectID> for ObjectBlockMapEntry {
+    fn borrow(&self) -> &ObjectID {
         &self.obj
     }
 }
-#[derive(Debug, Ord, PartialOrd, PartialEq, Eq, Copy, Clone)]
-struct OBMEBlock(BlockID);
 
-impl Borrow<OBMEBlock> for ObjectBlockMapEntry {
-    fn borrow(&self) -> &OBMEBlock {
+impl Borrow<BlockID> for ObjectBlockMapEntry {
+    fn borrow(&self) -> &BlockID {
         &self.block
     }
 }
@@ -51,45 +46,35 @@ impl ObjectBlockMap {
 
     pub fn insert(&mut self, obj: ObjectID, block: BlockID) {
         // verify that this block is between the existing entries blocks
-        let prev_ent_opt = self
-            .map
-            .range((Unbounded, Excluded(OBMEObject(obj))))
-            .next_back();
+        let prev_ent_opt = self.map.range((Unbounded, Excluded(obj))).next_back();
         if let Some(prev_ent) = prev_ent_opt {
-            assert!(prev_ent.block.0 < block);
+            assert!(prev_ent.block < block);
         }
-        let next_ent_opt = self
-            .map
-            .range((Excluded(OBMEObject(obj)), Unbounded))
-            .next();
+        let next_ent_opt = self.map.range((Excluded(obj), Unbounded)).next();
         if let Some(next_ent) = next_ent_opt {
-            assert!(next_ent.block.0 > block);
+            assert!(next_ent.block > block);
         }
         // verify that this object is not yet in the map
-        assert!(!self.map.contains(&OBMEObject(obj)));
+        assert!(!self.map.contains(&obj));
 
-        self.map.insert(ObjectBlockMapEntry {
-            obj: OBMEObject(obj),
-            block: OBMEBlock(block),
-        });
+        self.map.insert(ObjectBlockMapEntry { obj, block });
     }
 
     pub fn remove(&mut self, obj: ObjectID) {
-        let removed = self.map.remove(&OBMEObject(obj));
+        let removed = self.map.remove(&obj);
         assert!(removed);
     }
 
     pub fn block_to_obj(&self, block: BlockID) -> ObjectID {
         self.map
-            .range((Unbounded, Included(OBMEBlock(block))))
+            .range((Unbounded, Included(block)))
             .next_back()
             .unwrap()
             .obj
-            .0
     }
 
     pub fn obj_to_block(&self, obj: ObjectID) -> BlockID {
-        self.map.get(&OBMEObject(obj)).unwrap().block.0
+        self.map.get(&obj).unwrap().block
     }
 
     pub fn last_obj(&self) -> ObjectID {
@@ -97,11 +82,10 @@ impl ObjectBlockMap {
             .iter()
             .next_back()
             .unwrap_or(&ObjectBlockMapEntry {
-                obj: OBMEObject(ObjectID(0)),
-                block: OBMEBlock(BlockID(0)),
+                obj: ObjectID(0),
+                block: BlockID(0),
             })
             .obj
-            .0
     }
 
     pub fn len(&self) -> usize {

@@ -364,7 +364,8 @@ fn do_nvpair() {
     write_file_as_bytes("./zpool.cache.rust", &newbuf);
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     // assumes that AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment
@@ -377,27 +378,20 @@ fn main() {
     let bucket = Bucket::new(bucket_name, region, credentials).unwrap();
     println!("bucket: {:?}", bucket);
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_name("zoa")
-        .build()
-        .unwrap()
-        .block_on(async move {
-            match &args[1][..] {
-                "s3" => do_s3(&bucket).await.unwrap(),
-                "list" => do_list(&bucket).await.unwrap(),
-                "delete" => do_delete(&bucket).await.unwrap(),
-                "obl" => do_obl(&bucket).await.unwrap(),
-                "create" => do_create().await.unwrap(),
-                "write" => do_write().await.unwrap(),
-                "read" => do_read().await.unwrap(),
-                "free" => do_free().await.unwrap(),
-                "btree" => do_btree(),
-                "nvpair" => do_nvpair(),
+    match &args[1][..] {
+        "s3" => do_s3(&bucket).await.unwrap(),
+        "list" => do_list(&bucket).await.unwrap(),
+        "delete" => do_delete(&bucket).await.unwrap(),
+        "obl" => do_obl(&bucket).await.unwrap(),
+        "create" => do_create().await.unwrap(),
+        "write" => do_write().await.unwrap(),
+        "read" => do_read().await.unwrap(),
+        "free" => do_free().await.unwrap(),
+        "btree" => do_btree(),
+        "nvpair" => do_nvpair(),
 
-                _ => {
-                    println!("invalid argument: {}", args[1]);
-                }
-            }
-        });
+        _ => {
+            println!("invalid argument: {}", args[1]);
+        }
+    }
 }

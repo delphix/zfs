@@ -252,7 +252,6 @@ pub struct PoolState {
     // thread.
     syncing_state: tokio::sync::Mutex<PoolSyncingState>,
 
-    //block_to_obj: std::sync::RwLock<BTreeMap<BlockID, ObjectID>>,
     block_to_obj: std::sync::RwLock<ObjectBlockMap>,
 
     pub readonly_state: Arc<PoolSharedState>,
@@ -312,26 +311,9 @@ struct ReclaimFreesComplete {
     freed_blocks_bytes: u64,
     num_chunks: u64,
     remaining_frees: Vec<PendingFreesLogEntry>,
-    // XXX include deleted objects' firstblockid, so we can properly remove it from the obj mapping
     rewritten_object_sizes: Vec<(ObjectID, u32)>,
     deleted_objects: Vec<ObjectID>,
 }
-
-/*
-impl PoolState {
-    fn block_to_object(&self, block: BlockID) -> ObjectID {
-        // find entry equal or less than this blockID
-        *self
-            .block_to_obj
-            .read()
-            .unwrap()
-            .range((Unbounded, Included(block)))
-            .next_back()
-            .unwrap()
-            .1
-    }
-}
-*/
 
 impl Pool {
     pub async fn create(bucket: &Bucket, name: &str, guid: PoolGUID) {

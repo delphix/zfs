@@ -1653,6 +1653,7 @@ dependencies = [
  "rand",
  "rust-s3",
  "serde",
+ "stream-reduce",
  "tokio",
  "tokio-pipe",
  "tokio-stream",
