@@ -33,6 +33,11 @@ impl Display for ObjectID {
         write!(f, "{}", self.0)
     }
 }
+impl ObjectID {
+    pub fn next(&self) -> ObjectID {
+        ObjectID(self.0 + 1)
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub struct BlockID(pub u64);
@@ -40,5 +45,10 @@ impl OnDisk for BlockID {}
 impl Display for BlockID {
     fn fmt(&self, f: &mut Formatter) -> Result {
         write!(f, "{}", self.0)
+    }
+}
+impl BlockID {
+    pub fn next(&self) -> BlockID {
+        BlockID(self.0 + 1)
     }
 }

@@ -26,7 +26,7 @@ impl Server {
     async fn get_next_request(pipe: &mut OwnedReadHalf) -> tokio::io::Result<NvList> {
         // XXX kernel sends this as host byte order
         let len64 = pipe.read_u64_le().await?;
-        println!("got request len: {}", len64);
+        //println!("got request len: {}", len64);
         if len64 > 20_000_000 {
             // max zfs block size is 16MB
             panic!("got unreasonable request length {} ({:#x})", len64, len64);
@@ -155,7 +155,7 @@ impl Server {
         let len64 = buf.len() as u64;
         let mut w = output.lock().await;
         // XXX kernel expects this as host byte order
-        println!("sending response of {} bytes", len64);
+        //println!("sending response of {} bytes", len64);
         w.write_u64_le(len64).await.unwrap();
         w.write(buf.as_slice()).await.unwrap();
     }

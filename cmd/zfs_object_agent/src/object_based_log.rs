@@ -252,32 +252,37 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
     }
 
     pub fn iterate(&self) -> impl Stream<Item = T> {
-        self.iterate_after(0)
+        self.iterate_after(0).0
     }
 
-    pub fn iterate_after(&self, first_chunk: u64) -> impl Stream<Item = T> {
+    /// Iterates on-disk state, returns (stream, next_chunk), where the
+    /// next_chunk can be passed in to a subsequent call to iterate the later
+    /// entries that were not iterated by this stream
+    pub fn iterate_after(&self, first_chunk: u64) -> (impl Stream<Item = T>, u64) {
         let mut stream = FuturesOrdered::new();
         let generation = self.generation;
         for chunk in first_chunk..self.num_chunks {
             let pool = self.pool.clone();
             let n = self.name.clone();
-            let fut = async move {
+            stream.push(async move {
                 async move { ObjectBasedLogChunk::get(&pool.bucket, &n, generation, chunk).await }
-            };
-            stream.push(fut);
+            });
         }
         // Note: buffered() is needed because rust-s3 creates one connection for
         // each request, rather than using a connection pool. If we created 1000
         // connections we'd run into the open file descriptor limit.
         let mut buffered_stream = stream.buffered(50);
-        stream! {
-            while let Some(fut) = buffered_stream.next().await {
-                let chunk = fut;
-                println!("yielding entries of chunk {}", chunk.chunk);
-                for ent in chunk.entries {
-                    yield ent;
+        (
+            stream! {
+                while let Some(fut) = buffered_stream.next().await {
+                    let chunk = fut;
+                    println!("yielding entries of chunk {}", chunk.chunk);
+                    for ent in chunk.entries {
+                        yield ent;
+                    }
                 }
-            }
-        }
+            },
+            self.num_chunks,
+        )
     }
 }

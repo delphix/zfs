@@ -11,6 +11,9 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
+debug = true
+overflow-checks = true
+incremental = true
 
 [dependencies]
 async-stream = "0.3.0"
