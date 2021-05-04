@@ -242,7 +242,7 @@ struct PoolSyncingState {
     pub syncing_txg: Option<TXG>,
     stats: PoolStatsPhys,
     reclaim_task: Option<oneshot::Receiver<ReclaimFreesComplete>>,
-    reclaim_cb: Option<oneshot::Receiver<SyncTask>>,
+    reclaim_cb: Option<oneshot::Receiver<SyncTaskStruct>>,
     // Protects objects that are being overwritten for sync-to-convergence
     rewriting_objects: HashMap<ObjectID, Arc<tokio::sync::Mutex<()>>>,
 }
@@ -254,7 +254,7 @@ struct SyncTaskStruct {
 }
 impl fmt::Debug for SyncTaskStruct {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        "closure pointer".to_string()
+        f.debug_tuple("closure pointer").finish()
     }
 }
 
@@ -277,9 +277,7 @@ pub struct PoolSharedState {
     pub name: String,
 }
 
-pub struct SyncTask {}
-
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ReclaimFreesComplete {
     freed_blocks_count: u64,
     freed_blocks_bytes: u64,
@@ -340,6 +338,7 @@ impl Pool {
                     pending_flushes: Vec::new(),
                     stats: phys.stats,
                     reclaim_task: None,
+                    reclaim_cb: None,
                     rewriting_objects: HashMap::new(),
                 }),
                 block_to_obj: std::sync::RwLock::new(ObjectBlockMap::new()),
@@ -454,6 +453,7 @@ impl Pool {
                         pending_flushes: Vec::new(),
                         stats: PoolStatsPhys::default(),
                         reclaim_task: None,
+                        reclaim_cb: None,
                         rewriting_objects: HashMap::new(),
                     }),
                     block_to_obj: std::sync::RwLock::new(ObjectBlockMap::new()),
@@ -590,8 +590,11 @@ impl Pool {
             - (syncing_state.stats.blocks_count as f64 * FREE_LOWWATER_PCT / 100f64) as u64;
 
         let (s, r) = oneshot::channel();
-
         syncing_state.reclaim_task = Some(r);
+
+        let (cb_s, cb_r) = oneshot::channel();
+        syncing_state.reclaim_cb = Some(cb_r);
+
         tokio::spawn(async move {
             let shared_state = &state.readonly_state;
 
@@ -763,6 +766,13 @@ impl Pool {
             syncing_state.object_size_log.flush(txg).await;
             syncing_state.pending_frees_log.flush(txg).await;
             syncing_state.rewriting_objects.clear();
+
+            if let Some(rt) = syncing_state.reclaim_cb.as_mut() {
+                if let Ok(sts) = rt.try_recv() {
+                    let cb = sts.cb;
+                    cb(&mut syncing_state);
+                }
+            }
 
             if let Some(rt) = syncing_state.reclaim_task.as_mut() {
                 if let Ok(rfc) = rt.try_recv() {
