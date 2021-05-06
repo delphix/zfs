@@ -1,4 +1,6 @@
+use anyhow::Result;
 use core::time::Duration;
+use futures::Future;
 use lazy_static::lazy_static;
 use lru::LruCache;
 use s3::bucket::Bucket;
@@ -41,36 +43,54 @@ pub fn prefixed(key: &str) -> String {
     format!("{}/{}", prefix, key)
 }
 
-async fn get_object_impl(bucket: &Bucket, key: &str) -> Vec<u8> {
-    let prefixed_key = prefixed(key);
-    println!("getting {}", prefixed_key);
+async fn retry<Fut>(msg: &str, f: impl Fn() -> Fut) -> Vec<u8>
+where
+    Fut: Future<Output = Result<(Vec<u8>, u16)>>,
+{
+    println!("{}: begin", msg);
     let begin = Instant::now();
+    let mut delay = Duration::from_millis(100);
     let data = loop {
-        let (mydata, code) = bucket.get_object(&prefixed_key).await.unwrap();
-        if code == 200 {
-            break mydata;
-        } else if code >= 500 && code < 600 {
-            println!(
-                "{}: get returned http code {}; retrying in 1 second",
-                prefixed_key, code
-            );
-            tokio::time::sleep(Duration::from_millis(1000)).await;
-            continue;
-        } else {
-            panic!(
-                "{}: get returned invalid http code {} while getting",
-                prefixed_key, code
-            );
+        match f().await {
+            Err(e) => {
+                println!("{} returned: {}; retrying in {:?}", msg, e, delay);
+            }
+            Ok((mydata, code)) => {
+                if code == 200 {
+                    break mydata;
+                } else if code >= 500 && code < 600 {
+                    println!(
+                        "{}: returned http code {}; retrying in {:?}",
+                        msg, code, delay
+                    );
+                } else {
+                    panic!(
+                        "{}: returned invalid http code {}; response: {}",
+                        msg,
+                        code,
+                        String::from_utf8(mydata).unwrap_or("<Invalid UTF8>".to_string())
+                    );
+                }
+            }
         }
+        tokio::time::sleep(delay).await;
+        delay *= 2;
     };
-
     println!(
-        "{}: got {} bytes in {}ms",
-        prefixed_key,
+        "{}: {} bytes in {}ms",
+        msg,
         data.len(),
         begin.elapsed().as_millis()
     );
     data
+}
+
+async fn get_object_impl(bucket: &Bucket, key: &str) -> Vec<u8> {
+    let prefixed_key = &prefixed(key);
+    retry(&format!("get {}", prefixed_key), || async {
+        bucket.get_object(prefixed_key).await
+    })
+    .await
 }
 
 pub async fn get_object(bucket: &Bucket, key: &str) -> Arc<Vec<u8>> {
@@ -123,11 +143,8 @@ pub async fn get_object(bucket: &Bucket, key: &str) -> Arc<Vec<u8>> {
 // XXX update to take the actual Vec so that we can cache it?  Although that
 // should be the uncommon case.
 pub async fn put_object(bucket: &Bucket, key: &str, data: &[u8]) {
-    let prefixed_key = prefixed(key);
-    println!("putting {}", prefixed_key);
-
-    // invalidate cache
     {
+        // invalidate cache.  don't hold lock across .await below
         let mut c = CACHE.lock().unwrap();
         let mykey = key.to_string();
         if c.cache.contains(&mykey) {
@@ -136,55 +153,19 @@ pub async fn put_object(bucket: &Bucket, key: &str, data: &[u8]) {
         }
     }
 
-    let begin = Instant::now();
-    loop {
-        let (_, code) = bucket.put_object(&prefixed_key, data).await.unwrap();
-        if code == 200 {
-            break;
-        } else if code >= 500 && code < 600 {
-            println!(
-                "{}: put returned http code {}; retrying in 1 second",
-                prefixed_key, code
-            );
-            tokio::time::sleep(Duration::from_millis(1000)).await;
-            continue;
-        } else {
-            panic!("{}: put returned invalid http code {}", prefixed_key, code);
-        }
-    }
-
-    println!(
-        "{}: put {} bytes in {}ms",
-        prefixed_key,
-        data.len(),
-        begin.elapsed().as_millis()
-    );
+    let prefixed_key = &prefixed(key);
+    retry(&format!("put {}", prefixed_key), || async {
+        bucket.put_object(prefixed_key, data).await
+    })
+    .await;
 }
 
 pub async fn delete_object(bucket: &Bucket, key: &str) {
-    let prefixed_key = prefixed(key);
-    println!("deleting {}", prefixed_key);
-    let begin = Instant::now();
-    loop {
-        let (_, code) = bucket.delete_object(&prefixed_key).await.unwrap();
-        if code == 200 {
-            break;
-        } else if code >= 500 && code < 600 {
-            println!(
-                "{}: put returned http code {}; retrying in 1 second",
-                prefixed_key, code
-            );
-            tokio::time::sleep(Duration::from_millis(1000)).await;
-            continue;
-        } else {
-            panic!("{}: put returned invalid http code {}", prefixed_key, code);
-        }
-    }
-    println!(
-        "{}: deleted in {}ms",
-        prefixed_key,
-        begin.elapsed().as_millis()
-    );
+    let prefixed_key = &prefixed(key);
+    retry(&format!("delete {}", prefixed_key), || async {
+        bucket.delete_object(prefixed_key).await
+    })
+    .await;
 }
 
 pub async fn object_exists(bucket: &Bucket, key: &str) -> bool {

@@ -32,8 +32,9 @@ async fn do_s3(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
 
     let content = "I want to go to S3".as_bytes();
     println!("putting {}", key);
-    let (_, code) = bucket.put_object(key, content).await?;
+    let (data, code) = bucket.put_object(key, content).await?;
     println!("HTTP return code = {}", code);
+    println!("response contents = {}", String::from_utf8(data)?);
 
     let results = bucket.list("mahrens".to_string(), None).await?;
     for list_results in results {
