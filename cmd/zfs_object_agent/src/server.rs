@@ -50,7 +50,7 @@ impl Server {
         tokio::spawn(async move {
             loop {
                 let nvl = match tokio::time::timeout(
-                    Duration::from_millis(1000),
+                    Duration::from_millis(100),
                     Self::get_next_request(&mut server.input),
                 )
                 .await

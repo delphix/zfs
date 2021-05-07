@@ -211,6 +211,7 @@ again:
 	if (req == VOS_MAXREQ) {
 		// put on vqc_queued_tree for vdev_get_stats_ex_impl()
 		avl_add(&vq->vq_class[zio->io_priority].vqc_queued_tree, zio);
+		// XXX we really shouldn't be blocking in vdev_op_io_start
 		cv_wait(&vos->vos_outstanding_cv, &vos->vos_outstanding_lock);
 		avl_remove(&vq->vq_class[zio->io_priority].vqc_queued_tree, zio);
 
