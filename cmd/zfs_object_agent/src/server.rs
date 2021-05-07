@@ -155,7 +155,7 @@ impl Server {
         let len64 = buf.len() as u64;
         let mut w = output.lock().await;
         // XXX kernel expects this as host byte order
-        //println!("sending response of {} bytes", len64);
+        println!("sending response of {} bytes", len64);
         w.write_u64_le(len64).await.unwrap();
         w.write_all(buf.as_slice()).await.unwrap();
     }
@@ -288,8 +288,8 @@ impl Server {
             let mut nvl = NvList::new_unique_names();
             nvl.insert("Type", "read done").unwrap();
             nvl.insert("block", &block.0).unwrap();
-            nvl.insert("data", data.as_slice()).unwrap();
             nvl.insert("request_id", &request_id).unwrap();
+            nvl.insert("data", data.as_slice()).unwrap();
             println!(
                 "sending read done response: block={} req={} data=[{} bytes]",
                 block,
