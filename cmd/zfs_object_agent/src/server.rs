@@ -157,7 +157,7 @@ impl Server {
         // XXX kernel expects this as host byte order
         println!("sending response of {} bytes", len64);
         w.write_u64_le(len64).await.unwrap();
-        w.write(buf.as_slice()).await.unwrap();
+        w.write_all(buf.as_slice()).await.unwrap();
     }
 
     // Construct a custom Region.
