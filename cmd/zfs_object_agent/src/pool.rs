@@ -1006,8 +1006,13 @@ async fn reclaim_frees_object(
                 a.object
             );
             for (k, v) in b.blocks.drain() {
-                let old = a.blocks.insert(k, v);
-                assert!(old.is_none());
+                let k2 = k.clone();
+                let old_opt = a.blocks.insert(k, v);
+                if let Some(old_vec) = old_opt {
+                    // May have already been transferred in a previous job
+                    // during which we crashed before updating the metadata.
+                    assert_eq!(&old_vec, a.blocks.get(&k2).unwrap());
+                }
             }
             a
         })
