@@ -55,7 +55,7 @@ where
                 println!("{} returned: {}; retrying in {:?}", msg, e, delay);
             }
             Ok((mydata, code)) => {
-                if code == 200 {
+                if code >= 200 && code < 300 {
                     break mydata;
                 } else if code >= 500 && code < 600 {
                     println!(
