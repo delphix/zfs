@@ -22,12 +22,7 @@ lazy_static! {
         cache: LruCache::new(100),
         reading: HashMap::new(),
     });
-}
-
-/// For testing, prefix all object keys with this string.
-/// Should be something like "username-vmname"
-pub fn prefixed(key: &str) -> String {
-    let prefix = match env::var("AWS_PREFIX") {
+    static ref PREFIX: String = match env::var("AWS_PREFIX") {
         Ok(val) => val,
         Err(_) => {
             let raw_id = match fs::read_to_string("/etc/machine-id") {
@@ -40,7 +35,11 @@ pub fn prefixed(key: &str) -> String {
             raw_id[..std::cmp::min(10, raw_id.len())].to_string()
         }
     };
-    format!("{}/{}", prefix, key)
+}
+
+/// For testing, prefix all object keys with this string.
+pub fn prefixed(key: &str) -> String {
+    format!("{}/{}", *PREFIX, key)
 }
 
 async fn retry<Fut>(msg: &str, f: impl Fn() -> Fut) -> Vec<u8>
