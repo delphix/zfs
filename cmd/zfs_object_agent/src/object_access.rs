@@ -76,7 +76,7 @@ where
         delay *= 2;
     };
     println!(
-        "{}: {} bytes in {}ms",
+        "{}: returned {} bytes in {}ms",
         msg,
         data.len(),
         begin.elapsed().as_millis()
@@ -153,9 +153,10 @@ pub async fn put_object(bucket: &Bucket, key: &str, data: &[u8]) {
     }
 
     let prefixed_key = &prefixed(key);
-    retry(&format!("put {}", prefixed_key), || async {
-        bucket.put_object(prefixed_key, data).await
-    })
+    retry(
+        &format!("put {} ({} bytes)", prefixed_key, data.len()),
+        || async { bucket.put_object(prefixed_key, data).await },
+    )
     .await;
 }
 
