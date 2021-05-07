@@ -734,7 +734,7 @@ impl Pool {
                 // this blockID must have been written
                 assert!(removed.is_some());
 
-                // Size may not change.  This way we don't have to change the
+                // Size must not change.  This way we don't have to change the
                 // accounting, which would require writing a new entry to the
                 // ObjectSizeLog, which is not allowed in this (async) context.
                 // XXX this may be problematic if we switch to ashift=0
@@ -998,21 +998,33 @@ async fn reclaim_frees_object(
             assert_eq!(a.guid, b.guid);
             a.object = min(a.object, b.object);
             a.txg = min(a.txg, b.txg); // XXX maybe should track min & max txg?
-            a.blocks_size += b.blocks_size;
             println!(
                 "moving {} blocks from {:?} to {:?}",
                 b.blocks.len(),
                 b.object,
                 a.object
             );
+            let mut already_moved = 0;
             for (k, v) in b.blocks.drain() {
                 let k2 = k.clone();
-                let old_opt = a.blocks.insert(k, v);
-                if let Some(old_vec) = old_opt {
-                    // May have already been transferred in a previous job
-                    // during which we crashed before updating the metadata.
-                    assert_eq!(&old_vec, a.blocks.get(&k2).unwrap());
+                let len = v.len() as u32;
+                match a.blocks.insert(k, v) {
+                    Some(old_vec) => {
+                        // May have already been transferred in a previous job
+                        // during which we crashed before updating the metadata.
+                        assert_eq!(&old_vec, a.blocks.get(&k2).unwrap());
+                        already_moved += 1;
+                    }
+                    None => {
+                        a.blocks_size += len;
+                    }
                 }
+            }
+            if already_moved > 0 {
+                println!(
+                    "while moving blocks from {:?} to {:?} found {} blocks already moved",
+                    b.object, a.object, already_moved
+                );
             }
             a
         })
