@@ -193,6 +193,7 @@ static uint64_t
 agent_request_zio(vdev_object_store_t *vos, zio_t *zio, nvlist_t *nv)
 {
 	uint64_t req;
+	vdev_queue_t *vq = &zio->io_vd->vdev_queue;
 
 	/*
 	 * XXX need locking on requests array since this could be
@@ -208,9 +209,17 @@ again:
 	}
 
 	if (req == VOS_MAXREQ) {
+		// put on vqc_queued_tree for vdev_get_stats_ex_impl()
+		avl_add(&vq->vq_class[zio->io_priority].vqc_queued_tree, zio);
 		cv_wait(&vos->vos_outstanding_cv, &vos->vos_outstanding_lock);
+		avl_remove(&vq->vq_class[zio->io_priority].vqc_queued_tree, zio);
+
 		goto again;
 	}
+
+	// for vdev_get_stats_ex_impl()
+	vq->vq_class[zio->io_priority].vqc_active++;
+
 	VERIFY3U(req, <, VOS_MAXREQ);
 	fnvlist_add_uint64(nv, AGENT_REQUEST_ID, req);
 	zio->io_vsd = (void *)(uintptr_t)req;
@@ -231,6 +240,9 @@ agent_complete_zio(vdev_object_store_t *vos, uint64_t req)
 	zio->io_vsd = NULL;
 	vos->vos_outstanding_requests[req] = NULL;
 	cv_signal(&vos->vos_outstanding_cv);
+	vdev_queue_t *vq = &zio->io_vd->vdev_queue;
+	// for vdev_get_stats_ex_impl()
+	vq->vq_class[zio->io_priority].vqc_active--;
 	mutex_exit(&vos->vos_outstanding_lock);
 	return (zio);
 }
