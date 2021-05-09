@@ -25,6 +25,7 @@ pub trait ObjectBasedLogEntry: 'static + OnDisk + Copy + Clone + Unpin + Send + 
 pub struct ObjectBasedLogPhys {
     generation: u64,
     num_chunks: u64,
+    num_entries: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -73,6 +74,7 @@ pub struct ObjectBasedLog<T: ObjectBasedLogEntry> {
     name: String,
     generation: u64,
     num_chunks: u64,
+    num_entries: u64,
     pending_entries: Vec<T>,
     recovered: bool,
     pending_flushes: Vec<JoinHandle<()>>,
@@ -85,6 +87,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
             name: name.to_string(),
             generation: 0,
             num_chunks: 0,
+            num_entries: 0,
             recovered: true,
             pending_entries: Vec::new(),
             pending_flushes: Vec::new(),
@@ -101,6 +104,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
             name: name.to_string(),
             generation: phys.generation,
             num_chunks: phys.num_chunks,
+            num_entries: phys.num_entries,
             recovered: false,
             pending_entries: Vec::new(),
             pending_flushes: Vec::new(),
@@ -150,6 +154,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         ObjectBasedLogPhys {
             generation: self.generation,
             num_chunks: self.num_chunks,
+            num_entries: self.num_entries,
         }
     }
 
@@ -174,6 +179,9 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
             entries: self.pending_entries.split_off(0),
         };
 
+        self.num_chunks += 1;
+        self.num_entries += chunk.entries.len() as u64;
+
         // XXX cloning name, would be nice if we could find a way to
         // reference them from the spawned task (use Arc)
         let pool = self.pool.clone();
@@ -186,7 +194,6 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         self.pending_flushes.push(handle);
 
         assert!(self.pending_entries.is_empty());
-        self.num_chunks += 1;
     }
 
     pub async fn flush(&mut self, txg: TXG) {
@@ -205,21 +212,6 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         self.generation += 1;
         self.num_chunks = 0;
     }
-
-    /*
-    pub async fn read_serial(&self) -> Vec<T> {
-        let mut entries = Vec::new();
-        for chunk in 0..self.num_chunks {
-            let mut chunk =
-                ObjectBasedLogChunk::get(&self.bucket, &self.name, self.generation, chunk).await;
-            let begin = Instant::now();
-            entries.append(&mut chunk.entries);
-            println!("appended entries in {}ms", begin.elapsed().as_millis());
-        }
-        println!("got {} entries total", entries.len());
-        entries
-    }
-    */
 
     pub async fn read(&self) -> Vec<T> {
         let mut stream = FuturesOrdered::new();
@@ -245,10 +237,6 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
 
         println!("got {} entries total", entries.len());
         entries
-    }
-
-    pub fn num_chunks(&self) -> u64 {
-        self.num_chunks
     }
 
     pub fn iterate(&self) -> impl Stream<Item = T> {
