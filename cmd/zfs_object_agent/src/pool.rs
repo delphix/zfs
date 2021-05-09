@@ -1130,20 +1130,17 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
         let mut rewritten_object_sizes: Vec<(ObjectID, u32)> = Vec::new();
         let mut deleted_objects: Vec<ObjectID> = Vec::new();
         let mut writing: HashSet<ObjectID> = HashSet::new();
-        for (_, obj) in objs_by_frees.iter() {
-            if !frees_per_obj.contains_key(obj) {
+        for (_, obj) in objs_by_frees {
+            if !frees_per_obj.contains_key(&obj) {
                 // this object is being removed by a multi-object consolidation
                 continue;
             }
             // XXX limit amount of outstanding get/put requests?
             let mut objs_to_consolidate: Vec<(ObjectID, Vec<PendingFreesLogEntry>)> = Vec::new();
             let mut new_size: u32 = 0;
+            assert!(object_sizes.contains_key(&obj));
+            let mut first = true;
             for (later_obj, later_size) in object_sizes.range((Included(obj), Unbounded)) {
-                // If we run into an object that we're already writing, we
-                // can't consolidate with it.
-                if writing.contains(later_obj) {
-                    break;
-                }
                 let later_bytes_freed: u32 = frees_per_obj
                     .get(later_obj)
                     .unwrap_or(&Vec::new())
@@ -1151,9 +1148,19 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
                     .map(|e| e.size)
                     .sum();
                 let later_new_size = later_size - later_bytes_freed;
-
-                if new_size > 0 && new_size + later_new_size > MAX_BYTES_PER_OBJECT {
-                    break;
+                if first {
+                    assert_eq!(obj, *later_obj);
+                    assert!(!writing.contains(later_obj));
+                    first = false;
+                } else {
+                    // If we run into an object that we're already writing, we
+                    // can't consolidate with it.
+                    if writing.contains(later_obj) {
+                        break;
+                    }
+                    if new_size + later_new_size > MAX_BYTES_PER_OBJECT {
+                        break;
+                    }
                 }
                 new_size += later_new_size;
                 let frees = frees_per_obj.remove(later_obj).unwrap_or_default();
@@ -1164,14 +1171,14 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
             // XXX look for earlier objects too?
 
             // Must include at least the target object
-            assert_eq!(objs_to_consolidate[0].0, *obj);
+            assert_eq!(objs_to_consolidate[0].0, obj);
 
-            writing.insert(*obj);
+            writing.insert(obj);
 
             // all but the first object need to be deleted by syncing context
-            for (obj, _) in objs_to_consolidate.iter().skip(1) {
+            for (later_obj, _) in objs_to_consolidate.iter().skip(1) {
                 //complete.rewritten_object_sizes.push((*obj, 0));
-                deleted_objects.push(*obj);
+                deleted_objects.push(*later_obj);
             }
             // Note: we could calculate the new object's size here as well,
             // but that would be based on the object_sizes map/log, which
@@ -1195,6 +1202,11 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
             // XXX could simply give the whole frees_per_obj and have syncing context iterate
             remaining_frees.append(&mut frees);
         }
+
+        // release memory before waiting for i/o
+        drop(frees_per_obj);
+        drop(object_sizes);
+        drop(writing);
 
         let num_handles = join_handles.len();
         for jh in join_handles {
