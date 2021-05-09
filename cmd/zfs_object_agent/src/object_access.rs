@@ -3,6 +3,7 @@ use core::time::Duration;
 use futures::Future;
 use lazy_static::lazy_static;
 use lru::LruCache;
+use rand::prelude::*;
 use s3::bucket::Bucket;
 use std::collections::HashMap;
 use std::env;
@@ -38,7 +39,7 @@ where
 {
     println!("{}: begin", msg);
     let begin = Instant::now();
-    let mut delay = Duration::from_millis(100);
+    let delay = Duration::from_secs_f64(thread_rng().gen_range(0.001..0.2));
     let data = loop {
         match f().await {
             Err(e) => {
@@ -63,7 +64,7 @@ where
             }
         }
         tokio::time::sleep(delay).await;
-        delay *= 2;
+        delay.mul_f64(thread_rng().gen_range(1.5..2.5));
     };
     println!(
         "{}: returned {} bytes in {}ms",
