@@ -1130,6 +1130,7 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
         let mut rewritten_object_sizes: Vec<(ObjectID, u32)> = Vec::new();
         let mut deleted_objects: Vec<ObjectID> = Vec::new();
         let mut writing: HashSet<ObjectID> = HashSet::new();
+        let outstanding = Arc::new(tokio::sync::Semaphore::new(30));
         for (_, obj) in objs_by_frees {
             if !frees_per_obj.contains_key(&obj) {
                 // this object is being removed by a multi-object consolidation
@@ -1189,10 +1190,15 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
             // XXX would be nice to know if we are freeing the entire object
             // in which case we wouldn't need to read it.  Would have to
             // keep a count of blocks per object in RAM?
-            join_handles.push(tokio::spawn(reclaim_frees_object(
-                shared_state.clone(),
-                objs_to_consolidate,
-            )));
+            let sem2 = outstanding.clone();
+            let ss2 = shared_state.clone();
+            join_handles.push(tokio::spawn(async move {
+                // limits the amount of outstanding get/put requests (roughly).
+                // XXX would be nice to do this based on number of objs to consolidate
+                let p = sem2.acquire().await;
+                assert!(p.is_ok());
+                reclaim_frees_object(ss2, objs_to_consolidate).await
+            }));
             if freed_blocks_count > required_frees {
                 break;
             }
