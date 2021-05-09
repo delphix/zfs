@@ -400,6 +400,7 @@ impl Pool {
         );
 
         // load free map just to verify
+        /*
         let begin = Instant::now();
         let mut frees: HashSet<BlockID> = HashSet::new();
         syncing_state
@@ -419,6 +420,7 @@ impl Pool {
             frees.len(),
             begin.elapsed().as_millis()
         );
+        */
         //println!("{:#?}", frees);
         let next_block = Self::next_block_locked(&syncing_state);
         drop(syncing_state);
