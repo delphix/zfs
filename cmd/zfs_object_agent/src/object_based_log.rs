@@ -162,8 +162,8 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         assert!(self.recovered);
         // XXX assert that txg is the same as the txg for the other pending entries?
         self.pending_entries.push(value);
-        // XXX should be based on chunk size (bytes)
-        if self.pending_entries.len() > 1000 {
+        // XXX should be based on chunk size (bytes)?  Or maybe should just be unlimited.
+        if self.pending_entries.len() > 100_000 {
             self.initiate_flush(txg);
         }
     }
