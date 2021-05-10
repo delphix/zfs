@@ -1,13 +1,11 @@
-use crate::base_types::*;
-use crate::object_access;
 use crate::object_based_log::*;
 use crate::object_block_map::ObjectBlockMap;
+use crate::{base_types::*, object_access::ObjectAccess};
 use core::future::Future;
 use futures::future;
 use futures::future::*;
 use futures::stream::*;
 use nvpair::NvList;
-use s3::bucket::Bucket;
 use serde::{Deserialize, Serialize};
 use std::cmp::min;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -120,18 +118,18 @@ impl PoolPhys {
         format!("zfs/{}/super", guid)
     }
 
-    async fn get(bucket: &Bucket, guid: PoolGUID) -> Self {
-        let buf = object_access::get_object(bucket, &Self::key(guid)).await;
+    async fn get(object_access: &ObjectAccess, guid: PoolGUID) -> Self {
+        let buf = object_access.get_object(&Self::key(guid)).await;
         let this: Self = bincode::deserialize(&buf).unwrap();
         println!("got {:#?}", this);
         assert_eq!(this.guid, guid);
         this
     }
 
-    async fn put(&self, bucket: &Bucket) {
+    async fn put(&self, object_access: &ObjectAccess) {
         println!("putting {:#?}", self);
         let buf = &bincode::serialize(&self).unwrap();
-        object_access::put_object(bucket, &Self::key(self.guid), buf).await;
+        object_access.put_object(&Self::key(self.guid), buf).await;
     }
 }
 
@@ -148,8 +146,8 @@ impl UberblockPhys {
         &self.zfs_config
     }
 
-    async fn get(bucket: &Bucket, guid: PoolGUID, txg: TXG) -> Self {
-        let buf = object_access::get_object(bucket, &Self::key(guid, txg)).await;
+    async fn get(object_access: &ObjectAccess, guid: PoolGUID, txg: TXG) -> Self {
+        let buf = object_access.get_object(&Self::key(guid, txg)).await;
         let this: Self = bincode::deserialize(&buf).unwrap();
         println!("got {:#?}", this);
         assert_eq!(this.guid, guid);
@@ -157,10 +155,12 @@ impl UberblockPhys {
         this
     }
 
-    async fn put(&self, bucket: &Bucket) {
+    async fn put(&self, object_access: &ObjectAccess) {
         println!("putting {:#?}", self);
         let buf = &bincode::serialize(&self).unwrap();
-        object_access::put_object(bucket, &Self::key(self.guid, self.txg), buf).await;
+        object_access
+            .put_object(&Self::key(self.guid, self.txg), buf)
+            .await;
     }
 }
 
@@ -169,8 +169,8 @@ impl DataObjectPhys {
         format!("zfs/{}/data/{}", guid, obj)
     }
 
-    async fn get(bucket: &Bucket, guid: PoolGUID, obj: ObjectID) -> Self {
-        let buf = object_access::get_object(bucket, &Self::key(guid, obj)).await;
+    async fn get(object_access: &ObjectAccess, guid: PoolGUID, obj: ObjectID) -> Self {
+        let buf = object_access.get_object(&Self::key(guid, obj)).await;
         let begin = Instant::now();
         let this: Self = bincode::deserialize(&buf).unwrap();
         assert_eq!(this.guid, guid);
@@ -185,7 +185,7 @@ impl DataObjectPhys {
         this
     }
 
-    async fn put(&self, bucket: &Bucket) {
+    async fn put(&self, object_access: &ObjectAccess) {
         let begin = Instant::now();
         let contents = bincode::serialize(&self).unwrap();
         println!(
@@ -195,7 +195,9 @@ impl DataObjectPhys {
             contents.len(),
             begin.elapsed().as_millis()
         );
-        object_access::put_object(bucket, &Self::key(self.guid, self.object), &contents).await;
+        object_access
+            .put_object(&Self::key(self.guid, self.object), &contents)
+            .await;
     }
 }
 
@@ -274,7 +276,7 @@ struct PendingObject {
  */
 #[derive(Debug, Clone)]
 pub struct PoolSharedState {
-    pub bucket: Bucket,
+    pub object_access: ObjectAccess,
     pub guid: PoolGUID,
     pub name: String,
 }
@@ -296,25 +298,25 @@ impl Pool {
         NvList::try_unpack(&ubphys.zfs_config).unwrap()
     }
 
-    pub async fn create(bucket: &Bucket, name: &str, guid: PoolGUID) {
+    pub async fn create(object_access: &ObjectAccess, name: &str, guid: PoolGUID) {
         let phys = PoolPhys {
             guid,
             name: name.to_string(),
             last_txg: TXG(0),
         };
         // XXX make sure it doesn't already exist
-        phys.put(bucket).await;
+        phys.put(object_access).await;
     }
 
     async fn open_from_txg(
-        bucket: &Bucket,
+        object_access: &ObjectAccess,
         pool_phys: &PoolPhys,
         txg: TXG,
     ) -> (Pool, Option<UberblockPhys>, BlockID) {
-        let phys = UberblockPhys::get(bucket, pool_phys.guid, txg).await;
+        let phys = UberblockPhys::get(object_access, pool_phys.guid, txg).await;
 
         let readonly_state = Arc::new(PoolSharedState {
-            bucket: bucket.clone(),
+            object_access: object_access.clone(),
             guid: pool_phys.guid,
             name: pool_phys.name.clone(),
         });
@@ -430,11 +432,14 @@ impl Pool {
         (pool, Some(phys), next_block)
     }
 
-    pub async fn open(bucket: &Bucket, guid: PoolGUID) -> (Pool, Option<UberblockPhys>, BlockID) {
-        let phys = PoolPhys::get(bucket, guid).await;
+    pub async fn open(
+        object_access: &ObjectAccess,
+        guid: PoolGUID,
+    ) -> (Pool, Option<UberblockPhys>, BlockID) {
+        let phys = PoolPhys::get(object_access, guid).await;
         if phys.last_txg.0 == 0 {
             let readonly_state = Arc::new(PoolSharedState {
-                bucket: bucket.clone(),
+                object_access: object_access.clone(),
                 guid,
                 name: phys.name,
             });
@@ -473,7 +478,7 @@ impl Pool {
             drop(syncing_state);
             (pool, None, next_block)
         } else {
-            Pool::open_from_txg(bucket, &phys, phys.last_txg).await
+            Pool::open_from_txg(object_access, &phys, phys.last_txg).await
         }
     }
 
@@ -543,7 +548,7 @@ impl Pool {
                 stats: syncing_state.stats.clone(),
                 zfs_config: config,
             };
-            u.put(&state.readonly_state.bucket).await;
+            u.put(&state.readonly_state.object_access).await;
 
             // write super
             let s = PoolPhys {
@@ -551,7 +556,7 @@ impl Pool {
                 name: state.readonly_state.name.clone(),
                 last_txg: txg,
             };
-            s.put(&state.readonly_state.bucket).await;
+            s.put(&state.readonly_state.object_access).await;
 
             // Now that the metadata state has been atomically moved forward, we
             // can delete objects that are no longer needed
@@ -560,7 +565,7 @@ impl Pool {
                 // Note: we don't care about waiting for the frees to complete.
                 tokio::spawn(async move {
                     let key = DataObjectPhys::key(state.readonly_state.guid, obj);
-                    object_access::delete_object(&state.readonly_state.bucket, &key).await;
+                    state.readonly_state.object_access.delete_object(&key).await;
                 });
             }
 
@@ -715,7 +720,7 @@ impl Pool {
         // write to object store
         let readonly_state = self.state.readonly_state.clone();
         syncing_state.pending_flushes.push(tokio::spawn(async move {
-            po.phys.put(&readonly_state.bucket).await;
+            po.phys.put(&readonly_state.object_access).await;
             po.done.close();
         }));
     }
@@ -761,7 +766,7 @@ impl Pool {
                 let _guard = mtx.lock().await;
                 println!("rewriting {:?} to overwrite {:?}", obj, id);
                 let mut obj_phys =
-                    DataObjectPhys::get(&shared_state.bucket, shared_state.guid, obj).await;
+                    DataObjectPhys::get(&shared_state.object_access, shared_state.guid, obj).await;
                 // must have been written this txg
                 assert_eq!(obj_phys.txg, txg);
                 let removed = obj_phys.blocks.remove(&id);
@@ -775,7 +780,7 @@ impl Pool {
                 assert_eq!(removed.unwrap().len(), data.len());
 
                 obj_phys.blocks.insert(id, data);
-                obj_phys.put(&shared_state.bucket).await;
+                obj_phys.put(&shared_state.object_access).await;
                 sem2.close();
             });
             return (sem, false);
@@ -829,7 +834,8 @@ impl Pool {
 
         tokio::spawn(async move {
             println!("reading {:?} for {:?}", obj, id);
-            let block = DataObjectPhys::get(&readonly_state.bucket, readonly_state.guid, obj).await;
+            let block =
+                DataObjectPhys::get(&readonly_state.object_access, readonly_state.guid, obj).await;
             // XXX consider using debug_assert_eq
             assert_eq!(
                 block.blocks_size as usize,
@@ -1013,7 +1019,8 @@ async fn reclaim_frees_object(
         stream.push(async move {
             async move {
                 let mut obj_phys =
-                    DataObjectPhys::get(&my_shared_state.bucket, my_shared_state.guid, obj).await;
+                    DataObjectPhys::get(&my_shared_state.object_access, my_shared_state.guid, obj)
+                        .await;
                 for pfle in frees {
                     let removed = obj_phys.blocks.remove(&pfle.block);
                     // If we crashed in the middle of this operation last time, the
@@ -1072,7 +1079,7 @@ async fn reclaim_frees_object(
         .unwrap();
 
     assert_eq!(new_obj.object, first_obj);
-    new_obj.put(&shared_state.bucket).await;
+    new_obj.put(&shared_state.object_access).await;
 
     (new_obj.object, new_obj.blocks_size)
 }

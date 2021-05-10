@@ -1,9 +1,7 @@
 use crate::base_types::*;
+use crate::object_access::ObjectAccess;
 use crate::{object_access, pool::*};
 use nvpair::{NvData, NvEncoding, NvList};
-use s3::bucket::Bucket;
-use s3::creds::Credentials;
-use s3::Region;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -111,16 +109,16 @@ impl Server {
                         println!("got request: {:?}", nvl);
                         let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
                         let name = nvl.lookup_string("name").unwrap();
-                        let bucket = Self::get_bucket(nvl.as_ref());
+                        let object_access = Self::get_object_access(nvl.as_ref());
                         server
-                            .create_pool(&bucket, guid, name.to_str().unwrap())
+                            .create_pool(&object_access, guid, name.to_str().unwrap())
                             .await;
                     }
                     "open pool" => {
                         println!("got request: {:?}", nvl);
                         let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
-                        let bucket = Self::get_bucket(nvl.as_ref());
-                        server.open_pool(&bucket, guid).await;
+                        let object_access = Self::get_object_access(nvl.as_ref());
+                        server.open_pool(&object_access, guid).await;
                     }
                     "begin txg" => {
                         println!("got request: {:?}", nvl);
@@ -194,47 +192,18 @@ impl Server {
         w.write_all(buf.as_slice()).await.unwrap();
     }
 
-    // Construct a custom Region.
-    fn get_region(region_str: &str, endpoint: &str) -> Region {
-        let region = Region::Custom {
-            region: region_str.to_owned(),
-            endpoint: endpoint.to_owned(),
-        };
-
-        region
-    }
-
-    fn get_credentials(nvl: &nvpair::NvListRef) -> Credentials {
-        // credentials should be <access-key-id>:<secret-access-key>
-        let credential_str = nvl.lookup_string("credentials").unwrap();
-        let mut iter = credential_str.to_str().unwrap().split(":");
-        let access_key_id = iter.next().unwrap().trim();
-        let secret_access_key = iter.next().unwrap().trim();
-
-        let credentials = Credentials::new(
-            Some(access_key_id),
-            Some(secret_access_key),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-
-        credentials
-    }
-
-    fn get_bucket(nvl: &nvpair::NvListRef) -> s3::bucket::Bucket {
+    fn get_object_access(nvl: &nvpair::NvListRef) -> ObjectAccess {
         let bucket_name = nvl.lookup_string("bucket").unwrap();
         let region_str = nvl.lookup_string("region").unwrap();
         let endpoint = nvl.lookup_string("endpoint").unwrap();
-        let region: Region =
-            Self::get_region(region_str.to_str().unwrap(), endpoint.to_str().unwrap());
-        println!("region: {:?}", region);
-        println!("Endpoint: {}", region.endpoint());
+        let credential_str = nvl.lookup_string("credentials").unwrap();
 
-        let credentials = Self::get_credentials(nvl);
-
-        Bucket::new(bucket_name.to_str().unwrap(), region, credentials).unwrap()
+        ObjectAccess::new(
+            endpoint.to_str().unwrap(),
+            region_str.to_str().unwrap(),
+            bucket_name.to_str().unwrap(),
+            credential_str.to_str().unwrap(),
+        )
     }
 
     async fn get_pools(&mut self, bucket: &Bucket) {
@@ -259,8 +228,8 @@ impl Server {
         Self::send_response(&self.output, nvl).await;
     }
 
-    async fn create_pool(&mut self, bucket: &Bucket, guid: PoolGUID, name: &str) {
-        Pool::create(bucket, name, guid).await;
+    async fn create_pool(&mut self, object_access: &ObjectAccess, guid: PoolGUID, name: &str) {
+        Pool::create(object_access, name, guid).await;
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "pool create done").unwrap();
         nvl.insert("GUID", &guid.0).unwrap();
@@ -269,8 +238,8 @@ impl Server {
     }
 
     /// initiate pool opening.  Responds when pool is open
-    async fn open_pool(&mut self, bucket: &Bucket, guid: PoolGUID) {
-        let (pool, phys_opt, next_block) = Pool::open(bucket, guid).await;
+    async fn open_pool(&mut self, object_access: &ObjectAccess, guid: PoolGUID) {
+        let (pool, phys_opt, next_block) = Pool::open(object_access, guid).await;
         self.pool = Some(pool);
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "pool open done").unwrap();

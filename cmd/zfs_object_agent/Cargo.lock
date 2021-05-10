@@ -676,6 +676,8 @@ dependencies = [
  "lru",
  "nvpair",
  "rand",
+ "rusoto_core",
+ "rusoto_s3",
  "rust-s3",
  "serde",
  "stream-reduce",

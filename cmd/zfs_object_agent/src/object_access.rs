@@ -28,6 +28,11 @@ lazy_static! {
     };
 }
 
+#[derive(Debug, Clone)]
+pub struct ObjectAccess {
+    bucket: Bucket,
+}
+
 /// For testing, prefix all object keys with this string.
 pub fn prefixed(key: &str) -> String {
     format!("{}{}", *PREFIX, key)
@@ -75,60 +80,86 @@ where
     data
 }
 
-async fn get_object_impl(bucket: &Bucket, key: &str) -> Vec<u8> {
-    let prefixed_key = &prefixed(key);
-    retry(&format!("get {}", prefixed_key), || async {
-        bucket.get_object(prefixed_key).await
-    })
-    .await
-}
+impl ObjectAccess {
+    pub fn new(endpoint: &str, region: &str, bucket: &str, creds: &str) -> Self {
+        let region = s3::Region::Custom {
+            region: region.to_owned(),
+            endpoint: endpoint.to_owned(),
+        };
+        println!("region: {:?}", region);
+        println!("Endpoint: {}", region.endpoint());
 
-pub async fn get_object(bucket: &Bucket, key: &str) -> Arc<Vec<u8>> {
-    // XXX restructure so that this block "returns" an async func that does the
-    // 2nd half?
-    loop {
-        let mysem;
-        let reader;
-        // need this block separate so that we can drop the mutex before the .await
-        // note: the compiler doesn't realize that drop(c) actually drops it
-        {
-            let mut c = CACHE.lock().unwrap();
-            let mykey = key.to_string();
-            match c.cache.get(&mykey) {
-                Some(v) => {
-                    println!("found {} in cache", key);
-                    return v.clone();
-                }
-                None => match c.reading.get(key) {
-                    None => {
-                        mysem = Arc::new(Semaphore::new(0));
-                        c.reading.insert(mykey, mysem.clone());
-                        reader = true;
-                    }
-                    Some(sem) => {
-                        println!("found {} read in progress", key);
-                        mysem = sem.clone();
-                        reader = false;
-                    }
-                },
-            }
-        }
-        if reader {
-            let v = Arc::new(get_object_impl(bucket, key).await);
-            let mut c = CACHE.lock().unwrap();
-            mysem.close();
-            c.cache.put(key.to_string(), v.clone());
-            c.reading.remove(key);
-            return v;
-        } else {
-            let res = mysem.acquire().await;
-            assert!(res.is_err());
-            // XXX restructure so that new value is sent via tokio::sync::watch,
-            // so we don't have to look up in the cache again?  although this
-            // case is uncommon
+        let mut iter = creds.split(":");
+        let access_key_id = iter.next().unwrap().trim();
+        let secret_access_key = iter.next().unwrap().trim();
+        let credentials = s3::creds::Credentials::new(
+            Some(access_key_id),
+            Some(secret_access_key),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        ObjectAccess {
+            bucket: Bucket::new(bucket, region, credentials).unwrap(),
         }
     }
-}
+
+    async fn get_object_impl(&self, key: &str) -> Vec<u8> {
+        let prefixed_key = &prefixed(key);
+        retry(&format!("get {}", prefixed_key), || async {
+            self.bucket.get_object(prefixed_key).await
+        })
+        .await
+    }
+
+    pub async fn get_object(&self, key: &str) -> Arc<Vec<u8>> {
+        // XXX restructure so that this block "returns" an async func that does the
+        // 2nd half?
+        loop {
+            let mysem;
+            let reader;
+            // need this block separate so that we can drop the mutex before the .await
+            // note: the compiler doesn't realize that drop(c) actually drops it
+            {
+                let mut c = CACHE.lock().unwrap();
+                let mykey = key.to_string();
+                match c.cache.get(&mykey) {
+                    Some(v) => {
+                        println!("found {} in cache", key);
+                        return v.clone();
+                    }
+                    None => match c.reading.get(key) {
+                        None => {
+                            mysem = Arc::new(Semaphore::new(0));
+                            c.reading.insert(mykey, mysem.clone());
+                            reader = true;
+                        }
+                        Some(sem) => {
+                            println!("found {} read in progress", key);
+                            mysem = sem.clone();
+                            reader = false;
+                        }
+                    },
+                }
+            }
+            if reader {
+                let v = Arc::new(self.get_object_impl(key).await);
+                let mut c = CACHE.lock().unwrap();
+                mysem.close();
+                c.cache.put(key.to_string(), v.clone());
+                c.reading.remove(key);
+                return v;
+            } else {
+                let res = mysem.acquire().await;
+                assert!(res.is_err());
+                // XXX restructure so that new value is sent via tokio::sync::watch,
+                // so we don't have to look up in the cache again?  although this
+                // case is uncommon
+            }
+        }
+    }
 
 pub async fn list_objects(
     bucket: &Bucket,
@@ -139,39 +170,39 @@ pub async fn list_objects(
     bucket.list(full_prefix, delimiter).await.unwrap()
 }
 
-// XXX update to take the actual Vec so that we can cache it?  Although that
-// should be the uncommon case.
-pub async fn put_object(bucket: &Bucket, key: &str, data: &[u8]) {
-    {
-        // invalidate cache.  don't hold lock across .await below
-        let mut c = CACHE.lock().unwrap();
-        let mykey = key.to_string();
-        if c.cache.contains(&mykey) {
-            println!("found {} in cache when putting - invalidating", key);
-            c.cache.put(mykey, Arc::new(data.to_vec()));
+    // XXX update to take the actual Vec so that we can cache it?  Although that
+    // should be the uncommon case.
+    pub async fn put_object(&self, key: &str, data: &[u8]) {
+        {
+            // invalidate cache.  don't hold lock across .await below
+            let mut c = CACHE.lock().unwrap();
+            let mykey = key.to_string();
+            if c.cache.contains(&mykey) {
+                println!("found {} in cache when putting - invalidating", key);
+                c.cache.put(mykey, Arc::new(data.to_vec()));
+            }
         }
+
+        let prefixed_key = &prefixed(key);
+        retry(
+            &format!("put {} ({} bytes)", prefixed_key, data.len()),
+            || async { self.bucket.put_object(prefixed_key, data).await },
+        )
+        .await;
     }
 
-    let prefixed_key = &prefixed(key);
-    retry(
-        &format!("put {} ({} bytes)", prefixed_key, data.len()),
-        || async { bucket.put_object(prefixed_key, data).await },
-    )
-    .await;
-}
+    pub async fn delete_object(&self, key: &str) {
+        let prefixed_key = &prefixed(key);
+        retry(&format!("delete {}", prefixed_key), || async {
+            self.bucket.delete_object(prefixed_key).await
+        })
+        .await;
+    }
 
-pub async fn delete_object(bucket: &Bucket, key: &str) {
-    let prefixed_key = &prefixed(key);
-    retry(&format!("delete {}", prefixed_key), || async {
-        bucket.delete_object(prefixed_key).await
-    })
-    .await;
-}
-
-pub async fn object_exists(bucket: &Bucket, key: &str) -> bool {
-    let prefixed_key = prefixed(key);
-    println!("looking for {}", prefixed_key);
-    let begin = Instant::now();
+    pub async fn object_exists(&self, key: &str) -> bool {
+        let prefixed_key = prefixed(key);
+        println!("looking for {}", prefixed_key);
+        let begin = Instant::now();
     match bucket.list(prefixed_key, None).await {
         Ok(results) => {
             assert!(results.len() == 1);

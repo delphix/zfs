@@ -1,12 +1,10 @@
-use crate::base_types::*;
-use crate::object_access;
 use crate::pool::PoolSharedState;
+use crate::{base_types::*, object_access::ObjectAccess};
 use async_stream::stream;
 use futures::future;
 use futures::future::join_all;
 use futures::stream::{FuturesOrdered, StreamExt};
 use futures_core::Stream;
-use s3::bucket::Bucket;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -44,8 +42,10 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLogChunk<T> {
         format!("{}/{}/{}", name, generation, chunk)
     }
 
-    async fn get(bucket: &Bucket, name: &str, generation: u64, chunk: u64) -> Self {
-        let buf = object_access::get_object(bucket, &Self::key(name, generation, chunk)).await;
+    async fn get(object_access: &ObjectAccess, name: &str, generation: u64, chunk: u64) -> Self {
+        let buf = object_access
+            .get_object(&Self::key(name, generation, chunk))
+            .await;
         let begin = Instant::now();
         let this: Self = bincode::deserialize(&buf).unwrap();
         println!(
@@ -56,7 +56,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLogChunk<T> {
         this
     }
 
-    async fn put(&self, bucket: &Bucket, name: &str, generation: u64, chunk: u64) {
+    async fn put(&self, object_access: &ObjectAccess, name: &str, generation: u64, chunk: u64) {
         let begin = Instant::now();
         let buf = &bincode::serialize(&self).unwrap();
         println!(
@@ -64,7 +64,9 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLogChunk<T> {
             self.entries.len(),
             begin.elapsed().as_millis()
         );
-        object_access::put_object(bucket, &Self::key(name, generation, chunk), buf).await;
+        object_access
+            .put_object(&Self::key(name, generation, chunk), buf)
+            .await;
     }
 }
 
@@ -128,8 +130,8 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         // Delete any chunks past the logical end of the log
         for c in self.num_chunks.. {
             let key = &format!("{}/{}/{}", self.name, self.generation, c);
-            if object_access::object_exists(&self.pool.bucket, &key).await {
-                object_access::delete_object(&self.pool.bucket, &key).await;
+            if self.pool.object_access.object_exists(&key).await {
+                self.pool.object_access.delete_object(&key).await;
             } else {
                 break;
             }
@@ -138,8 +140,8 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         // Delete the partially-complete generation (if present)
         for c in 0.. {
             let key = &format!("{}/{}/{}", self.name, self.generation + 1, c);
-            if object_access::object_exists(&self.pool.bucket, key).await {
-                object_access::delete_object(&self.pool.bucket, key).await;
+            if self.pool.object_access.object_exists(key).await {
+                self.pool.object_access.delete_object(key).await;
             } else {
                 break;
             }
@@ -189,7 +191,9 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         let generation = self.generation;
         let num_chunks = self.num_chunks;
         let handle = tokio::spawn(async move {
-            chunk.put(&pool.bucket, &name, generation, num_chunks).await;
+            chunk
+                .put(&pool.object_access, &name, generation, num_chunks)
+                .await;
         });
         self.pending_flushes.push(handle);
 
@@ -216,8 +220,12 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
     pub async fn read(&self) -> Vec<T> {
         let mut stream = FuturesOrdered::new();
         for chunk in 0..self.num_chunks {
-            let fut =
-                ObjectBasedLogChunk::get(&self.pool.bucket, &self.name, self.generation, chunk);
+            let fut = ObjectBasedLogChunk::get(
+                &self.pool.object_access,
+                &self.name,
+                self.generation,
+                chunk,
+            );
             stream.push(fut);
         }
         let mut entries = Vec::new();
@@ -253,7 +261,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
             let pool = self.pool.clone();
             let n = self.name.clone();
             stream.push(async move {
-                async move { ObjectBasedLogChunk::get(&pool.bucket, &n, generation, chunk).await }
+                async move { ObjectBasedLogChunk::get(&pool.object_access, &n, generation, chunk).await }
             });
         }
         // Note: buffered() is needed because rust-s3 creates one connection for
