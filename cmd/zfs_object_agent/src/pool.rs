@@ -1011,26 +1011,29 @@ async fn reclaim_frees_object(
 
         let my_shared_state = shared_state.clone();
         stream.push(async move {
-            let mut obj_phys =
-                DataObjectPhys::get(&my_shared_state.bucket, my_shared_state.guid, obj).await;
-            for pfle in frees {
-                let removed = obj_phys.blocks.remove(&pfle.block);
-                // If we crashed in the middle of this operation last time, the
-                // block may already have been removed (and the object
-                // rewritten), however the stats were not yet updated (since
-                // that happens as part of txg_end, atomically with the updates
-                // to the PendingFreesLog).  In this case we ignore the fact
-                // that it isn't present, but count this block as removed for
-                // stats purposes.
-                if let Some(v) = removed {
-                    assert_eq!(v.len() as u32, pfle.size);
-                    obj_phys.blocks_size -= v.len() as u32;
+            async move {
+                let mut obj_phys =
+                    DataObjectPhys::get(&my_shared_state.bucket, my_shared_state.guid, obj).await;
+                for pfle in frees {
+                    let removed = obj_phys.blocks.remove(&pfle.block);
+                    // If we crashed in the middle of this operation last time, the
+                    // block may already have been removed (and the object
+                    // rewritten), however the stats were not yet updated (since
+                    // that happens as part of txg_end, atomically with the updates
+                    // to the PendingFreesLog).  In this case we ignore the fact
+                    // that it isn't present, but count this block as removed for
+                    // stats purposes.
+                    if let Some(v) = removed {
+                        assert_eq!(v.len() as u32, pfle.size);
+                        obj_phys.blocks_size -= v.len() as u32;
+                    }
                 }
+                obj_phys
             }
-            obj_phys
         });
     }
     let new_obj = stream
+        .buffered(10)
         .reduce(|mut a, mut b| async move {
             assert_eq!(a.guid, b.guid);
             a.object = min(a.object, b.object);
