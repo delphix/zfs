@@ -11,5 +11,7 @@ futures = "0.3.13"
 nvpair = { git = "https://github.com/ahrens/rust-libzfs", branch = "work"}
 rand = "0.8.3"
 rust-s3 = "0.27.0-rc1"
+rusoto_s3 = "0.46.0"
+rusoto_core = "0.46.0"
 tokio = { version = "1.4", features = ["full"] }
 libzoa = { path = "../" }

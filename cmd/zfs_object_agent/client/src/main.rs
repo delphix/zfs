@@ -4,6 +4,8 @@ use libzoa::base_types::*;
 use libzoa::object_access;
 use nvpair::*;
 use rand::prelude::*;
+use rusoto_core::ByteStream;
+use rusoto_s3::*;
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::Region;
@@ -15,6 +17,7 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::io::Read;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 mod client;
 
 const ENDPOINT: &str = "https://s3-us-west-2.amazonaws.com";
@@ -43,6 +46,49 @@ async fn do_s3(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
             println!("found object {}", res.key);
         }
     }
+
+    return std::result::Result::Ok(());
+}
+
+async fn do_s3_rusoto() -> Result<(), Box<dyn Error>> {
+    let client = S3Client::new(rusoto_core::Region::UsWest2);
+    let key = "mahrens/test.file2";
+
+    println!("getting {}", key);
+    let req = GetObjectRequest {
+        bucket: BUCKET_NAME.to_string(),
+        key: key.to_string(),
+        ..Default::default()
+    };
+    let res = client.get_object(req).await?;
+    let mut s = String::new();
+    res.body
+        .unwrap()
+        .into_async_read()
+        .read_to_string(&mut s)
+        .await
+        .unwrap();
+    println!("object contents = {}", s);
+
+    let content = "I want to go to S3".as_bytes().to_vec();
+    println!("putting {}", key);
+    let req = PutObjectRequest {
+        bucket: BUCKET_NAME.to_string(),
+        key: key.to_string(),
+        body: Some(ByteStream::from(content)),
+        ..Default::default()
+    };
+    client.put_object(req).await?;
+
+    /*
+    let results = bucket.list("mahrens".to_string(), None).await?;
+    for list_results in results {
+        assert_eq!(code, 200);
+        for res in list_results.contents {
+            println!("found object {}", res.key);
+        }
+    }
+    */
 
     return std::result::Result::Ok(());
 }
@@ -310,6 +356,7 @@ async fn main() {
 
     match &args[1][..] {
         "s3" => do_s3(&bucket).await.unwrap(),
+        "s3_rusoto" => do_s3_rusoto().await.unwrap(),
         "list" => do_list(&bucket).await.unwrap(),
         "delete" => do_delete(&bucket).await.unwrap(),
         "create" => do_create().await.unwrap(),
