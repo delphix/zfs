@@ -98,6 +98,7 @@ typedef struct vdev_object_store {
 
 	uint64_t vos_next_block;
 	uberblock_t vos_uberblock;
+	nvlist_t *vos_config;
 } vdev_object_store_t;
 
 static mode_t
@@ -393,6 +394,10 @@ object_store_end_txg(spa_t *spa, nvlist_t *config, uint64_t txg)
 	    &spa->spa_uberblock, sizeof (spa->spa_uberblock), nvbuf, nvlen);
 	agent_wait_serial(vos);
 	fnvlist_pack_free(nvbuf, nvlen);
+
+	if (vos->vos_config != NULL)
+		fnvlist_free(vos->vos_config);
+	vos->vos_config = fnvlist_dup(config);
 }
 
 void
@@ -479,6 +484,9 @@ agent_reader(void *arg)
 			if (err == 0) {
 				ASSERT3U(len, ==, sizeof (uberblock_t));
 				bcopy(arr, &vos->vos_uberblock, len);
+				VERIFY0(nvlist_lookup_uint8_array(nv,
+				    AGENT_CONFIG, &arr, &len));
+				vos->vos_config = fnvlist_unpack(arr, len);
 			}
 
 			uint64_t next_block = fnvlist_lookup_uint64(nv,
@@ -588,6 +596,9 @@ vdev_object_store_fini(vdev_t *vd)
 	}
 	if (vos->vos_credentials != NULL) {
 		kmem_strfree(vos->vos_credentials);
+	}
+	if (vos->vos_config != NULL) {
+		fnvlist_free(vos->vos_config);
 	}
 	kmem_free(vd->vdev_tsd, sizeof (vdev_object_store_t));
 	vd->vdev_tsd = NULL;
@@ -777,6 +788,13 @@ vdev_object_store_get_uberblock(vdev_t *vd)
 {
 	vdev_object_store_t *vos = vd->vdev_tsd;
 	return (&vos->vos_uberblock);
+}
+
+nvlist_t *
+vdev_object_store_get_config(vdev_t *vd)
+{
+	vdev_object_store_t *vos = vd->vdev_tsd;
+	return (fnvlist_dup(vos->vos_config));
 }
 
 vdev_ops_t vdev_object_store_ops = {

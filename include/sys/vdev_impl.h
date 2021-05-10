@@ -653,6 +653,7 @@ extern int vdev_obsolete_counts_are_precise(vdev_t *vd, boolean_t *are_precise);
 int vdev_checkpoint_sm_object(vdev_t *vd, uint64_t *sm_obj);
 void vdev_metaslab_group_create(vdev_t *vd);
 uberblock_t *vdev_object_store_get_uberblock(vdev_t *vd);
+nvlist_t *vdev_object_store_get_config(vdev_t *vd);
 
 /*
  * Vdev ashift optimization tunables

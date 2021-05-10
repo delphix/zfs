@@ -144,6 +144,10 @@ impl UberblockPhys {
         &self.zfs_uberblock
     }
 
+    pub fn get_zfs_config(&self) -> &Vec<u8> {
+        &self.zfs_config
+    }
+
     async fn get(bucket: &Bucket, guid: PoolGUID, txg: TXG) -> Self {
         let buf = object_access::get_object(bucket, &Self::key(guid, txg)).await;
         let this: Self = bincode::deserialize(&buf).unwrap();

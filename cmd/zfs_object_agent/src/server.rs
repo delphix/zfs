@@ -278,6 +278,7 @@ impl Server {
         if let Some(phys) = phys_opt {
             nvl.insert("uberblock", &phys.get_zfs_uberblock()[..])
                 .unwrap();
+            nvl.insert("config", &phys.get_zfs_config()[..]).unwrap();
         }
 
         nvl.insert("next_block", &next_block.0).unwrap();

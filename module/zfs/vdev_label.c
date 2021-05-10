@@ -777,6 +777,12 @@ vdev_label_read_config(vdev_t *vd, uint64_t txg)
 	if (vd->vdev_ops == &vdev_draid_spare_ops)
 		return (vdev_draid_read_config_spare(vd));
 
+	if (vdev_is_object_based(vd)) {
+#ifdef _KERNEL
+		return (vdev_object_store_get_config(vd));
+#endif
+	}
+
 	for (int l = 0; l < VDEV_LABELS; l++) {
 		vp_abd[l] = abd_alloc_linear(sizeof (vdev_phys_t), B_TRUE);
 		vp[l] = abd_to_buf(vp_abd[l]);
@@ -1573,6 +1579,13 @@ vdev_uberblock_load(vdev_t *rvd, uberblock_t *ub, nvlist_t **config)
 		}
 		if (*config == NULL) {
 			vdev_dbgmsg(cb.ubl_vd, "failed to read label config");
+		}
+	} else if (cb.ubl_vd != NULL && vdev_is_object_based(cb.ubl_vd)) {
+#ifdef _KERNEL
+		*config = vdev_object_store_get_config(cb.ubl_vd);
+#endif
+		if (*config == NULL) {
+			vdev_dbgmsg(cb.ubl_vd, "failed to read objstore label config");
 		}
 	}
 	spa_config_exit(spa, SCL_ALL, FTAG);

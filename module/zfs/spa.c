@@ -3564,7 +3564,6 @@ spa_ld_select_uberblock(spa_t *spa, spa_import_type_t type)
 		return (spa_vdev_err(rvd, VDEV_AUX_VERSION_NEWER, ENOTSUP));
 	}
 
-#if 0
 	if (ub->ub_version >= SPA_VERSION_FEATURES) {
 		nvlist_t *features;
 
@@ -3628,7 +3627,6 @@ spa_ld_select_uberblock(spa_t *spa, spa_import_type_t type)
 
 		nvlist_free(unsup_feat);
 	}
-#endif
 
 	if (type != SPA_IMPORT_ASSEMBLE && spa->spa_config_splitting) {
 		spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
