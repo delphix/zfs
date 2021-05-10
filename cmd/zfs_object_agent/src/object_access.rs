@@ -171,14 +171,17 @@ pub async fn object_exists(bucket: &Bucket, key: &str) -> bool {
     let prefixed_key = prefixed(key);
     println!("looking for {}", prefixed_key);
     let begin = Instant::now();
-    let results = bucket.list(prefixed_key, None).await.unwrap_or(vec![]);
-    if results.len() == 0 {
-        return false;
+    match bucket.list(prefixed_key, None).await {
+        Ok(results) => {
+            assert!(results.len() == 1);
+            let list = &results[0];
+            println!("list completed in {}ms", begin.elapsed().as_millis());
+            // Note need to check if this exact name is in the results. If we are looking
+            // for "x/y" and there is "x/y" and "x/yz", both will be returned.
+            list.contents.iter().find(|o| o.key == key).is_some()
+        }
+        Err(_) => {
+            return false;
+        }
     }
-    assert!(results.len() == 1);
-    let list = &results[0];
-    println!("list completed in {}ms", begin.elapsed().as_millis());
-    // Note need to check if this exact name is in the results. If we are looking
-    // for "x/y" and there is "x/y" and "x/yz", both will be returned.
-    list.contents.iter().find(|o| o.key == key).is_some()
 }

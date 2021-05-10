@@ -469,7 +469,7 @@ zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
 		close(sock);
 		return;
 	}
-	ASSERT3U(rv, ==, len);
+	VERIFY3U(rv, ==, len); // XXX We need to handle partial writes here.
 
 	uint64_t resp_size;
 	size_t size;
@@ -479,7 +479,8 @@ zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
 		close(sock);
 		return;
 	}
-	ASSERT3U(rv, ==, sizeof (resp_size));
+	// XXX We need to handle partial reads here.
+	VERIFY3U(rv, ==, sizeof (resp_size));
 
 	size = le64toh(resp_size);
 	buf = malloc(size);

@@ -1,7 +1,6 @@
 use crate::base_types::*;
 use crate::{object_access, pool::*};
-use nvpair::NvEncoding;
-use nvpair::{NvData, NvList};
+use nvpair::{NvData, NvEncoding, NvList};
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::Region;
@@ -48,27 +47,17 @@ impl Server {
         };
         tokio::spawn(async move {
             loop {
-                let nvl = match tokio::time::timeout(
-                    Duration::from_millis(1000),
-                    Self::get_next_request(&mut server.input),
-                )
-                .await
-                {
+                let nvl = match Self::get_next_request(&mut server.input).await {
                     Err(_) => {
                         continue;
                     }
-                    Ok(getreq_result) => match getreq_result {
-                        Err(_) => {
-                            println!("got error reading from connection: {:?}", getreq_result);
-                            return;
-                        }
-                        Ok(mynvl) => mynvl,
-                    },
+                    Ok(nvl) => nvl,
                 };
                 match nvl.lookup_string("Type").unwrap().to_str().unwrap() {
                     "get pools" => {
                         println!("got request: {:?}", nvl);
-                        server.get_pools(&nvl).await;
+                        let bucket = Self::get_bucket(&nvl);
+                        server.get_pools(&bucket).await;
                     }
                     other => {
                         println!("got request: {:?}", nvl);
@@ -248,8 +237,7 @@ impl Server {
         Bucket::new(bucket_name.to_str().unwrap(), region, credentials).unwrap()
     }
 
-    async fn get_pools(&mut self, nvl: &nvpair::NvListRef) {
-        let bucket = Self::get_bucket(nvl);
+    async fn get_pools(&mut self, bucket: &Bucket) {
         let objs = object_access::list_objects(&bucket, "zfs/", Some("/super".to_string())).await;
         let mut nvl = NvList::new_unique_names();
         for res in objs {
