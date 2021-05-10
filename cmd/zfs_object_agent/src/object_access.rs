@@ -49,7 +49,7 @@ where
 {
     println!("{}: begin", msg);
     let begin = Instant::now();
-    let delay = Duration::from_secs_f64(thread_rng().gen_range(0.001..0.2));
+    let mut delay = Duration::from_secs_f64(thread_rng().gen_range(0.001..0.2));
     let data = loop {
         match f().await {
             Err(e) => {
@@ -74,7 +74,7 @@ where
             }
         }
         tokio::time::sleep(delay).await;
-        delay.mul_f64(thread_rng().gen_range(1.5..2.5));
+        delay = delay.mul_f64(thread_rng().gen_range(1.5..2.5));
     };
     println!(
         "{}: returned {} bytes in {}ms",
@@ -92,7 +92,7 @@ where
 {
     println!("{}: begin", msg);
     let begin = Instant::now();
-    let delay = Duration::from_secs_f64(thread_rng().gen_range(0.001..0.2));
+    let mut delay = Duration::from_secs_f64(thread_rng().gen_range(0.001..0.2));
     let data = loop {
         match f().await {
             Err(e) => {
@@ -104,7 +104,7 @@ where
             }
         }
         tokio::time::sleep(delay).await;
-        delay.mul_f64(thread_rng().gen_range(1.5..2.5));
+        delay = delay.mul_f64(thread_rng().gen_range(1.5..2.5));
     };
     println!(
         "{}: returned success in {}ms",
