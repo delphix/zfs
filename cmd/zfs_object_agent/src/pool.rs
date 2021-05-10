@@ -274,7 +274,7 @@ struct PendingObject {
  * Note: this struct is passed to the OBL code.  It needs to be a separate struct from Pool,
  * because it can't refer back to the OBL itself, which would create a circular reference.
  */
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PoolSharedState {
     pub object_access: ObjectAccess,
     pub guid: PoolGUID,
@@ -560,14 +560,20 @@ impl Pool {
 
             // Now that the metadata state has been atomically moved forward, we
             // can delete objects that are no longer needed
-            for obj in syncing_state.objects_to_delete.drain(..) {
+            for objs in syncing_state.objects_to_delete.chunks(900) {
                 let state = state.clone();
                 // Note: we don't care about waiting for the frees to complete.
+                let mut v = Vec::new();
+                for obj in objs {
+                    let key = DataObjectPhys::key(state.readonly_state.guid, *obj);
+                    v.push(key);
+                }
                 tokio::spawn(async move {
-                    let key = DataObjectPhys::key(state.readonly_state.guid, obj);
-                    state.readonly_state.object_access.delete_object(&key).await;
+                    state.readonly_state.object_access.delete_objects(v).await;
                 });
             }
+            syncing_state.objects_to_delete.clear();
+            syncing_state.objects_to_delete.shrink_to_fit();
 
             // update txg
             syncing_state.last_txg = txg;

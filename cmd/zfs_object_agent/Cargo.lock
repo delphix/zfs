@@ -670,6 +670,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "bincode",
+ "bytes",
  "futures",
  "futures-core",
  "lazy_static",

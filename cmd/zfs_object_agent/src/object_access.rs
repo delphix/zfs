@@ -1,15 +1,18 @@
 use anyhow::Result;
+use async_stream::stream;
+use bytes::Bytes;
 use core::time::Duration;
 use futures::Future;
 use lazy_static::lazy_static;
 use lru::LruCache;
 use rand::prelude::*;
-use s3::bucket::Bucket;
+use rusoto_core::{ByteStream, RusotoError};
+use rusoto_s3::*;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Semaphore;
+use tokio::{io::AsyncReadExt, sync::Semaphore};
 
 struct ObjectCache {
     // XXX cache key should include Bucket
@@ -28,9 +31,11 @@ lazy_static! {
     };
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ObjectAccess {
-    bucket: Bucket,
+    bucket: s3::Bucket,
+    client: rusoto_s3::S3Client,
+    bucket_str: String,
 }
 
 /// For testing, prefix all object keys with this string.
@@ -80,6 +85,35 @@ where
     data
 }
 
+async fn retry2<F, O, E>(msg: &str, f: impl Fn() -> F) -> O
+where
+    E: core::fmt::Debug + core::fmt::Display + std::error::Error,
+    F: Future<Output = Result<O, RusotoError<E>>>,
+{
+    println!("{}: begin", msg);
+    let begin = Instant::now();
+    let delay = Duration::from_secs_f64(thread_rng().gen_range(0.001..0.2));
+    let data = loop {
+        match f().await {
+            Err(e) => {
+                // XXX why can't we use {} with `e`?  lifetime error???
+                println!("{} returned: {:?}; retrying in {:?}", msg, e, delay);
+            }
+            Ok(output) => {
+                break output;
+            }
+        }
+        tokio::time::sleep(delay).await;
+        delay.mul_f64(thread_rng().gen_range(1.5..2.5));
+    };
+    println!(
+        "{}: returned success in {}ms",
+        msg,
+        begin.elapsed().as_millis()
+    );
+    data
+}
+
 impl ObjectAccess {
     pub fn new(endpoint: &str, region: &str, bucket: &str, creds: &str) -> Self {
         let region = s3::Region::Custom {
@@ -101,8 +135,20 @@ impl ObjectAccess {
         )
         .unwrap();
 
+        let http_client = rusoto_core::HttpClient::new().unwrap();
+        let creds = rusoto_core::credential::StaticProvider::new(
+            access_key_id.to_string(),
+            secret_access_key.to_string(),
+            None,
+            None,
+        );
+        let client =
+            rusoto_s3::S3Client::new_with(http_client, creds, rusoto_core::Region::UsWest2);
+
         ObjectAccess {
-            bucket: Bucket::new(bucket, region, credentials).unwrap(),
+            bucket: s3::Bucket::new(bucket, region, credentials).unwrap(),
+            client,
+            bucket_str: bucket.to_string(),
         }
     }
 
@@ -112,6 +158,27 @@ impl ObjectAccess {
             self.bucket.get_object(prefixed_key).await
         })
         .await
+    }
+
+    async fn get_object_impl2(&self, key: &str) -> Vec<u8> {
+        let msg = format!("get {}", prefixed(key));
+        let x = retry2(&msg, || async {
+            let req = GetObjectRequest {
+                bucket: self.bucket_str.clone(),
+                key: prefixed(key),
+                ..Default::default()
+            };
+            self.client.get_object(req).await
+        })
+        .await;
+        let mut s = Vec::new();
+        x.body
+            .unwrap()
+            .into_async_read()
+            .read_to_end(&mut s)
+            .await
+            .unwrap();
+        s
     }
 
     pub async fn get_object(&self, key: &str) -> Arc<Vec<u8>> {
@@ -145,7 +212,7 @@ impl ObjectAccess {
                 }
             }
             if reader {
-                let v = Arc::new(self.get_object_impl(key).await);
+                let v = Arc::new(self.get_object_impl2(key).await);
                 let mut c = CACHE.lock().unwrap();
                 mysem.close();
                 c.cache.put(key.to_string(), v.clone());
@@ -169,6 +236,37 @@ pub async fn list_objects(
     let full_prefix = prefixed(prefix);
     bucket.list(full_prefix, delimiter).await.unwrap()
 }
+    async fn put_object_impl(&self, key: &str, data: &[u8]) {
+        let prefixed_key = &prefixed(key);
+        retry(
+            &format!("put {} ({} bytes)", prefixed_key, data.len()),
+            || async { self.bucket.put_object(prefixed_key, data).await },
+        )
+        .await;
+    }
+
+    async fn put_object_impl2(&self, key: &str, data: &[u8]) {
+        let len = data.len();
+        let v = Vec::from(data);
+        let b = Bytes::from(v);
+        let a = Arc::new(b);
+        retry2(
+            &format!("put {} ({} bytes)", prefixed(key), data.len()),
+            || async {
+                let my_b = (*a).clone();
+                let stream = ByteStream::new_with_size(stream! { yield Ok(my_b)}, len);
+
+                let req = PutObjectRequest {
+                    bucket: self.bucket_str.clone(),
+                    key: prefixed(key),
+                    body: Some(stream),
+                    ..Default::default()
+                };
+                self.client.put_object(req).await
+            },
+        )
+        .await;
+    }
 
     // XXX update to take the actual Vec so that we can cache it?  Although that
     // should be the uncommon case.
@@ -183,20 +281,56 @@ pub async fn list_objects(
             }
         }
 
-        let prefixed_key = &prefixed(key);
-        retry(
-            &format!("put {} ({} bytes)", prefixed_key, data.len()),
-            || async { self.bucket.put_object(prefixed_key, data).await },
-        )
-        .await;
+        self.put_object_impl2(key, data).await;
     }
 
     pub async fn delete_object(&self, key: &str) {
+        let mut v = Vec::new();
+        v.push(key.to_string());
+        self.delete_objects(v).await;
+        /*
         let prefixed_key = &prefixed(key);
         retry(&format!("delete {}", prefixed_key), || async {
             self.bucket.delete_object(prefixed_key).await
         })
         .await;
+        */
+    }
+
+    // XXX just have it take ObjectIdentifiers? but they would need to be
+    // prefixed already, to avoid creating new ObjectIdentifiers
+    // Note: AWS supports up to 1000 keys per delete_objects request.
+    // XXX should we split them up here?
+    pub async fn delete_objects(&self, keys: Vec<String>) {
+        let msg = format!(
+            "delete {} objects including {}",
+            keys.len(),
+            prefixed(&keys[0])
+        );
+        let x = retry2(&msg, || async {
+            let v: Vec<_> = keys
+                .iter()
+                .map(|x| ObjectIdentifier {
+                    key: prefixed(x),
+                    ..Default::default()
+                })
+                .collect();
+            let req = DeleteObjectsRequest {
+                bucket: self.bucket_str.clone(),
+                delete: Delete {
+                    objects: v,
+                    quiet: Some(true),
+                },
+                ..Default::default()
+            };
+            self.client.delete_objects(req).await
+        })
+        .await;
+        if let Some(errs) = x.errors {
+            for err in errs {
+                panic!("error from s3: {:?}", err);
+            }
+        }
     }
 
     pub async fn object_exists(&self, key: &str) -> bool {

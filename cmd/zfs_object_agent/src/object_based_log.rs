@@ -70,7 +70,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLogChunk<T> {
     }
 }
 
-#[derive(Debug)]
+//#[derive(Debug)]
 pub struct ObjectBasedLog<T: ObjectBasedLogEntry> {
     pool: Arc<PoolSharedState>,
     name: String,
