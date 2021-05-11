@@ -112,7 +112,7 @@ impl ObjectAccess {
 
     async fn get_object_impl(&self, key: &str) -> Vec<u8> {
         let msg = format!("get {}", prefixed(key));
-        let x = retry(&msg, || async {
+        let output = retry(&msg, || async {
             let req = GetObjectRequest {
                 bucket: self.bucket_str.clone(),
                 key: prefixed(key),
@@ -122,21 +122,22 @@ impl ObjectAccess {
         })
         .await;
         let begin = Instant::now();
-        let mut s = Vec::new();
-        x.body
+        let mut v = Vec::new();
+        output
+            .body
             .unwrap()
             .into_async_read()
-            .read_to_end(&mut s)
+            .read_to_end(&mut v)
             .await
             .unwrap();
         println!(
             "{}: got {} bytes of data in additional {}ms",
             msg,
-            s.len(),
+            v.len(),
             begin.elapsed().as_millis()
         );
 
-        s
+        v
     }
 
     pub async fn get_object(&self, key: &str) -> Arc<Vec<u8>> {

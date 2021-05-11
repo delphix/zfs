@@ -228,6 +228,7 @@ impl Server {
                 }
             }
         }
+        println!("sending response: {:?}", nvl);
         Self::send_response(&self.output, nvl).await;
     }
 
