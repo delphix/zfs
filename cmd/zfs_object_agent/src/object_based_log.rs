@@ -60,7 +60,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLogChunk<T> {
 
     async fn put(&self, object_access: &ObjectAccess, name: &str) {
         let begin = Instant::now();
-        let buf = &bincode::serialize(&self).unwrap();
+        let buf = bincode::serialize(&self).unwrap();
         println!(
             "serialized {} log entries in {}ms",
             self.entries.len(),

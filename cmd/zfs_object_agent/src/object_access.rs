@@ -43,49 +43,7 @@ pub fn prefixed(key: &str) -> String {
     format!("{}{}", *PREFIX, key)
 }
 
-async fn retry<Fut>(msg: &str, f: impl Fn() -> Fut) -> Vec<u8>
-where
-    Fut: Future<Output = Result<(Vec<u8>, u16)>>,
-{
-    println!("{}: begin", msg);
-    let begin = Instant::now();
-    let mut delay = Duration::from_secs_f64(thread_rng().gen_range(0.001..0.2));
-    let data = loop {
-        match f().await {
-            Err(e) => {
-                println!("{} returned: {}; retrying in {:?}", msg, e, delay);
-            }
-            Ok((mydata, code)) => {
-                if code >= 200 && code < 300 {
-                    break mydata;
-                } else if code >= 500 && code < 600 {
-                    println!(
-                        "{}: returned http code {}; retrying in {:?}",
-                        msg, code, delay
-                    );
-                } else {
-                    panic!(
-                        "{}: returned invalid http code {}; response: {}",
-                        msg,
-                        code,
-                        String::from_utf8(mydata).unwrap_or("<Invalid UTF8>".to_string())
-                    );
-                }
-            }
-        }
-        tokio::time::sleep(delay).await;
-        delay = delay.mul_f64(thread_rng().gen_range(1.5..2.5));
-    };
-    println!(
-        "{}: returned {} bytes in {}ms",
-        msg,
-        data.len(),
-        begin.elapsed().as_millis()
-    );
-    data
-}
-
-async fn retry2<F, O, E>(msg: &str, f: impl Fn() -> F) -> O
+async fn retry<F, O, E>(msg: &str, f: impl Fn() -> F) -> O
 where
     E: core::fmt::Debug + core::fmt::Display + std::error::Error,
     F: Future<Output = Result<O, RusotoError<E>>>,
@@ -93,14 +51,14 @@ where
     println!("{}: begin", msg);
     let begin = Instant::now();
     let mut delay = Duration::from_secs_f64(thread_rng().gen_range(0.001..0.2));
-    let data = loop {
+    let result = loop {
         match f().await {
             Err(e) => {
                 // XXX why can't we use {} with `e`?  lifetime error???
                 println!("{} returned: {:?}; retrying in {:?}", msg, e, delay);
             }
-            Ok(output) => {
-                break output;
+            Ok(result) => {
+                break result;
             }
         }
         tokio::time::sleep(delay).await;
@@ -111,7 +69,7 @@ where
         msg,
         begin.elapsed().as_millis()
     );
-    data
+    result
 }
 
 impl ObjectAccess {
@@ -153,16 +111,8 @@ impl ObjectAccess {
     }
 
     async fn get_object_impl(&self, key: &str) -> Vec<u8> {
-        let prefixed_key = &prefixed(key);
-        retry(&format!("get {}", prefixed_key), || async {
-            self.bucket.get_object(prefixed_key).await
-        })
-        .await
-    }
-
-    async fn get_object_impl2(&self, key: &str) -> Vec<u8> {
         let msg = format!("get {}", prefixed(key));
-        let x = retry2(&msg, || async {
+        let x = retry(&msg, || async {
             let req = GetObjectRequest {
                 bucket: self.bucket_str.clone(),
                 key: prefixed(key),
@@ -171,6 +121,7 @@ impl ObjectAccess {
             self.client.get_object(req).await
         })
         .await;
+        let begin = Instant::now();
         let mut s = Vec::new();
         x.body
             .unwrap()
@@ -178,6 +129,13 @@ impl ObjectAccess {
             .read_to_end(&mut s)
             .await
             .unwrap();
+        println!(
+            "{}: got {} bytes of data in additional {}ms",
+            msg,
+            s.len(),
+            begin.elapsed().as_millis()
+        );
+
         s
     }
 
@@ -212,7 +170,7 @@ impl ObjectAccess {
                 }
             }
             if reader {
-                let v = Arc::new(self.get_object_impl2(key).await);
+                let v = Arc::new(self.get_object_impl(key).await);
                 let mut c = CACHE.lock().unwrap();
                 mysem.close();
                 c.cache.put(key.to_string(), v.clone());
@@ -237,22 +195,11 @@ impl ObjectAccess {
         self.bucket.list(full_prefix, delimiter).await.unwrap()
     }
 
-    async fn put_object_impl(&self, key: &str, data: &[u8]) {
-        let prefixed_key = &prefixed(key);
-        retry(
-            &format!("put {} ({} bytes)", prefixed_key, data.len()),
-            || async { self.bucket.put_object(prefixed_key, data).await },
-        )
-        .await;
-    }
-
-    async fn put_object_impl2(&self, key: &str, data: &[u8]) {
+    async fn put_object_impl(&self, key: &str, data: Vec<u8>) {
         let len = data.len();
-        let v = Vec::from(data);
-        let b = Bytes::from(v);
-        let a = Arc::new(b);
-        retry2(
-            &format!("put {} ({} bytes)", prefixed(key), data.len()),
+        let a = Arc::new(Bytes::from(data));
+        retry(
+            &format!("put {} ({} bytes)", prefixed(key), len),
             || async {
                 let my_b = (*a).clone();
                 let stream = ByteStream::new_with_size(stream! { yield Ok(my_b)}, len);
@@ -269,33 +216,24 @@ impl ObjectAccess {
         .await;
     }
 
-    // XXX update to take the actual Vec so that we can cache it?  Although that
-    // should be the uncommon case.
-    pub async fn put_object(&self, key: &str, data: &[u8]) {
+    pub async fn put_object(&self, key: &str, data: Vec<u8>) {
         {
             // invalidate cache.  don't hold lock across .await below
             let mut c = CACHE.lock().unwrap();
             let mykey = key.to_string();
             if c.cache.contains(&mykey) {
                 println!("found {} in cache when putting - invalidating", key);
-                c.cache.put(mykey, Arc::new(data.to_vec()));
+                c.cache.put(mykey, Arc::new(data.clone()));
             }
         }
 
-        self.put_object_impl2(key, data).await;
+        self.put_object_impl(key, data).await;
     }
 
     pub async fn delete_object(&self, key: &str) {
         let mut v = Vec::new();
         v.push(key.to_string());
         self.delete_objects(v).await;
-        /*
-        let prefixed_key = &prefixed(key);
-        retry(&format!("delete {}", prefixed_key), || async {
-            self.bucket.delete_object(prefixed_key).await
-        })
-        .await;
-        */
     }
 
     // XXX just have it take ObjectIdentifiers? but they would need to be
@@ -308,7 +246,7 @@ impl ObjectAccess {
             keys.len(),
             prefixed(&keys[0])
         );
-        let x = retry2(&msg, || async {
+        let x = retry(&msg, || async {
             let v: Vec<_> = keys
                 .iter()
                 .map(|x| ObjectIdentifier {

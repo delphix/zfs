@@ -20,15 +20,12 @@ use tokio::task::JoinHandle;
 
 // XXX need a real tunables infrastructure
 // start freeing when the pending frees are this % of the entire pool
-const FREE_HIGHWATER_PCT: f64 = 2.0;
+const FREE_HIGHWATER_PCT: f64 = 10.0;
 // stop freeing when the pending frees are this % of the entire pool
-const FREE_LOWWATER_PCT: f64 = 1.5;
+const FREE_LOWWATER_PCT: f64 = 9.0;
 // don't bother freeing unless there are at least this number of free blocks
 const FREE_MIN_BLOCKS: u64 = 1000;
-// XXX change this to bytes
-const MAX_BLOCKS_PER_OBJECT: usize = 100;
-// XXX increase
-const MAX_BYTES_PER_OBJECT: u32 = 128 * 1024;
+const MAX_BYTES_PER_OBJECT: u32 = 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct PoolPhys {
@@ -128,7 +125,7 @@ impl PoolPhys {
 
     async fn put(&self, object_access: &ObjectAccess) {
         println!("putting {:#?}", self);
-        let buf = &bincode::serialize(&self).unwrap();
+        let buf = bincode::serialize(&self).unwrap();
         object_access.put_object(&Self::key(self.guid), buf).await;
     }
 }
@@ -157,7 +154,7 @@ impl UberblockPhys {
 
     async fn put(&self, object_access: &ObjectAccess) {
         println!("putting {:#?}", self);
-        let buf = &bincode::serialize(&self).unwrap();
+        let buf = bincode::serialize(&self).unwrap();
         object_access
             .put_object(&Self::key(self.guid, self.txg), buf)
             .await;
@@ -196,7 +193,7 @@ impl DataObjectPhys {
             begin.elapsed().as_millis()
         );
         object_access
-            .put_object(&Self::key(self.guid, self.object), &contents)
+            .put_object(&Self::key(self.guid, self.object), contents)
             .await;
     }
 }
@@ -807,7 +804,7 @@ impl Pool {
         pending_object.phys.blocks_size += data.len() as u32;
         pending_object.phys.blocks.insert(id, data);
         let sem = pending_object.done.clone();
-        let do_flush = pending_object.phys.blocks.len() >= MAX_BLOCKS_PER_OBJECT;
+        let do_flush = pending_object.phys.blocks_size >= MAX_BYTES_PER_OBJECT;
         (sem, do_flush)
     }
 
