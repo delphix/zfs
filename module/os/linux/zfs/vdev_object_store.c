@@ -486,7 +486,7 @@ agent_reader(void *arg)
 				bcopy(arr, &vos->vos_uberblock, len);
 				VERIFY0(nvlist_lookup_uint8_array(nv,
 				    AGENT_CONFIG, &arr, &len));
-				vos->vos_config = fnvlist_unpack(arr, len);
+				vos->vos_config = fnvlist_unpack((char *)arr, len);
 			}
 
 			uint64_t next_block = fnvlist_lookup_uint64(nv,
