@@ -674,7 +674,6 @@ dependencies = [
  "futures",
  "futures-core",
  "lazy_static",
- "log",
  "lru",
  "more-asserts",
  "nvpair",

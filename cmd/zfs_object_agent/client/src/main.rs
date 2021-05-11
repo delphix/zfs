@@ -51,9 +51,6 @@ async fn do_s3(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
 }
 
 async fn do_s3_rusoto() -> Result<(), Box<dyn Error>> {
-    //let http_client = HttpClient::new()?;
-    //let creds = StaticProvider::new("XXX".to_string(), "XXX".to_string(), None, None);
-    //let client = S3Client::new_with(http_client, creds, rusoto_core::Region::UsWest2);
     let client = S3Client::new(rusoto_core::Region::UsWest2);
 
     let key = "mahrens/test.file2";
@@ -83,16 +80,6 @@ async fn do_s3_rusoto() -> Result<(), Box<dyn Error>> {
         ..Default::default()
     };
     client.put_object(req).await?;
-
-    /*
-    let results = bucket.list("mahrens".to_string(), None).await?;
-    for list_results in results {
-        assert_eq!(code, 200);
-        for res in list_results.contents {
-            println!("found object {}", res.key);
-        }
-    }
-    */
 
     return std::result::Result::Ok(());
 }
