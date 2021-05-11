@@ -53,10 +53,12 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLogChunk<T> {
             this.entries.len(),
             begin.elapsed().as_millis()
         );
+        assert_eq!(this.generation, generation);
+        assert_eq!(this.chunk, chunk);
         this
     }
 
-    async fn put(&self, object_access: &ObjectAccess, name: &str, generation: u64, chunk: u64) {
+    async fn put(&self, object_access: &ObjectAccess, name: &str) {
         let begin = Instant::now();
         let buf = &bincode::serialize(&self).unwrap();
         println!(
@@ -65,7 +67,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLogChunk<T> {
             begin.elapsed().as_millis()
         );
         object_access
-            .put_object(&Self::key(name, generation, chunk), buf)
+            .put_object(&Self::key(name, self.generation, self.chunk), buf)
             .await;
     }
 }
@@ -188,12 +190,8 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         // reference them from the spawned task (use Arc)
         let pool = self.pool.clone();
         let name = self.name.clone();
-        let generation = self.generation;
-        let num_chunks = self.num_chunks;
         let handle = tokio::spawn(async move {
-            chunk
-                .put(&pool.object_access, &name, generation, num_chunks)
-                .await;
+            chunk.put(&pool.object_access, &name).await;
         });
         self.pending_flushes.push(handle);
 
