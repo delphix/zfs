@@ -279,7 +279,7 @@ impl ObjectAccess {
         let begin = Instant::now();
         match self.bucket.list(prefixed_key, None).await {
             Ok(results) => {
-                assert!(results.len() == 1);
+                assert_eq!(results.len(), 1);
                 let list = &results[0];
                 println!("list completed in {}ms", begin.elapsed().as_millis());
                 // Note need to check if this exact name is in the results. If we are looking

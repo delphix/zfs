@@ -5,6 +5,7 @@ use core::future::Future;
 use futures::future;
 use futures::future::*;
 use futures::stream::*;
+use more_asserts::*;
 use nvpair::NvList;
 use serde::{Deserialize, Serialize};
 use std::cmp::min;
@@ -285,7 +286,7 @@ pub struct PoolSharedState {
 impl PoolSyncingState {
     fn log_free(&mut self, ent: PendingFreesLogEntry) {
         let txg = self.syncing_txg.unwrap();
-        assert!(ent.block < self.pending_object_min_block);
+        assert_lt!(ent.block, self.pending_object_min_block);
         self.pending_frees_log.append(txg, ent);
         self.stats.pending_frees_count += 1;
         self.stats.pending_frees_bytes += ent.size as u64;
@@ -491,7 +492,7 @@ impl Pool {
         let syncing_state = &mut self.state.syncing_state.try_lock().unwrap();
 
         assert!(syncing_state.syncing_txg.is_none());
-        assert!(txg.0 > syncing_state.last_txg.0);
+        assert_gt!(txg.0, syncing_state.last_txg.0);
         syncing_state.syncing_txg = Some(txg);
         let last_obj = self.state.block_to_obj.read().unwrap().last_obj();
 
@@ -650,8 +651,8 @@ impl Pool {
 
             // verify BlockID's are in expected range
             for b in pending_object.phys.blocks.keys() {
-                assert!(*b >= min_block);
-                assert!(*b <= max_block);
+                assert_ge!(*b, min_block);
+                assert_le!(*b, max_block);
             }
             assert_eq!(pending_object.phys.guid, self.state.readonly_state.guid);
             assert_eq!(pending_object.phys.txg, txg);
@@ -1034,7 +1035,12 @@ async fn reclaim_frees_object(
                 let mut obj_phys =
                     DataObjectPhys::get(&my_shared_state.object_access, my_shared_state.guid, obj)
                         .await;
-                assert!(obj_size >= obj_phys.blocks_size);
+                assert_ge!(
+                    obj_size,
+                    obj_phys.blocks_size,
+                    "{} ObjectSizeLogEntry should be at least as large as actual size",
+                    obj,
+                );
                 for pfle in frees {
                     let removed = obj_phys.blocks.remove(&pfle.block);
                     // If we crashed in the middle of this operation last time, the

@@ -1,4 +1,5 @@
 use crate::base_types::*;
+use more_asserts::*;
 use std::borrow::Borrow;
 use std::collections::BTreeSet;
 use std::ops::Bound::*;
@@ -37,8 +38,8 @@ impl ObjectBlockMap {
         let mut prev_ent_opt: Option<ObjectBlockMapEntry> = None;
         for ent in self.map.iter() {
             if let Some(prev_ent) = prev_ent_opt {
-                assert!(ent.obj > prev_ent.obj);
-                assert!(ent.block > prev_ent.block);
+                assert_gt!(ent.obj, prev_ent.obj);
+                assert_gt!(ent.block, prev_ent.block);
             }
             prev_ent_opt = Some(*ent);
         }
@@ -48,11 +49,11 @@ impl ObjectBlockMap {
         // verify that this block is between the existing entries blocks
         let prev_ent_opt = self.map.range((Unbounded, Excluded(obj))).next_back();
         if let Some(prev_ent) = prev_ent_opt {
-            assert!(prev_ent.block < block);
+            assert_lt!(prev_ent.block, block);
         }
         let next_ent_opt = self.map.range((Excluded(obj), Unbounded)).next();
         if let Some(next_ent) = next_ent_opt {
-            assert!(next_ent.block > block);
+            assert_gt!(next_ent.block, block);
         }
         // verify that this object is not yet in the map
         assert!(!self.map.contains(&obj));
