@@ -23,6 +23,7 @@ bytes = "1.0"
 futures = "0.3.13"
 futures-core = "0.3.13"
 lazy_static = "1.4.0"
+log = "0.4.14"
 lru = "0.6.5"
 nvpair = { git = "https://github.com/ahrens/rust-libzfs", branch = "work"}
 rand = "0.8.3"

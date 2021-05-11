@@ -170,14 +170,18 @@ impl DataObjectPhys {
         let buf = object_access.get_object(&Self::key(guid, obj)).await;
         let begin = Instant::now();
         let this: Self = bincode::deserialize(&buf).unwrap();
-        assert_eq!(this.guid, guid);
-        assert_eq!(this.object, obj);
         println!(
             "{:?}: deserialized {} blocks from {} bytes in {}ms",
             obj,
             this.blocks.len(),
             buf.len(),
             begin.elapsed().as_millis()
+        );
+        assert_eq!(this.guid, guid);
+        assert_eq!(this.object, obj);
+        assert_eq!(
+            this.blocks_size as usize,
+            this.blocks.values().map(|x| x.len()).sum::<usize>()
         );
         this
     }
@@ -890,6 +894,7 @@ fn log_deleted_objects(
     deleted_objects: Vec<ObjectID>,
 ) {
     let txg = syncing_state.syncing_txg.unwrap();
+    let begin = Instant::now();
     for obj in deleted_objects {
         syncing_state
             .storage_object_log
@@ -903,6 +908,11 @@ fn log_deleted_objects(
         // aren't any other users of objects_to_delete?
         syncing_state.objects_to_delete.push(obj);
     }
+    println!(
+        "reclaim: logged {} deleted objects in {}ms",
+        syncing_state.objects_to_delete.len(),
+        begin.elapsed().as_millis()
+    );
 }
 
 async fn build_new_frees(
@@ -930,7 +940,7 @@ async fn build_new_frees(
         })
         .await;
     println!(
-        "transferred {} freed blocks in {}ms",
+        "reclaim: transferred {} freed blocks in {}ms",
         syncing_state.stats.pending_frees_count,
         begin.elapsed().as_millis()
     );
@@ -960,7 +970,7 @@ async fn get_object_sizes(
         })
         .await;
     println!(
-        "loaded sizes for {} objects in {}ms",
+        "reclaim: loaded sizes for {} objects in {}ms",
         object_sizes.len(),
         begin.elapsed().as_millis()
     );
@@ -990,7 +1000,7 @@ async fn get_frees_per_obj(
         })
         .await;
     println!(
-        "loaded {} freed blocks in {}ms",
+        "reclaim: loaded {} freed blocks in {}ms",
         count,
         begin.elapsed().as_millis()
     );
@@ -999,20 +1009,20 @@ async fn get_frees_per_obj(
 
 async fn reclaim_frees_object(
     shared_state: Arc<PoolSharedState>,
-    objs: Vec<(ObjectID, Vec<PendingFreesLogEntry>)>,
+    objs: Vec<(ObjectID, u32, Vec<PendingFreesLogEntry>)>,
 ) -> (ObjectID, u32) {
     let first_obj = objs[0].0;
     println!(
-        "rewriting {} objects starting with {:?} to free {} blocks",
+        "reclaim: rewriting {} objects starting with {:?} to free {} blocks",
         objs.len(),
         first_obj,
-        objs.iter().map(|x| x.1.len()).sum::<usize>()
+        objs.iter().map(|x| x.2.len()).sum::<usize>()
     );
 
     let stream = FuturesUnordered::new();
     let mut to_delete = Vec::new();
     let mut first = true;
-    for (obj, frees) in objs {
+    for (obj, obj_size, frees) in objs {
         if !first {
             to_delete.push(obj);
         }
@@ -1024,6 +1034,7 @@ async fn reclaim_frees_object(
                 let mut obj_phys =
                     DataObjectPhys::get(&my_shared_state.object_access, my_shared_state.guid, obj)
                         .await;
+                assert!(obj_size >= obj_phys.blocks_size);
                 for pfle in frees {
                     let removed = obj_phys.blocks.remove(&pfle.block);
                     // If we crashed in the middle of this operation last time, the
@@ -1049,7 +1060,7 @@ async fn reclaim_frees_object(
             a.object = min(a.object, b.object);
             a.txg = min(a.txg, b.txg); // XXX maybe should track min & max txg?
             println!(
-                "moving {} blocks from {:?} to {:?}",
+                "reclaim: moving {} blocks from {:?} to {:?}",
                 b.blocks.len(),
                 b.object,
                 a.object
@@ -1072,7 +1083,7 @@ async fn reclaim_frees_object(
             }
             if already_moved > 0 {
                 println!(
-                    "while moving blocks from {:?} to {:?} found {} blocks already moved",
+                    "reclaim: while moving blocks from {:?} to {:?} found {} blocks already moved",
                     b.object, a.object, already_moved
                 );
             }
@@ -1102,7 +1113,7 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
         return;
     }
     println!(
-        "starting to reclaim space (process pending frees) pending_frees_count={} blocks_count={}",
+        "reclaim: starting; pending_frees_count={} blocks_count={}",
         syncing_state.stats.pending_frees_count, syncing_state.stats.blocks_count
     );
 
@@ -1152,7 +1163,8 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
                 continue;
             }
             // XXX limit amount of outstanding get/put requests?
-            let mut objs_to_consolidate: Vec<(ObjectID, Vec<PendingFreesLogEntry>)> = Vec::new();
+            let mut objs_to_consolidate: Vec<(ObjectID, u32, Vec<PendingFreesLogEntry>)> =
+                Vec::new();
             let mut new_size: u32 = 0;
             assert!(object_sizes.contains_key(&obj));
             let mut first = true;
@@ -1182,7 +1194,7 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
                 let frees = frees_per_obj.remove(later_obj).unwrap_or_default();
                 freed_blocks_count += frees.len() as u64;
                 freed_blocks_bytes += later_bytes_freed as u64;
-                objs_to_consolidate.push((*later_obj, frees));
+                objs_to_consolidate.push((*later_obj, *later_size, frees));
             }
             // XXX look for earlier objects too?
 
@@ -1192,7 +1204,7 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
             writing.insert(obj);
 
             // all but the first object need to be deleted by syncing context
-            for (later_obj, _) in objs_to_consolidate.iter().skip(1) {
+            for (later_obj, _, _) in objs_to_consolidate.iter().skip(1) {
                 //complete.rewritten_object_sizes.push((*obj, 0));
                 deleted_objects.push(*later_obj);
             }
@@ -1236,14 +1248,17 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
         }
 
         println!(
-            "rewrote {} objects in {}ms",
+            "reclaim: rewrote {} objects in {:.1}sec, freeing {} MiB from {} blocks ({:.1}MiB/s)",
             num_handles,
-            begin.elapsed().as_millis(),
+            begin.elapsed().as_secs_f64(),
+            freed_blocks_bytes / 1024 / 1024,
+            freed_blocks_count,
+            ((freed_blocks_bytes as f64 / 1024f64 / 1024f64) / begin.elapsed().as_secs_f64()),
         );
 
         let r = s.send(Box::new(move |syncing_state| {
             Box::pin(async move {
-                println!("reclaim complete; transferring tail of frees to new generation");
+                println!("reclaim: complete; transferring tail of frees to new generation");
 
                 syncing_state.stats.blocks_count -= freed_blocks_count;
                 syncing_state.stats.blocks_bytes -= freed_blocks_bytes;
