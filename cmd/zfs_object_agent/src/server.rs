@@ -1,6 +1,6 @@
 use crate::base_types::*;
 use crate::object_access::ObjectAccess;
-use crate::{object_access, pool::*};
+use crate::pool::*;
 use nvpair::{NvData, NvEncoding, NvList};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -54,8 +54,8 @@ impl Server {
                 match nvl.lookup_string("Type").unwrap().to_str().unwrap() {
                     "get pools" => {
                         println!("got request: {:?}", nvl);
-                        let bucket = Self::get_bucket(&nvl);
-                        server.get_pools(&bucket).await;
+                        let object_access = Self::get_object_access(&nvl);
+                        server.get_pools(&object_access).await;
                     }
                     other => {
                         println!("got request: {:?}", nvl);
@@ -206,8 +206,10 @@ impl Server {
         )
     }
 
-    async fn get_pools(&mut self, bucket: &Bucket) {
-        let objs = object_access::list_objects(&bucket, "zfs/", Some("/super".to_string())).await;
+    async fn get_pools(&mut self, object_access: &ObjectAccess) {
+        let objs = object_access
+            .list_objects("zfs/", Some("/super".to_string()))
+            .await;
         let mut nvl = NvList::new_unique_names();
         for res in objs {
             if let Some(prefixes) = res.common_prefixes {
@@ -216,7 +218,8 @@ impl Server {
                     let vector: Vec<&str> = prefix.prefix.rsplitn(3, "/").collect();
                     let guid: &str = vector[1];
                     let pool_config =
-                        Pool::get_config(&bucket, PoolGUID(str::parse::<u64>(guid).unwrap())).await;
+                        Pool::get_config(object_access, PoolGUID(str::parse::<u64>(guid).unwrap()))
+                            .await;
                     nvl.insert(
                         pool_config.lookup_string("name").unwrap(),
                         pool_config.as_ref(),

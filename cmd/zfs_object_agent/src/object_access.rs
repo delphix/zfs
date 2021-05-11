@@ -228,14 +228,15 @@ impl ObjectAccess {
         }
     }
 
-pub async fn list_objects(
-    bucket: &Bucket,
-    prefix: &str,
-    delimiter: Option<String>,
-) -> Vec<s3::serde_types::ListBucketResult> {
-    let full_prefix = prefixed(prefix);
-    bucket.list(full_prefix, delimiter).await.unwrap()
-}
+    pub async fn list_objects(
+        &self,
+        prefix: &str,
+        delimiter: Option<String>,
+    ) -> Vec<s3::serde_types::ListBucketResult> {
+        let full_prefix = prefixed(prefix);
+        self.bucket.list(full_prefix, delimiter).await.unwrap()
+    }
+
     async fn put_object_impl(&self, key: &str, data: &[u8]) {
         let prefixed_key = &prefixed(key);
         retry(
@@ -337,17 +338,18 @@ pub async fn list_objects(
         let prefixed_key = prefixed(key);
         println!("looking for {}", prefixed_key);
         let begin = Instant::now();
-    match bucket.list(prefixed_key, None).await {
-        Ok(results) => {
-            assert!(results.len() == 1);
-            let list = &results[0];
-            println!("list completed in {}ms", begin.elapsed().as_millis());
-            // Note need to check if this exact name is in the results. If we are looking
-            // for "x/y" and there is "x/y" and "x/yz", both will be returned.
-            list.contents.iter().find(|o| o.key == key).is_some()
-        }
-        Err(_) => {
-            return false;
+        match self.bucket.list(prefixed_key, None).await {
+            Ok(results) => {
+                assert!(results.len() == 1);
+                let list = &results[0];
+                println!("list completed in {}ms", begin.elapsed().as_millis());
+                // Note need to check if this exact name is in the results. If we are looking
+                // for "x/y" and there is "x/y" and "x/yz", both will be returned.
+                list.contents.iter().find(|o| o.key == key).is_some()
+            }
+            Err(_) => {
+                return false;
+            }
         }
     }
 }

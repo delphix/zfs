@@ -292,9 +292,9 @@ impl PoolSyncingState {
 }
 
 impl Pool {
-    pub async fn get_config(bucket: &Bucket, guid: PoolGUID) -> NvList {
-        let pool_phys = PoolPhys::get(bucket, guid).await;
-        let ubphys = UberblockPhys::get(bucket, pool_phys.guid, pool_phys.last_txg).await;
+    pub async fn get_config(object_access: &ObjectAccess, guid: PoolGUID) -> NvList {
+        let pool_phys = PoolPhys::get(object_access, guid).await;
+        let ubphys = UberblockPhys::get(object_access, pool_phys.guid, pool_phys.last_txg).await;
         NvList::try_unpack(&ubphys.zfs_config).unwrap()
     }
 
