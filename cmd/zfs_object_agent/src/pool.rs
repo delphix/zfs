@@ -44,7 +44,7 @@ pub struct UberblockPhys {
     storage_object_log: ObjectBasedLogPhys,
     pending_frees_log: ObjectBasedLogPhys,
     object_size_log: ObjectBasedLogPhys,
-    highest_block: BlockID, // highest blockID in use
+    next_block: BlockID, // next BlockID that can be allocated
     stats: PoolStatsPhys,
     zfs_uberblock: Vec<u8>,
     zfs_config: Vec<u8>,
@@ -267,8 +267,7 @@ struct PoolSyncingState {
     // if we crashed while processing pending frees.
     pending_frees_log: ObjectBasedLog<PendingFreesLogEntry>,
 
-    pending_object: Option<PendingObject>,
-    pending_object_min_block: BlockID,
+    pending_object: PendingObject,
     pending_flushes: Vec<JoinHandle<()>>,
     pub last_txg: TXG,
     pub syncing_txg: Option<TXG>,
@@ -284,9 +283,9 @@ type SyncTask =
     Box<dyn FnOnce(&mut PoolSyncingState) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> + Send>;
 
 #[derive(Debug)]
-struct PendingObject {
-    done: Arc<Semaphore>,
-    phys: DataObjectPhys,
+enum PendingObject {
+    Pending(DataObjectPhys, Arc<Semaphore>), // available to write
+    NotPending(BlockID), // not available to write; this is the next blockID to use
 }
 
 /*
@@ -301,9 +300,16 @@ pub struct PoolSharedState {
 }
 
 impl PoolSyncingState {
+    fn next_block(&self) -> BlockID {
+        match &self.pending_object {
+            PendingObject::Pending(phys, _) => phys.next_block,
+            PendingObject::NotPending(next_block) => *next_block,
+        }
+    }
+
     fn log_free(&mut self, ent: PendingFreesLogEntry) {
         let txg = self.syncing_txg.unwrap();
-        assert_lt!(ent.block, self.pending_object_min_block);
+        assert_lt!(ent.block, self.next_block());
         self.pending_frees_log.append(txg, ent);
         self.stats.pending_frees_count += 1;
         self.stats.pending_frees_bytes += ent.size as u64;
@@ -360,8 +366,7 @@ impl Pool {
                         &format!("zfs/{}/PendingFreesLog", pool_phys.guid),
                         &phys.pending_frees_log,
                     ),
-                    pending_object: None,
-                    pending_object_min_block: phys.highest_block.next(),
+                    pending_object: PendingObject::NotPending(phys.next_block),
                     pending_flushes: Vec::new(),
                     stats: phys.stats,
                     reclaim_cb: None,
@@ -442,7 +447,7 @@ impl Pool {
         );
         */
         //println!("{:#?}", frees);
-        let next_block = Self::next_block_locked(&syncing_state);
+        let next_block = syncing_state.next_block();
         drop(syncing_state);
 
         //println!("opened {:#?}", pool);
@@ -479,8 +484,7 @@ impl Pool {
                             readonly_state.clone(),
                             &format!("zfs/{}/PendingFreesLog", guid),
                         ),
-                        pending_object: None,
-                        pending_object_min_block: BlockID(0),
+                        pending_object: PendingObject::NotPending(BlockID(0)),
                         pending_flushes: Vec::new(),
                         stats: PoolStatsPhys::default(),
                         reclaim_cb: None,
@@ -491,7 +495,7 @@ impl Pool {
                 }),
             };
             let syncing_state = pool.state.syncing_state.try_lock().unwrap();
-            let next_block = Self::next_block_locked(&syncing_state);
+            let next_block = syncing_state.next_block();
             drop(syncing_state);
             (pool, None, next_block)
         } else {
@@ -511,19 +515,26 @@ impl Pool {
         syncing_state.syncing_txg = Some(txg);
         let last_obj = self.state.block_to_obj.read().unwrap().last_obj();
 
-        syncing_state.pending_object = Some(PendingObject {
-            done: Arc::new(Semaphore::new(0)),
-            phys: DataObjectPhys {
-                guid: self.state.readonly_state.guid,
-                object: last_obj.next(),
-                min_block: syncing_state.pending_object_min_block,
-                next_block: syncing_state.pending_object_min_block,
-                min_txg: txg,
-                max_txg: txg,
-                blocks_size: 0,
-                blocks: HashMap::new(),
-            },
-        });
+        match syncing_state.pending_object {
+            PendingObject::NotPending(next_block) => {
+                syncing_state.pending_object = PendingObject::Pending(
+                    DataObjectPhys {
+                        guid: self.state.readonly_state.guid,
+                        object: last_obj.next(),
+                        min_block: next_block,
+                        next_block,
+                        min_txg: txg,
+                        max_txg: txg,
+                        blocks_size: 0,
+                        blocks: HashMap::new(),
+                    },
+                    Arc::new(Semaphore::new(0)),
+                );
+            }
+            _ => {
+                panic!("invalid {:?}", syncing_state.pending_object);
+            }
+        }
     }
 
     pub fn end_txg_cb<F>(&mut self, uberblock: Vec<u8>, config: Vec<u8>, cb: F)
@@ -563,7 +574,7 @@ impl Pool {
                 storage_object_log: syncing_state.storage_object_log.to_phys(),
                 object_size_log: syncing_state.object_size_log.to_phys(),
                 pending_frees_log: syncing_state.pending_frees_log.to_phys(),
-                highest_block: BlockID(syncing_state.pending_object_min_block.0 - 1),
+                next_block: syncing_state.next_block(),
                 zfs_uberblock: uberblock,
                 stats: syncing_state.stats.clone(),
                 zfs_config: config,
@@ -598,7 +609,6 @@ impl Pool {
             // update txg
             syncing_state.last_txg = txg;
             syncing_state.syncing_txg = None;
-            assert!(syncing_state.pending_object.is_none());
 
             // We need to drop the mutex before sending response (in callback).
             // Otherwise we could send the response, and get another request
@@ -649,85 +659,71 @@ impl Pool {
 
         let txg = syncing_state.syncing_txg.unwrap();
 
-        if syncing_state
-            .pending_object
-            .as_ref()
-            .unwrap()
-            .phys
-            .blocks
-            .is_empty()
-        {
-            if !new_pending {
-                syncing_state.pending_object = None;
+        let (obj, next_block) = match &syncing_state.pending_object {
+            PendingObject::Pending(phys, _) => {
+                if phys.blocks.is_empty() {
+                    if !new_pending {
+                        syncing_state.pending_object = PendingObject::NotPending(phys.min_block);
+                    }
+                    return;
+                } else {
+                    (phys.object, phys.next_block)
+                }
             }
-            return;
-        }
-        let min_block = syncing_state.pending_object_min_block;
-        let next_block = syncing_state
-            .pending_object
-            .as_ref()
-            .unwrap()
-            .phys
-            .next_block;
-        {
-            let pending_object = syncing_state.pending_object.as_ref().unwrap();
+            _ => panic!("invalid {:?}", syncing_state.pending_object),
+        };
 
-            assert_eq!(pending_object.phys.min_block, min_block);
-            assert_eq!(pending_object.phys.guid, self.state.readonly_state.guid);
-            assert_eq!(pending_object.phys.min_txg, txg);
-            assert_eq!(pending_object.phys.max_txg, txg);
-        }
-
-        let obj = syncing_state.pending_object.as_mut().unwrap().phys.object;
-        let po = match new_pending {
-            true => syncing_state.pending_object.replace(PendingObject {
-                done: Arc::new(Semaphore::new(0)),
-                phys: DataObjectPhys {
-                    guid: self.state.readonly_state.guid,
-                    object: obj.next(),
-                    min_txg: txg,
-                    max_txg: txg,
-                    min_block: next_block,
-                    next_block,
-                    blocks_size: 0,
-                    blocks: HashMap::new(),
+        let (phys, done) = match {
+            mem::replace(
+                &mut syncing_state.pending_object,
+                match new_pending {
+                    true => PendingObject::Pending(
+                        DataObjectPhys {
+                            guid: self.state.readonly_state.guid,
+                            object: obj.next(),
+                            min_txg: txg,
+                            max_txg: txg,
+                            min_block: next_block,
+                            next_block,
+                            blocks_size: 0,
+                            blocks: HashMap::new(),
+                        },
+                        Arc::new(Semaphore::new(0)),
+                    ),
+                    false => PendingObject::NotPending(next_block),
                 },
-            }),
-            false => syncing_state.pending_object.take(),
-        }
-        .unwrap();
-        assert_eq!(obj, po.phys.object);
+            )
+        } {
+            PendingObject::Pending(phys, done) => (phys, done),
+            _ => panic!("invalid {:?}", syncing_state.pending_object),
+        };
+
+        assert_eq!(phys.guid, self.state.readonly_state.guid);
+        assert_eq!(phys.min_txg, txg);
+        assert_eq!(phys.max_txg, txg);
+
         assert_eq!(
             obj,
             self.state.block_to_obj.read().unwrap().last_obj().next()
         );
-        // reset pending_object for next use
-        syncing_state.pending_object_min_block = next_block;
 
         // increment stats
-        let num_blocks = po.phys.blocks.len() as u32;
-        let num_bytes = po.phys.blocks_size;
-        // XXX consider using debug_assert_eq
-        assert_eq!(
-            num_bytes as usize,
-            po.phys.blocks.values().map(|x| x.len()).sum::<usize>()
-        );
         syncing_state.stats.objects_count += 1;
-        syncing_state.stats.blocks_bytes += num_bytes as u64;
-        syncing_state.stats.blocks_count += num_blocks as u64;
+        syncing_state.stats.blocks_bytes += phys.blocks_size as u64;
+        syncing_state.stats.blocks_count += phys.blocks.len() as u64;
 
         // add to in-memory block->object map
         self.state
             .block_to_obj
             .write()
             .unwrap()
-            .insert(obj, min_block);
+            .insert(obj, phys.min_block);
 
         // log to on-disk block->object map
         syncing_state.storage_object_log.append(
             txg,
             StorageObjectLogEntry::Alloc {
-                first_possible_block: min_block,
+                first_possible_block: phys.min_block,
                 obj,
             },
         );
@@ -737,29 +733,26 @@ impl Pool {
             txg,
             ObjectSizeLogEntry::Exists {
                 obj,
-                num_blocks,
-                num_bytes,
+                num_blocks: phys.blocks.len() as u32,
+                num_bytes: phys.blocks_size,
             },
         );
 
         println!(
             "{:?}: writing {:?}: blocks={} bytes={} min={:?}",
-            txg, obj, num_blocks, num_bytes, min_block
+            txg,
+            obj,
+            phys.blocks.len(),
+            phys.blocks_size,
+            phys.min_block
         );
 
         // write to object store
         let readonly_state = self.state.readonly_state.clone();
         syncing_state.pending_flushes.push(tokio::spawn(async move {
-            po.phys.put(&readonly_state.object_access).await;
-            po.done.close();
+            phys.put(&readonly_state.object_access).await;
+            done.close();
         }));
-    }
-
-    fn next_block_locked(syncing_state: &PoolSyncingState) -> BlockID {
-        match syncing_state.pending_object.as_ref() {
-            Some(po) => po.phys.next_block,
-            None => syncing_state.pending_object_min_block,
-        }
     }
 
     fn do_overwrite_impl(
@@ -819,22 +812,25 @@ impl Pool {
         let mut syncing_state = self.state.syncing_state.try_lock().unwrap();
         assert!(syncing_state.syncing_txg.is_some());
         //assert!(id >= Self::next_block_locked(&syncing_state));
-        if id < Self::next_block_locked(&syncing_state) {
+        if id < syncing_state.next_block() {
             // XXX the design is for this to not happen. Writes must be received
             // in blockID-order. However, for now we allow overwrites during
             // sync to convergence via this slow path.
             return Self::do_overwrite_impl(&self.state, &mut syncing_state, id, data);
         }
 
-        let pending_object = syncing_state.pending_object.as_mut().unwrap();
-        pending_object.phys.blocks_size += data.len() as u32;
-        pending_object.phys.blocks.insert(id, data);
-        assert_ge!(id, pending_object.phys.min_block);
-        assert_ge!(id, pending_object.phys.next_block);
-        pending_object.phys.next_block = id.next();
-        let sem = pending_object.done.clone();
-        let do_flush = pending_object.phys.blocks_size >= MAX_BYTES_PER_OBJECT;
-        (sem, do_flush)
+        let (phys, done) = match &mut syncing_state.pending_object {
+            PendingObject::Pending(phys, done) => (phys, done),
+            _ => panic!("invalid {:?}", syncing_state.pending_object),
+        };
+
+        phys.blocks_size += data.len() as u32;
+        phys.blocks.insert(id, data);
+        assert_ge!(id, phys.min_block);
+        assert_ge!(id, phys.next_block);
+        phys.next_block = id.next();
+        let do_flush = phys.blocks_size >= MAX_BYTES_PER_OBJECT;
+        (done.clone(), do_flush)
     }
 
     pub fn write_block_cb<F>(&mut self, id: BlockID, data: Vec<u8>, cb: F)
@@ -1047,7 +1043,7 @@ async fn reclaim_frees_object(
     let stream = FuturesUnordered::new();
     let mut to_delete = Vec::new();
     let mut first = true;
-    for (obj, obj_size, frees) in objs {
+    for (obj, _, frees) in objs {
         if !first {
             to_delete.push(obj);
         }
