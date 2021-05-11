@@ -269,7 +269,6 @@ struct PoolSyncingState {
 
     pending_object: Option<PendingObject>,
     pending_object_min_block: BlockID,
-    pending_object_max_block: Option<BlockID>, // inclusive
     pending_flushes: Vec<JoinHandle<()>>,
     pub last_txg: TXG,
     pub syncing_txg: Option<TXG>,
@@ -363,7 +362,6 @@ impl Pool {
                     ),
                     pending_object: None,
                     pending_object_min_block: phys.highest_block.next(),
-                    pending_object_max_block: None,
                     pending_flushes: Vec::new(),
                     stats: phys.stats,
                     reclaim_cb: None,
@@ -483,7 +481,6 @@ impl Pool {
                         ),
                         pending_object: None,
                         pending_object_min_block: BlockID(0),
-                        pending_object_max_block: None,
                         pending_flushes: Vec::new(),
                         stats: PoolStatsPhys::default(),
                         reclaim_cb: None,
@@ -666,12 +663,16 @@ impl Pool {
             return;
         }
         let min_block = syncing_state.pending_object_min_block;
-        let max_block = syncing_state.pending_object_max_block.unwrap();
+        let next_block = syncing_state
+            .pending_object
+            .as_ref()
+            .unwrap()
+            .phys
+            .next_block;
         {
-            let pending_object = syncing_state.pending_object.as_mut().unwrap();
+            let pending_object = syncing_state.pending_object.as_ref().unwrap();
 
             assert_eq!(pending_object.phys.min_block, min_block);
-            assert_eq!(pending_object.phys.next_block, max_block.next());
             assert_eq!(pending_object.phys.guid, self.state.readonly_state.guid);
             assert_eq!(pending_object.phys.min_txg, txg);
             assert_eq!(pending_object.phys.max_txg, txg);
@@ -686,8 +687,8 @@ impl Pool {
                     object: obj.next(),
                     min_txg: txg,
                     max_txg: txg,
-                    min_block: max_block.next(),
-                    next_block: max_block.next(),
+                    min_block: next_block,
+                    next_block,
                     blocks_size: 0,
                     blocks: HashMap::new(),
                 },
@@ -701,8 +702,7 @@ impl Pool {
             self.state.block_to_obj.read().unwrap().last_obj().next()
         );
         // reset pending_object for next use
-        syncing_state.pending_object_min_block = max_block.next();
-        syncing_state.pending_object_max_block = None;
+        syncing_state.pending_object_min_block = next_block;
 
         // increment stats
         let num_blocks = po.phys.blocks.len() as u32;
@@ -756,8 +756,8 @@ impl Pool {
     }
 
     fn next_block_locked(syncing_state: &PoolSyncingState) -> BlockID {
-        match syncing_state.pending_object_max_block {
-            Some(max) => max.next(),
+        match syncing_state.pending_object.as_ref() {
+            Some(po) => po.phys.next_block,
             None => syncing_state.pending_object_min_block,
         }
     }
@@ -826,17 +826,6 @@ impl Pool {
             return Self::do_overwrite_impl(&self.state, &mut syncing_state, id, data);
         }
 
-        assert_eq!(
-            syncing_state.pending_object_max_block.is_none(),
-            syncing_state
-                .pending_object
-                .as_ref()
-                .unwrap()
-                .phys
-                .blocks
-                .is_empty()
-        );
-        syncing_state.pending_object_max_block = Some(id);
         let pending_object = syncing_state.pending_object.as_mut().unwrap();
         pending_object.phys.blocks_size += data.len() as u32;
         pending_object.phys.blocks.insert(id, data);
