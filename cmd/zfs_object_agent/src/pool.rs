@@ -8,7 +8,7 @@ use futures::stream::*;
 use more_asserts::*;
 use nvpair::NvList;
 use serde::{Deserialize, Serialize};
-use std::cmp::min;
+use std::cmp::{max, min};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::mem;
 use std::ops::Bound::*;
@@ -63,11 +63,18 @@ impl OnDisk for PoolStatsPhys {}
 
 #[derive(Serialize, Deserialize, Debug)]
 struct DataObjectPhys {
-    guid: PoolGUID,   // redundant with key, for verification
-    object: ObjectID, // redundant with key, for verification
-    blocks_size: u32, // sum of blocks.values().len()
-    // XXX add min/max block ID ?
-    txg: TXG, // for debugging
+    guid: PoolGUID,      // redundant with key, for verification
+    object: ObjectID,    // redundant with key, for verification
+    blocks_size: u32,    // sum of blocks.values().len()
+    min_block: BlockID,  // inclusive (all blocks are >= min_block)
+    next_block: BlockID, // exclusive (all blocks are < next_block)
+
+    // Note: if this object was rewritten to consolidate adjacent objects, the
+    // blocks in this object may have been originally written over a range of
+    // TXG's.
+    min_txg: TXG,
+    max_txg: TXG, // inclusive
+
     blocks: HashMap<BlockID, Vec<u8>>,
 }
 impl OnDisk for DataObjectPhys {}
@@ -167,6 +174,19 @@ impl DataObjectPhys {
         format!("zfs/{}/data/{}", guid, obj)
     }
 
+    fn verify(&self) {
+        assert_eq!(
+            self.blocks_size as usize,
+            self.blocks.values().map(|x| x.len()).sum::<usize>()
+        );
+        assert_le!(self.min_txg, self.max_txg);
+        assert_le!(self.min_block, self.next_block);
+        if !self.blocks.is_empty() {
+            assert_le!(self.min_block, self.blocks.keys().min().unwrap());
+            assert_gt!(self.next_block, self.blocks.keys().max().unwrap());
+        }
+    }
+
     async fn get(object_access: &ObjectAccess, guid: PoolGUID, obj: ObjectID) -> Self {
         let buf = object_access.get_object(&Self::key(guid, obj)).await;
         let begin = Instant::now();
@@ -180,10 +200,7 @@ impl DataObjectPhys {
         );
         assert_eq!(this.guid, guid);
         assert_eq!(this.object, obj);
-        assert_eq!(
-            this.blocks_size as usize,
-            this.blocks.values().map(|x| x.len()).sum::<usize>()
-        );
+        this.verify();
         this
     }
 
@@ -197,6 +214,7 @@ impl DataObjectPhys {
             contents.len(),
             begin.elapsed().as_millis()
         );
+        self.verify();
         object_access
             .put_object(&Self::key(self.guid, self.object), contents)
             .await;
@@ -251,7 +269,7 @@ struct PoolSyncingState {
 
     pending_object: Option<PendingObject>,
     pending_object_min_block: BlockID,
-    pending_object_max_block: Option<BlockID>,
+    pending_object_max_block: Option<BlockID>, // inclusive
     pending_flushes: Vec<JoinHandle<()>>,
     pub last_txg: TXG,
     pub syncing_txg: Option<TXG>,
@@ -501,7 +519,10 @@ impl Pool {
             phys: DataObjectPhys {
                 guid: self.state.readonly_state.guid,
                 object: last_obj.next(),
-                txg,
+                min_block: syncing_state.pending_object_min_block,
+                next_block: syncing_state.pending_object_min_block,
+                min_txg: txg,
+                max_txg: txg,
                 blocks_size: 0,
                 blocks: HashMap::new(),
             },
@@ -649,13 +670,11 @@ impl Pool {
         {
             let pending_object = syncing_state.pending_object.as_mut().unwrap();
 
-            // verify BlockID's are in expected range
-            for b in pending_object.phys.blocks.keys() {
-                assert_ge!(*b, min_block);
-                assert_le!(*b, max_block);
-            }
+            assert_eq!(pending_object.phys.min_block, min_block);
+            assert_eq!(pending_object.phys.next_block, max_block.next());
             assert_eq!(pending_object.phys.guid, self.state.readonly_state.guid);
-            assert_eq!(pending_object.phys.txg, txg);
+            assert_eq!(pending_object.phys.min_txg, txg);
+            assert_eq!(pending_object.phys.max_txg, txg);
         }
 
         let obj = syncing_state.pending_object.as_mut().unwrap().phys.object;
@@ -665,7 +684,10 @@ impl Pool {
                 phys: DataObjectPhys {
                     guid: self.state.readonly_state.guid,
                     object: obj.next(),
-                    txg,
+                    min_txg: txg,
+                    max_txg: txg,
+                    min_block: max_block.next(),
+                    next_block: max_block.next(),
                     blocks_size: 0,
                     blocks: HashMap::new(),
                 },
@@ -740,6 +762,53 @@ impl Pool {
         }
     }
 
+    fn do_overwrite_impl(
+        state: &PoolState,
+        syncing_state: &mut PoolSyncingState,
+        id: BlockID,
+        data: Vec<u8>,
+    ) -> (Arc<Semaphore>, bool) {
+        let obj = state.block_to_obj.read().unwrap().block_to_obj(id);
+        let shared_state = state.readonly_state.clone();
+        let txg = syncing_state.syncing_txg.unwrap();
+        let sem = Arc::new(Semaphore::new(0));
+        let sem2 = sem.clone();
+
+        // lock is needed because client could concurrently overwrite 2
+        // blocks in the same object. If the get/put's from the object store
+        // could run concurrently, the last put could clobber the earlier
+        // ones.
+        let mtx = syncing_state
+            .rewriting_objects
+            .entry(obj)
+            .or_default()
+            .clone();
+
+        tokio::spawn(async move {
+            let _guard = mtx.lock().await;
+            println!("rewriting {:?} to overwrite {:?}", obj, id);
+            let mut obj_phys =
+                DataObjectPhys::get(&shared_state.object_access, shared_state.guid, obj).await;
+            // must have been written this txg
+            assert_eq!(obj_phys.min_txg, txg);
+            assert_eq!(obj_phys.max_txg, txg);
+            let removed = obj_phys.blocks.remove(&id);
+            // this blockID must have been written
+            assert!(removed.is_some());
+
+            // Size must not change.  This way we don't have to change the
+            // accounting, which would require writing a new entry to the
+            // ObjectSizeLog, which is not allowed in this (async) context.
+            // XXX this may be problematic if we switch to ashift=0
+            assert_eq!(removed.unwrap().len(), data.len());
+
+            obj_phys.blocks.insert(id, data);
+            obj_phys.put(&shared_state.object_access).await;
+            sem2.close();
+        });
+        (sem, false)
+    }
+
     // XXX change to return a Future rather than Arc<Sem>?
     fn do_write_impl(&mut self, id: BlockID, data: Vec<u8>) -> (Arc<Semaphore>, bool) {
         // the syncing_state is only held from the thread that owns the Pool
@@ -754,44 +823,7 @@ impl Pool {
             // XXX the design is for this to not happen. Writes must be received
             // in blockID-order. However, for now we allow overwrites during
             // sync to convergence via this slow path.
-            let obj = self.state.block_to_obj.read().unwrap().block_to_obj(id);
-            let shared_state = self.state.readonly_state.clone();
-            let txg = syncing_state.syncing_txg.unwrap();
-            let sem = Arc::new(Semaphore::new(0));
-            let sem2 = sem.clone();
-
-            // lock is needed because client could concurrently overwrite 2
-            // blocks in the same object. If the get/put's from the object store
-            // could run concurrently, the last put could clobber the earlier
-            // ones.
-            let mtx = syncing_state
-                .rewriting_objects
-                .entry(obj)
-                .or_default()
-                .clone();
-
-            tokio::spawn(async move {
-                let _guard = mtx.lock().await;
-                println!("rewriting {:?} to overwrite {:?}", obj, id);
-                let mut obj_phys =
-                    DataObjectPhys::get(&shared_state.object_access, shared_state.guid, obj).await;
-                // must have been written this txg
-                assert_eq!(obj_phys.txg, txg);
-                let removed = obj_phys.blocks.remove(&id);
-                // this blockID must have been written
-                assert!(removed.is_some());
-
-                // Size must not change.  This way we don't have to change the
-                // accounting, which would require writing a new entry to the
-                // ObjectSizeLog, which is not allowed in this (async) context.
-                // XXX this may be problematic if we switch to ashift=0
-                assert_eq!(removed.unwrap().len(), data.len());
-
-                obj_phys.blocks.insert(id, data);
-                obj_phys.put(&shared_state.object_access).await;
-                sem2.close();
-            });
-            return (sem, false);
+            return Self::do_overwrite_impl(&self.state, &mut syncing_state, id, data);
         }
 
         assert_eq!(
@@ -808,6 +840,9 @@ impl Pool {
         let pending_object = syncing_state.pending_object.as_mut().unwrap();
         pending_object.phys.blocks_size += data.len() as u32;
         pending_object.phys.blocks.insert(id, data);
+        assert_ge!(id, pending_object.phys.min_block);
+        assert_ge!(id, pending_object.phys.next_block);
+        pending_object.phys.next_block = id.next();
         let sem = pending_object.done.clone();
         let do_flush = pending_object.phys.blocks_size >= MAX_BYTES_PER_OBJECT;
         (sem, do_flush)
@@ -1014,7 +1049,7 @@ async fn reclaim_frees_object(
 ) -> (ObjectID, u32) {
     let first_obj = objs[0].0;
     println!(
-        "reclaim: rewriting {} objects starting with {:?} to free {} blocks",
+        "reclaim: consolidating {} objects into {:?} to free {} blocks",
         objs.len(),
         first_obj,
         objs.iter().map(|x| x.2.len()).sum::<usize>()
@@ -1035,12 +1070,21 @@ async fn reclaim_frees_object(
                 let mut obj_phys =
                     DataObjectPhys::get(&my_shared_state.object_access, my_shared_state.guid, obj)
                         .await;
+                // XXX This is not true, because the object could have been
+                // rewritten as part of a previous reclaim that we crashed in
+                // the middle of.  In this case the actual size may be larger or
+                // smaller than the ObjectSizeLog Entry, because this object may
+                // have been compacted on its own (shrinking it), or
+                // consolidated with subsequent objects (it could grow or
+                // shrink).
+                /*
                 assert_ge!(
                     obj_size,
                     obj_phys.blocks_size,
                     "{} ObjectSizeLogEntry should be at least as large as actual size",
                     obj,
                 );
+                */
                 for pfle in frees {
                     let removed = obj_phys.blocks.remove(&pfle.block);
                     // If we crashed in the middle of this operation last time, the
@@ -1063,14 +1107,25 @@ async fn reclaim_frees_object(
         .buffered(10)
         .reduce(|mut a, mut b| async move {
             assert_eq!(a.guid, b.guid);
-            a.object = min(a.object, b.object);
-            a.txg = min(a.txg, b.txg); // XXX maybe should track min & max txg?
             println!(
-                "reclaim: moving {} blocks from {:?} to {:?}",
+                "reclaim: moving {} blocks from {:?} (TXG[{},{}] BlockID[{},{})) to {:?} (TXG[{},{}] BlockID[{},{}))",
                 b.blocks.len(),
                 b.object,
-                a.object
+                b.min_txg,
+                b.max_txg,
+                b.min_block,
+                b.next_block,
+                a.object,
+                a.min_txg,
+                a.max_txg,
+                a.min_block,
+                a.next_block,
             );
+            a.object = min(a.object, b.object);
+            a.min_txg = min(a.min_txg, b.min_txg);
+            a.max_txg = max(a.max_txg, b.max_txg);
+            a.min_block = min(a.min_block, b.min_block);
+            a.next_block = max(a.next_block, b.next_block);
             let mut already_moved = 0;
             for (k, v) in b.blocks.drain() {
                 let k2 = k.clone();
