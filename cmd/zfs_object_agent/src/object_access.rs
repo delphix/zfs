@@ -81,7 +81,7 @@ impl ObjectAccess {
         };
         info!("region: {:?}", region);
 
-        let mut iter = creds.split(":");
+        let mut iter = creds.split(':');
         let access_key_id = iter.next().unwrap().trim();
         let secret_access_key = iter.next().unwrap().trim();
         let credentials = s3::creds::Credentials::new(
@@ -232,9 +232,7 @@ impl ObjectAccess {
     }
 
     pub async fn delete_object(&self, key: &str) {
-        let mut v = Vec::new();
-        v.push(key.to_string());
-        self.delete_objects(v).await;
+        self.delete_objects(vec![key.to_string()]).await;
     }
 
     // XXX just have it take ObjectIdentifiers? but they would need to be
@@ -284,7 +282,7 @@ impl ObjectAccess {
                 debug!("list completed in {}ms", begin.elapsed().as_millis());
                 // Note need to check if this exact name is in the results. If we are looking
                 // for "x/y" and there is "x/y" and "x/yz", both will be returned.
-                list.contents.iter().find(|o| o.key == key).is_some()
+                list.contents.iter().any(|o| o.key == key)
             }
             Err(_) => {
                 return false;

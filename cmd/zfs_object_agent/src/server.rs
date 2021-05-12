@@ -221,7 +221,7 @@ impl Server {
             if let Some(prefixes) = res.common_prefixes {
                 for prefix in prefixes {
                     debug!("prefix: {}", prefix.prefix);
-                    let vector: Vec<&str> = prefix.prefix.rsplitn(3, "/").collect();
+                    let vector: Vec<&str> = prefix.prefix.rsplitn(3, '/').collect();
                     let guid: &str = vector[1];
                     let pool_config =
                         Pool::get_config(object_access, PoolGUID(str::parse::<u64>(guid).unwrap()))

@@ -587,7 +587,7 @@ impl Pool {
                 pending_frees_log: syncing_state.pending_frees_log.to_phys(),
                 next_block: syncing_state.next_block(),
                 zfs_uberblock: TerseVec(uberblock),
-                stats: syncing_state.stats.clone(),
+                stats: syncing_state.stats,
                 zfs_config: TerseVec(config),
             };
             u.put(&state.readonly_state.object_access).await;
@@ -1124,13 +1124,12 @@ async fn reclaim_frees_object(
             a.next_block = max(a.next_block, b.next_block);
             let mut already_moved = 0;
             for (k, v) in b.blocks.drain() {
-                let k2 = k.clone();
                 let len = v.len() as u32;
                 match a.blocks.insert(k, v) {
                     Some(old_vec) => {
                         // May have already been transferred in a previous job
                         // during which we crashed before updating the metadata.
-                        assert_eq!(&old_vec, a.blocks.get(&k2).unwrap());
+                        assert_eq!(&old_vec, a.blocks.get(&k).unwrap());
                         already_moved += 1;
                     }
                     None => {
