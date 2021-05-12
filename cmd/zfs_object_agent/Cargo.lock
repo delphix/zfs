@@ -727,6 +727,7 @@ dependencies = [
  "rusoto_s3",
  "rust-s3",
  "serde",
+ "serde_bytes",
  "stream-reduce",
  "tokio",
  "tokio-stream",
@@ -1385,6 +1386,15 @@ dependencies = [
  "serde",
  "thiserror",
  "xml-rs",
+]
+
+[[package]]
+name = "serde_bytes"
+version = "0.11.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16ae07dd2f88a366f15bd0632ba725227018c69a1c8550a927324f8eb8368bb9"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

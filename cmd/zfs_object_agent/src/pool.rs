@@ -9,6 +9,7 @@ use log::*;
 use more_asserts::*;
 use nvpair::NvList;
 use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
 use std::cmp::{max, min};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -86,7 +87,7 @@ struct DataObjectPhys {
     min_txg: TXG,
     max_txg: TXG, // inclusive
 
-    blocks: HashMap<BlockID, Vec<u8>>,
+    blocks: HashMap<BlockID, ByteBuf>,
 }
 impl OnDisk for DataObjectPhys {}
 
@@ -822,7 +823,7 @@ impl Pool {
             // XXX this may be problematic if we switch to ashift=0
             assert_eq!(removed.unwrap().len(), data.len());
 
-            obj_phys.blocks.insert(id, data);
+            obj_phys.blocks.insert(id, ByteBuf::from(data));
             obj_phys.put(&shared_state.object_access).await;
             sem2.close();
         });
@@ -852,7 +853,7 @@ impl Pool {
         };
 
         phys.blocks_size += data.len() as u32;
-        phys.blocks.insert(id, data);
+        phys.blocks.insert(id, ByteBuf::from(data));
         assert_ge!(id, phys.min_block);
         assert_ge!(id, phys.next_block);
         phys.next_block = id.next();
@@ -900,7 +901,8 @@ impl Pool {
                 //println!("{:#?}", self.objects);
                 error!("{:#?}", block);
             }
-            cb(block.blocks.get(&id).unwrap().to_owned()).await;
+            // XXX to_owned() copies the data; would be nice to pass a reference to the callback
+            cb(block.blocks.get(&id).unwrap().to_owned().into_vec()).await;
         });
     }
 
