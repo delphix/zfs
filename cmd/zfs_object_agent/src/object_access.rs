@@ -56,7 +56,7 @@ where
         match f().await {
             Err(e) => {
                 // XXX why can't we use {} with `e`?  lifetime error???
-                debug!("{} returned: {:?}; retrying in {:?}", msg, e, delay);
+                info!("{} returned: {:?}; retrying in {:?}", msg, e, delay);
             }
             Ok(result) => {
                 break result;
@@ -235,17 +235,16 @@ impl ObjectAccess {
         self.delete_objects(vec![key.to_string()]).await;
     }
 
-    // XXX just have it take ObjectIdentifiers? but they would need to be
-    // prefixed already, to avoid creating new ObjectIdentifiers
-    // Note: AWS supports up to 1000 keys per delete_objects request.
-    // XXX should we split them up here?
-    pub async fn delete_objects(&self, keys: Vec<String>) {
+    // return if retry needed
+    // XXX unfortunate that this level of retry can't be handled by retry()
+    // XXX ideally we would only retry the failed deletions, not all of them
+    async fn delete_objects_impl(&self, keys: &Vec<String>) -> bool {
         let msg = format!(
             "delete {} objects including {}",
             keys.len(),
             prefixed(&keys[0])
         );
-        let x = retry(&msg, || async {
+        let output = retry(&msg, || async {
             let v: Vec<_> = keys
                 .iter()
                 .map(|x| ObjectIdentifier {
@@ -264,11 +263,24 @@ impl ObjectAccess {
             self.client.delete_objects(req).await
         })
         .await;
-        if let Some(errs) = x.errors {
+        if let Some(errs) = output.errors {
+            if !errs.is_empty() {}
             for err in errs {
-                panic!("error from s3: {:?}", err);
+                info!("delete: error from s3; retrying in 100ms: {:?}", err);
             }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            return true;
         }
+        return false;
+    }
+
+    // XXX just have it take ObjectIdentifiers? but they would need to be
+    // prefixed already, to avoid creating new ObjectIdentifiers
+    // Note: AWS supports up to 1000 keys per delete_objects request.
+    // XXX should we split them up here?
+    pub async fn delete_objects(&self, keys: Vec<String>) {
+        while self.delete_objects_impl(&keys).await {}
     }
 
     pub async fn object_exists(&self, key: &str) -> bool {
