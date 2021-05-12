@@ -8,6 +8,7 @@ edition = "2018"
 
 [dependencies]
 chrono = "0.4"
+clap = "2"
 fern = "0.6"
 libzoa = { path = "../" }
 log = "0.4"

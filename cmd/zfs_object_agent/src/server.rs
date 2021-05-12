@@ -47,14 +47,16 @@ impl Server {
         tokio::spawn(async move {
             loop {
                 let nvl = match Self::get_next_request(&mut server.input).await {
-                    Err(_) => {
-                        continue;
+                    Err(e) => {
+                        info!("got error reading from user connection: {:?}", e);
+                        return;
                     }
                     Ok(nvl) => nvl,
                 };
                 match nvl.lookup_string("Type").unwrap().to_str().unwrap() {
                     "get pools" => {
-                        debug!("got request: {:?}", nvl);
+                        // XXX nvl includes credentials; need to redact?
+                        info!("got request: {:?}", nvl);
                         let object_access = Self::get_object_access(&nvl);
                         server.get_pools(&object_access).await;
                     }
@@ -98,7 +100,10 @@ impl Server {
                     }
                     Ok(getreq_result) => match getreq_result {
                         Err(_) => {
-                            error!("got error reading from connection: {:?}", getreq_result);
+                            info!(
+                                "got error reading from kernel connection: {:?}",
+                                getreq_result
+                            );
                             return;
                         }
                         Ok(mynvl) => mynvl,
@@ -106,6 +111,7 @@ impl Server {
                 };
                 match nvl.lookup_string("Type").unwrap().to_str().unwrap() {
                     "create pool" => {
+                        // XXX nvl includes credentials; need to redact?
                         info!("got request: {:?}", nvl);
                         let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
                         let name = nvl.lookup_string("name").unwrap();
@@ -115,6 +121,7 @@ impl Server {
                             .await;
                     }
                     "open pool" => {
+                        // XXX nvl includes credentials; need to redact?
                         info!("got request: {:?}", nvl);
                         let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
                         let object_access = Self::get_object_access(nvl.as_ref());
@@ -336,34 +343,41 @@ fn create_listener(path: String) -> UnixListener {
     UnixListener::bind(&path).unwrap()
 }
 
-pub async fn do_server(socket_path: &str) {
-    let ksocket_name = str::replace(socket_path, "{}", "kernel");
-    let usocket_name = str::replace(socket_path, "{}", "user");
+pub async fn do_server(socket_dir: &str) {
+    let ksocket_name = format!("{}/zfs_kernel_socket", socket_dir);
+    let usocket_name = format!("{}/zfs_user_socket", socket_dir);
 
-    let klistener = create_listener(ksocket_name);
-    let ulistener = create_listener(usocket_name);
+    let klistener = create_listener(ksocket_name.clone());
+    let ulistener = create_listener(usocket_name.clone());
 
-    tokio::spawn(async move {
+    let ujh = tokio::spawn(async move {
         loop {
             match ulistener.accept().await {
                 Ok((socket, _)) => {
+                    info!("accepted connection on {}", usocket_name);
                     self::Server::ustart(socket);
                 }
                 Err(e) => {
-                    warn!("user accept() failed: {}", e);
+                    warn!("accept() on {} failed: {}", usocket_name, e);
                 }
             }
         }
     });
 
-    loop {
-        match klistener.accept().await {
-            Ok((socket, _)) => {
-                self::Server::start(socket);
-            }
-            Err(e) => {
-                warn!("kernel accept() failed: {}", e);
+    let kjh = tokio::spawn(async move {
+        loop {
+            match klistener.accept().await {
+                Ok((socket, _)) => {
+                    info!("accepted connection on {}", ksocket_name);
+                    self::Server::start(socket);
+                }
+                Err(e) => {
+                    warn!("accept() on {} failed: {}", ksocket_name, e);
+                }
             }
         }
-    }
+    });
+
+    ujh.await.unwrap();
+    kjh.await.unwrap();
 }
