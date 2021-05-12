@@ -602,20 +602,36 @@ impl Pool {
 
             // Now that the metadata state has been atomically moved forward, we
             // can delete objects that are no longer needed
-            for objs in syncing_state.objects_to_delete.chunks(900) {
-                let state = state.clone();
-                // Note: we don't care about waiting for the frees to complete.
-                let mut v = Vec::new();
-                for obj in objs {
-                    let key = DataObjectPhys::key(state.readonly_state.guid, *obj);
-                    v.push(key);
+            // Note: we don't care about waiting for the frees to complete.
+            // XXX need some mechanism to clean up these objects if we crash
+            // Note: we intentionally issue the delete calls serially because
+            // AWS doesn't like getting a lot of them at the same time (it
+            // returns HTTP 503 "Please reduce your request rate.")
+            let objects_to_delete = syncing_state.objects_to_delete.split_off(0);
+            let my_state = state.clone();
+            tokio::spawn(async move {
+                let begin = Instant::now();
+                let len = objects_to_delete.len();
+                for objs in objects_to_delete.chunks(900) {
+                    let mut v = Vec::new();
+                    for obj in objs {
+                        let key = DataObjectPhys::key(my_state.readonly_state.guid, *obj);
+                        v.push(key);
+                    }
+                    my_state
+                        .readonly_state
+                        .object_access
+                        .delete_objects(v)
+                        .await;
                 }
-                tokio::spawn(async move {
-                    state.readonly_state.object_access.delete_objects(v).await;
-                });
-            }
-            syncing_state.objects_to_delete.clear();
-            syncing_state.objects_to_delete.shrink_to_fit();
+                if len != 0 {
+                    info!(
+                        "deleted {} objects in {}ms",
+                        len,
+                        begin.elapsed().as_millis()
+                    );
+                }
+            });
 
             // update txg
             syncing_state.last_txg = txg;

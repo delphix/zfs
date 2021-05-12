@@ -56,7 +56,7 @@ where
         match f().await {
             Err(e) => {
                 // XXX why can't we use {} with `e`?  lifetime error???
-                info!("{} returned: {:?}; retrying in {:?}", msg, e, delay);
+                debug!("{} returned: {:?}; retrying in {:?}", msg, e, delay);
             }
             Ok(result) => {
                 break result;
@@ -266,7 +266,7 @@ impl ObjectAccess {
         if let Some(errs) = output.errors {
             if !errs.is_empty() {}
             for err in errs {
-                info!("delete: error from s3; retrying in 100ms: {:?}", err);
+                debug!("delete: error from s3; retrying in 100ms: {:?}", err);
             }
 
             tokio::time::sleep(Duration::from_millis(100)).await;
