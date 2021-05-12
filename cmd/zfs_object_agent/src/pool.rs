@@ -5,11 +5,13 @@ use core::future::Future;
 use futures::future;
 use futures::future::*;
 use futures::stream::*;
+use log::*;
 use more_asserts::*;
 use nvpair::NvList;
 use serde::{Deserialize, Serialize};
 use std::cmp::{max, min};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::mem;
 use std::ops::Bound::*;
 use std::pin::Pin;
@@ -46,10 +48,19 @@ pub struct UberblockPhys {
     object_size_log: ObjectBasedLogPhys,
     next_block: BlockID, // next BlockID that can be allocated
     stats: PoolStatsPhys,
-    zfs_uberblock: Vec<u8>,
-    zfs_config: Vec<u8>,
+    zfs_uberblock: TerseVec<u8>,
+    zfs_config: TerseVec<u8>,
 }
 impl OnDisk for UberblockPhys {}
+
+/// exists just to reduce Debug output on fields we don't really care about
+#[derive(Serialize, Deserialize)]
+pub struct TerseVec<T>(Vec<T>);
+impl<T> fmt::Debug for TerseVec<T> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.write_fmt(format_args!("[...{} elements...]", self.0.len()))
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Copy)]
 struct PoolStatsPhys {
@@ -126,13 +137,13 @@ impl PoolPhys {
     async fn get(object_access: &ObjectAccess, guid: PoolGUID) -> Self {
         let buf = object_access.get_object(&Self::key(guid)).await;
         let this: Self = bincode::deserialize(&buf).unwrap();
-        println!("got {:#?}", this);
+        debug!("got {:#?}", this);
         assert_eq!(this.guid, guid);
         this
     }
 
     async fn put(&self, object_access: &ObjectAccess) {
-        println!("putting {:#?}", self);
+        debug!("putting {:#?}", self);
         let buf = bincode::serialize(&self).unwrap();
         object_access.put_object(&Self::key(self.guid), buf).await;
     }
@@ -144,24 +155,24 @@ impl UberblockPhys {
     }
 
     pub fn get_zfs_uberblock(&self) -> &Vec<u8> {
-        &self.zfs_uberblock
+        &self.zfs_uberblock.0
     }
 
     pub fn get_zfs_config(&self) -> &Vec<u8> {
-        &self.zfs_config
+        &self.zfs_config.0
     }
 
     async fn get(object_access: &ObjectAccess, guid: PoolGUID, txg: TXG) -> Self {
         let buf = object_access.get_object(&Self::key(guid, txg)).await;
         let this: Self = bincode::deserialize(&buf).unwrap();
-        println!("got {:#?}", this);
+        debug!("got {:#?}", this);
         assert_eq!(this.guid, guid);
         assert_eq!(this.txg, txg);
         this
     }
 
     async fn put(&self, object_access: &ObjectAccess) {
-        println!("putting {:#?}", self);
+        debug!("putting {:#?}", self);
         let buf = bincode::serialize(&self).unwrap();
         object_access
             .put_object(&Self::key(self.guid, self.txg), buf)
@@ -191,7 +202,7 @@ impl DataObjectPhys {
         let buf = object_access.get_object(&Self::key(guid, obj)).await;
         let begin = Instant::now();
         let this: Self = bincode::deserialize(&buf).unwrap();
-        println!(
+        debug!(
             "{:?}: deserialized {} blocks from {} bytes in {}ms",
             obj,
             this.blocks.len(),
@@ -207,7 +218,7 @@ impl DataObjectPhys {
     async fn put(&self, object_access: &ObjectAccess) {
         let begin = Instant::now();
         let contents = bincode::serialize(&self).unwrap();
-        println!(
+        debug!(
             "{:?}: serialized {} blocks in {} bytes in {}ms",
             self.object,
             self.blocks.len(),
@@ -320,7 +331,7 @@ impl Pool {
     pub async fn get_config(object_access: &ObjectAccess, guid: PoolGUID) -> NvList {
         let pool_phys = PoolPhys::get(object_access, guid).await;
         let ubphys = UberblockPhys::get(object_access, pool_phys.guid, pool_phys.last_txg).await;
-        NvList::try_unpack(&ubphys.zfs_config).unwrap()
+        NvList::try_unpack(&ubphys.zfs_config.0).unwrap()
     }
 
     pub async fn create(object_access: &ObjectAccess, name: &str, guid: PoolGUID) {
@@ -410,7 +421,7 @@ impl Pool {
                 future::ready(())
             })
             .await;
-        println!(
+        info!(
             "loaded mapping with {} allocs and {} frees in {}ms",
             num_alloc_entries,
             num_free_entries,
@@ -575,9 +586,9 @@ impl Pool {
                 object_size_log: syncing_state.object_size_log.to_phys(),
                 pending_frees_log: syncing_state.pending_frees_log.to_phys(),
                 next_block: syncing_state.next_block(),
-                zfs_uberblock: uberblock,
+                zfs_uberblock: TerseVec(uberblock),
                 stats: syncing_state.stats.clone(),
-                zfs_config: config,
+                zfs_config: TerseVec(config),
             };
             u.put(&state.readonly_state.object_access).await;
 
@@ -738,7 +749,7 @@ impl Pool {
             },
         );
 
-        println!(
+        debug!(
             "{:?}: writing {:?}: blocks={} bytes={} min={:?}",
             txg,
             obj,
@@ -779,7 +790,7 @@ impl Pool {
 
         tokio::spawn(async move {
             let _guard = mtx.lock().await;
-            println!("rewriting {:?} to overwrite {:?}", obj, id);
+            debug!("rewriting {:?} to overwrite {:?}", obj, id);
             let mut obj_phys =
                 DataObjectPhys::get(&shared_state.object_access, shared_state.guid, obj).await;
             // must have been written this txg
@@ -861,7 +872,7 @@ impl Pool {
         //let state = self.state.clone();
 
         tokio::spawn(async move {
-            println!("reading {:?} for {:?}", obj, id);
+            debug!("reading {:?} for {:?}", obj, id);
             let block =
                 DataObjectPhys::get(&readonly_state.object_access, readonly_state.guid, obj).await;
             // XXX consider using debug_assert_eq
@@ -871,7 +882,7 @@ impl Pool {
             );
             if block.blocks.get(&id).is_none() {
                 //println!("{:#?}", self.objects);
-                println!("{:#?}", block);
+                error!("{:#?}", block);
             }
             cb(block.blocks.get(&id).unwrap().to_owned()).await;
         });
@@ -929,7 +940,7 @@ fn log_deleted_objects(
         // aren't any other users of objects_to_delete?
         syncing_state.objects_to_delete.push(obj);
     }
-    println!(
+    info!(
         "reclaim: logged {} deleted objects in {}ms",
         syncing_state.objects_to_delete.len(),
         begin.elapsed().as_millis()
@@ -960,7 +971,7 @@ async fn build_new_frees(
             future::ready(())
         })
         .await;
-    println!(
+    info!(
         "reclaim: transferred {} freed blocks in {}ms",
         syncing_state.stats.pending_frees_count,
         begin.elapsed().as_millis()
@@ -990,7 +1001,7 @@ async fn get_object_sizes(
             future::ready(())
         })
         .await;
-    println!(
+    info!(
         "reclaim: loaded sizes for {} objects in {}ms",
         object_sizes.len(),
         begin.elapsed().as_millis()
@@ -1020,7 +1031,7 @@ async fn get_frees_per_obj(
             future::ready(())
         })
         .await;
-    println!(
+    info!(
         "reclaim: loaded {} freed blocks in {}ms",
         count,
         begin.elapsed().as_millis()
@@ -1033,7 +1044,7 @@ async fn reclaim_frees_object(
     objs: Vec<(ObjectID, u32, Vec<PendingFreesLogEntry>)>,
 ) -> (ObjectID, u32) {
     let first_obj = objs[0].0;
-    println!(
+    debug!(
         "reclaim: consolidating {} objects into {:?} to free {} blocks",
         objs.len(),
         first_obj,
@@ -1092,7 +1103,7 @@ async fn reclaim_frees_object(
         .buffered(10)
         .reduce(|mut a, mut b| async move {
             assert_eq!(a.guid, b.guid);
-            println!(
+            debug!(
                 "reclaim: moving {} blocks from {:?} (TXG[{},{}] BlockID[{},{})) to {:?} (TXG[{},{}] BlockID[{},{}))",
                 b.blocks.len(),
                 b.object,
@@ -1128,7 +1139,7 @@ async fn reclaim_frees_object(
                 }
             }
             if already_moved > 0 {
-                println!(
+                debug!(
                     "reclaim: while moving blocks from {:?} to {:?} found {} blocks already moved",
                     b.object, a.object, already_moved
                 );
@@ -1158,7 +1169,7 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
     {
         return;
     }
-    println!(
+    info!(
         "reclaim: starting; pending_frees_count={} blocks_count={}",
         syncing_state.stats.pending_frees_count, syncing_state.stats.blocks_count
     );
@@ -1293,7 +1304,7 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
             rewritten_object_sizes.push((obj, size));
         }
 
-        println!(
+        info!(
             "reclaim: rewrote {} objects in {:.1}sec, freeing {} MiB from {} blocks ({:.1}MiB/s)",
             num_handles,
             begin.elapsed().as_secs_f64(),
@@ -1304,7 +1315,7 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
 
         let r = s.send(Box::new(move |syncing_state| {
             Box::pin(async move {
-                println!("reclaim: complete; transferring tail of frees to new generation");
+                info!("reclaim: complete; transferring tail of frees to new generation");
 
                 syncing_state.stats.blocks_count -= freed_blocks_count;
                 syncing_state.stats.blocks_bytes -= freed_blocks_bytes;

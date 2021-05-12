@@ -5,6 +5,7 @@ use futures::future;
 use futures::future::join_all;
 use futures::stream::{FuturesOrdered, StreamExt};
 use futures_core::Stream;
+use log::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -48,7 +49,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLogChunk<T> {
             .await;
         let begin = Instant::now();
         let this: Self = bincode::deserialize(&buf).unwrap();
-        println!(
+        debug!(
             "deserialized {} log entries in {}ms",
             this.entries.len(),
             begin.elapsed().as_millis()
@@ -61,7 +62,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLogChunk<T> {
     async fn put(&self, object_access: &ObjectAccess, name: &str) {
         let begin = Instant::now();
         let buf = bincode::serialize(&self).unwrap();
-        println!(
+        debug!(
             "serialized {} log entries in {}ms",
             self.entries.len(),
             begin.elapsed().as_millis()
@@ -231,7 +232,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         // XXX or retire this in favor of the iterate() interface
         stream
             .for_each(|mut chunk| {
-                println!(
+                debug!(
                     "appending {} entries of chunk {}",
                     chunk.entries.len(),
                     chunk.chunk
@@ -241,7 +242,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
             })
             .await;
 
-        println!("got {} entries total", entries.len());
+        debug!("got {} entries total", entries.len());
         entries
     }
 
@@ -270,7 +271,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
             stream! {
                 while let Some(fut) = buffered_stream.next().await {
                     let chunk = fut;
-                    println!("yielding entries of chunk {}", chunk.chunk);
+                    trace!("yielding entries of chunk {}", chunk.chunk);
                     for ent in chunk.entries {
                         yield ent;
                     }

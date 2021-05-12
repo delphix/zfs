@@ -4,6 +4,7 @@ use bytes::Bytes;
 use core::time::Duration;
 use futures::Future;
 use lazy_static::lazy_static;
+use log::*;
 use lru::LruCache;
 use rand::prelude::*;
 use rusoto_core::{ByteStream, RusotoError};
@@ -48,14 +49,14 @@ where
     E: core::fmt::Debug + core::fmt::Display + std::error::Error,
     F: Future<Output = Result<O, RusotoError<E>>>,
 {
-    println!("{}: begin", msg);
+    debug!("{}: begin", msg);
     let begin = Instant::now();
     let mut delay = Duration::from_secs_f64(thread_rng().gen_range(0.001..0.2));
     let result = loop {
         match f().await {
             Err(e) => {
                 // XXX why can't we use {} with `e`?  lifetime error???
-                println!("{} returned: {:?}; retrying in {:?}", msg, e, delay);
+                debug!("{} returned: {:?}; retrying in {:?}", msg, e, delay);
             }
             Ok(result) => {
                 break result;
@@ -64,7 +65,7 @@ where
         tokio::time::sleep(delay).await;
         delay = delay.mul_f64(thread_rng().gen_range(1.5..2.5));
     };
-    println!(
+    debug!(
         "{}: returned success in {}ms",
         msg,
         begin.elapsed().as_millis()
@@ -73,13 +74,12 @@ where
 }
 
 impl ObjectAccess {
-    pub fn new(endpoint: &str, region: &str, bucket: &str, creds: &str) -> Self {
+    pub fn new(endpoint: &str, region_str: &str, bucket: &str, creds: &str) -> Self {
         let region = s3::Region::Custom {
-            region: region.to_owned(),
+            region: region_str.to_owned(),
             endpoint: endpoint.to_owned(),
         };
-        println!("region: {:?}", region);
-        println!("Endpoint: {}", region.endpoint());
+        info!("region: {:?}", region);
 
         let mut iter = creds.split(":");
         let access_key_id = iter.next().unwrap().trim();
@@ -130,7 +130,7 @@ impl ObjectAccess {
             .read_to_end(&mut v)
             .await
             .unwrap();
-        println!(
+        debug!(
             "{}: got {} bytes of data in additional {}ms",
             msg,
             v.len(),
@@ -153,7 +153,7 @@ impl ObjectAccess {
                 let mykey = key.to_string();
                 match c.cache.get(&mykey) {
                     Some(v) => {
-                        println!("found {} in cache", key);
+                        debug!("found {} in cache", key);
                         return v.clone();
                     }
                     None => match c.reading.get(key) {
@@ -163,7 +163,7 @@ impl ObjectAccess {
                             reader = true;
                         }
                         Some(sem) => {
-                            println!("found {} read in progress", key);
+                            debug!("found {} read in progress", key);
                             mysem = sem.clone();
                             reader = false;
                         }
@@ -223,7 +223,7 @@ impl ObjectAccess {
             let mut c = CACHE.lock().unwrap();
             let mykey = key.to_string();
             if c.cache.contains(&mykey) {
-                println!("found {} in cache when putting - invalidating", key);
+                debug!("found {} in cache when putting - invalidating", key);
                 c.cache.put(mykey, Arc::new(data.clone()));
             }
         }
@@ -275,13 +275,13 @@ impl ObjectAccess {
 
     pub async fn object_exists(&self, key: &str) -> bool {
         let prefixed_key = prefixed(key);
-        println!("looking for {}", prefixed_key);
+        debug!("looking for {}", prefixed_key);
         let begin = Instant::now();
         match self.bucket.list(prefixed_key, None).await {
             Ok(results) => {
                 assert_eq!(results.len(), 1);
                 let list = &results[0];
-                println!("list completed in {}ms", begin.elapsed().as_millis());
+                debug!("list completed in {}ms", begin.elapsed().as_millis());
                 // Note need to check if this exact name is in the results. If we are looking
                 // for "x/y" and there is "x/y" and "x/yz", both will be returned.
                 list.contents.iter().find(|o| o.key == key).is_some()

@@ -1,6 +1,7 @@
 use crate::base_types::*;
 use crate::object_access::ObjectAccess;
 use crate::pool::*;
+use log::*;
 use nvpair::{NvData, NvEncoding, NvList};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -53,13 +54,12 @@ impl Server {
                 };
                 match nvl.lookup_string("Type").unwrap().to_str().unwrap() {
                     "get pools" => {
-                        println!("got request: {:?}", nvl);
+                        debug!("got request: {:?}", nvl);
                         let object_access = Self::get_object_access(&nvl);
                         server.get_pools(&object_access).await;
                     }
                     other => {
-                        println!("got request: {:?}", nvl);
-                        panic!("bad type {:?}", other);
+                        panic!("bad type {:?} in request {:?}", other, nvl);
                     }
                 }
             }
@@ -98,7 +98,7 @@ impl Server {
                     }
                     Ok(getreq_result) => match getreq_result {
                         Err(_) => {
-                            println!("got error reading from connection: {:?}", getreq_result);
+                            error!("got error reading from connection: {:?}", getreq_result);
                             return;
                         }
                         Ok(mynvl) => mynvl,
@@ -106,7 +106,7 @@ impl Server {
                 };
                 match nvl.lookup_string("Type").unwrap().to_str().unwrap() {
                     "create pool" => {
-                        println!("got request: {:?}", nvl);
+                        info!("got request: {:?}", nvl);
                         let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
                         let name = nvl.lookup_string("name").unwrap();
                         let object_access = Self::get_object_access(nvl.as_ref());
@@ -115,22 +115,22 @@ impl Server {
                             .await;
                     }
                     "open pool" => {
-                        println!("got request: {:?}", nvl);
+                        info!("got request: {:?}", nvl);
                         let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
                         let object_access = Self::get_object_access(nvl.as_ref());
                         server.open_pool(&object_access, guid).await;
                     }
                     "begin txg" => {
-                        println!("got request: {:?}", nvl);
+                        debug!("got request: {:?}", nvl);
                         let txg = TXG(nvl.lookup_uint64("TXG").unwrap());
                         server.begin_txg(txg);
                     }
                     "flush writes" => {
-                        println!("got request: {:?}", nvl);
+                        trace!("got request: {:?}", nvl);
                         server.flush_writes();
                     }
                     "end txg" => {
-                        println!("got request: {:?}", nvl);
+                        debug!("got request: {:?}", nvl);
                         let uberblock = nvl.lookup("uberblock").unwrap().data();
                         let config = nvl.lookup("config").unwrap().data();
                         if let NvData::Uint8Array(slice) = uberblock {
@@ -148,7 +148,7 @@ impl Server {
                         let data = nvl.lookup("data").unwrap().data();
                         let id = nvl.lookup_uint64("request_id").unwrap();
                         if let NvData::Uint8Array(slice) = data {
-                            println!(
+                            trace!(
                                 "got write request id={}: {:?} len={}",
                                 id,
                                 block,
@@ -160,20 +160,19 @@ impl Server {
                         }
                     }
                     "free block" => {
-                        println!("got request: {:?}", nvl);
+                        trace!("got request: {:?}", nvl);
                         let block = BlockID(nvl.lookup_uint64("block").unwrap());
                         let size = nvl.lookup_uint64("size").unwrap();
                         server.free_block(block, size as u32);
                     }
                     "read block" => {
-                        println!("got request: {:?}", nvl);
+                        trace!("got request: {:?}", nvl);
                         let block = BlockID(nvl.lookup_uint64("block").unwrap());
                         let id = nvl.lookup_uint64("request_id").unwrap();
                         server.read_block(block, id);
                     }
                     other => {
-                        println!("got request: {:?}", nvl);
-                        panic!("bad type {:?}", other);
+                        panic!("bad type {:?} in request {:?}", other, nvl);
                     }
                 }
             }
@@ -214,7 +213,7 @@ impl Server {
         for res in objs {
             if let Some(prefixes) = res.common_prefixes {
                 for prefix in prefixes {
-                    println!("prefix: {}", prefix.prefix);
+                    debug!("prefix: {}", prefix.prefix);
                     let vector: Vec<&str> = prefix.prefix.rsplitn(3, "/").collect();
                     let guid: &str = vector[1];
                     let pool_config =
@@ -228,7 +227,7 @@ impl Server {
                 }
             }
         }
-        println!("sending response: {:?}", nvl);
+        debug!("sending response: {:?}", nvl);
         Self::send_response(&self.output, nvl).await;
     }
 
@@ -237,7 +236,7 @@ impl Server {
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "pool create done").unwrap();
         nvl.insert("GUID", &guid.0).unwrap();
-        println!("sending response: {:?}", nvl);
+        debug!("sending response: {:?}", nvl);
         Self::send_response(&self.output, nvl).await;
     }
 
@@ -255,7 +254,7 @@ impl Server {
         }
 
         nvl.insert("next_block", &next_block.0).unwrap();
-        println!("sending response: {:?}", nvl);
+        debug!("sending response: {:?}", nvl);
         Self::send_response(&self.output, nvl).await;
     }
 
@@ -276,7 +275,7 @@ impl Server {
         pool.end_txg_cb(uberblock, config, async move {
             let mut nvl = NvList::new_unique_names();
             nvl.insert("Type", "end txg done").unwrap();
-            println!("sending response: {:?}", nvl);
+            debug!("sending response: {:?}", nvl);
             Self::send_response(&output, nvl).await;
         });
     }
@@ -300,7 +299,7 @@ impl Server {
             nvl.insert("Type", "write done").unwrap();
             nvl.insert("block", &block.0).unwrap();
             nvl.insert("request_id", &request_id).unwrap();
-            println!("sending response: {:?}", nvl);
+            trace!("sending response: {:?}", nvl);
             Self::send_response(&output, nvl).await;
         });
     }
@@ -320,7 +319,7 @@ impl Server {
             nvl.insert("block", &block.0).unwrap();
             nvl.insert("request_id", &request_id).unwrap();
             nvl.insert("data", data.as_slice()).unwrap();
-            println!(
+            trace!(
                 "sending read done response: block={} req={} data=[{} bytes]",
                 block,
                 request_id,
@@ -333,7 +332,7 @@ impl Server {
 
 fn create_listener(path: String) -> UnixListener {
     let _ = std::fs::remove_file(&path);
-    println!("Listening on: {}", path);
+    info!("Listening on: {}", path);
     UnixListener::bind(&path).unwrap()
 }
 
@@ -351,7 +350,7 @@ pub async fn do_server(socket_path: &str) {
                     self::Server::ustart(socket);
                 }
                 Err(e) => {
-                    println!("user accept() failed: {}", e);
+                    warn!("user accept() failed: {}", e);
                 }
             }
         }
@@ -363,7 +362,7 @@ pub async fn do_server(socket_path: &str) {
                 self::Server::start(socket);
             }
             Err(e) => {
-                println!("kernel accept() failed: {}", e);
+                warn!("kernel accept() failed: {}", e);
             }
         }
     }
