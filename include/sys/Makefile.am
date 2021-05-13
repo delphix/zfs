@@ -61,6 +61,7 @@ COMMON_H = \
 	sa.h \
 	sa_impl.h \
 	skein.h \
+	sock.h \
 	spa_boot.h \
 	spa_checkpoint.h \
 	spa_log_spacemap.h \

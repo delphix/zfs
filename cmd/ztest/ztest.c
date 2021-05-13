@@ -164,6 +164,12 @@ enum ztest_class_state {
 typedef struct ztest_shared_opts {
 	char zo_pool[ZFS_MAX_DATASET_NAME_LEN];
 	char zo_dir[ZFS_MAX_DATASET_NAME_LEN];
+	int zo_obj_store;
+	char zo_obj_store_endpoint[MAXPATHLEN];
+	char zo_obj_store_region[MAXNAMELEN];
+	char zo_obj_store_bucket[MAXNAMELEN];
+	char zo_obj_store_creds_file[MAXPATHLEN];
+	char zo_obj_store_creds[MAXNAMELEN];
 	char zo_alt_ztest[MAXNAMELEN];
 	char zo_alt_libpath[MAXNAMELEN];
 	uint64_t zo_vdevs;
@@ -195,6 +201,11 @@ typedef struct ztest_shared_opts {
 static const ztest_shared_opts_t ztest_opts_defaults = {
 	.zo_pool = "ztest",
 	.zo_dir = "/tmp",
+	.zo_obj_store = 0,
+	.zo_obj_store_endpoint = "https://s3-us-west-2.amazonaws.com",
+	.zo_obj_store_region = "us-west-2",
+	.zo_obj_store_bucket = { '\0' },
+	.zo_obj_store_creds_file = "file:///etc/zfs/zpool_credentials",
 	.zo_alt_ztest = { '\0' },
 	.zo_alt_libpath = { '\0' },
 	.zo_vdevs = 5,
@@ -714,6 +725,10 @@ usage(boolean_t requested)
 	    "\t[-k kill_percentage (default: %llu%%)]\n"
 	    "\t[-p pool_name (default: %s)]\n"
 	    "\t[-f dir (default: %s)] file directory for vdev files\n"
+	    "\t[-O object store endpoint (default: %s)]\n"
+	    "\t[-A object store region (default: %s)]\n"
+	    "\t[-b object store bucket]\n"
+	    "\t[-z object store credentials file (default: %s)]\n"
 	    "\t[-M] Multi-host simulate pool imported on remote host\n"
 	    "\t[-V] verbose (use multiple times for ever more blather)\n"
 	    "\t[-E] use existing pool instead of creating new one\n"
@@ -743,6 +758,9 @@ usage(boolean_t requested)
 	    (u_longlong_t)zo->zo_killrate,		/* -k */
 	    zo->zo_pool,				/* -p */
 	    zo->zo_dir,					/* -f */
+	    zo->zo_obj_store_endpoint,			/* -O */
+	    zo->zo_obj_store_region,			/* -A */
+	    zo->zo_obj_store_creds_file,		/* -z */
 	    (u_longlong_t)zo->zo_time,			/* -T */
 	    (u_longlong_t)zo->zo_maxloops,		/* -F */
 	    (u_longlong_t)zo->zo_passtime);
@@ -818,7 +836,8 @@ process_options(int argc, char **argv)
 	bcopy(&ztest_opts_defaults, zo, sizeof (*zo));
 
 	while ((opt = getopt(argc, argv,
-	    "v:s:a:m:r:R:K:D:S:d:t:g:i:k:p:f:MVET:P:hF:B:C:o:G")) != EOF) {
+	    "v:s:a:m:r:R:K:D:S:d:t:g:i:k:p:f:O:A:b:z:MVET:P:hF:B:C:o:G"))
+	    != EOF) {
 		value = 0;
 		switch (opt) {
 		case 'v':
@@ -899,6 +918,26 @@ process_options(int argc, char **argv)
 				free(path);
 			}
 			break;
+		case 'O':
+			(void) strlcpy(zo->zo_obj_store_endpoint, optarg,
+			    sizeof (zo->zo_obj_store_endpoint));
+			zo->zo_obj_store = 1;
+			break;
+		case 'A':
+			(void) strlcpy(zo->zo_obj_store_region, optarg,
+			    sizeof (zo->zo_obj_store_region));
+			zo->zo_obj_store = 1;
+			break;
+		case 'b':
+			(void) strlcpy(zo->zo_obj_store_bucket, optarg,
+			    sizeof (zo->zo_obj_store_bucket));
+			zo->zo_obj_store = 1;
+			break;
+		case 'z':
+			(void) strlcpy(zo->zo_obj_store_creds_file, optarg,
+			    sizeof (zo->zo_obj_store_creds_file));
+			zo->zo_obj_store = 1;
+			break;
 		case 'M':
 			zo->zo_mmp_test = 1;
 			break;
@@ -954,7 +993,7 @@ process_options(int argc, char **argv)
 	}
 
 	/* When raid choice is 'random' add a draid pool 50% of the time */
-	if (strcmp(raid_kind, "random") == 0) {
+	if (strcmp(raid_kind, "random") == 0 && zo->zo_obj_store == 0) {
 		(void) strlcpy(raid_kind, (ztest_random(2) == 0) ?
 		    "draid" : "raidz", sizeof (raid_kind));
 
@@ -995,11 +1034,11 @@ process_options(int argc, char **argv)
 		(void) strlcpy(zo->zo_raid_type, VDEV_TYPE_DRAID,
 		    sizeof (zo->zo_raid_type));
 
-	} else /* using raidz */ {
-		ASSERT0(strcmp(raid_kind, "raidz"));
-
+	} else if (strcmp(raid_kind, "raidz") == 0) {
 		zo->zo_raid_parity = MIN(zo->zo_raid_parity,
 		    zo->zo_raid_children - 1);
+	} else {
+		ASSERT(zo->zo_obj_store);
 	}
 
 	zo->zo_vdevtime =
@@ -1098,6 +1137,58 @@ ztest_is_draid_spare(const char *name)
 	}
 
 	return (B_FALSE);
+}
+
+static int
+load_obj_store_creds(char *obj_store_creds_file, char *obj_store_creds,
+    size_t cred_buf_size)
+{
+	int rc = 0;
+	char *file = obj_store_creds_file;
+	if (strlen(obj_store_creds_file) <= 8 ||
+	    strncmp("file:///", obj_store_creds_file, 8) == 0) {
+		file = obj_store_creds_file + 7;
+	} else {
+		return (EINVAL);
+	}
+
+	int fd = open(file, O_RDONLY);
+	if (fd == -1) {
+		(void) fprintf(stderr, "can't open %s", obj_store_creds_file);
+		return (errno);
+	}
+
+	int read_size = read(fd, obj_store_creds, cred_buf_size - 1);
+	if (read_size == -1) {
+		(void) fprintf(stderr, "can't read %s", obj_store_creds_file);
+		rc = errno;
+	} else {
+		obj_store_creds[read_size] = '\0';
+	}
+
+	(void) close(fd);
+
+	return (rc);
+}
+
+static nvlist_t *
+make_vdev_obj_store(void)
+{
+	nvlist_t *vdev = fnvlist_alloc();
+	fnvlist_add_string(vdev, ZPOOL_CONFIG_TYPE, VDEV_TYPE_OBJSTORE);
+	fnvlist_add_string(vdev, ZPOOL_CONFIG_PATH,
+	    ztest_opts.zo_obj_store_bucket);
+	fnvlist_add_string(vdev, zpool_prop_to_name(ZPOOL_PROP_OBJ_ENDPOINT),
+	    ztest_opts.zo_obj_store_endpoint);
+	fnvlist_add_string(vdev, zpool_prop_to_name(ZPOOL_PROP_OBJ_REGION),
+	    ztest_opts.zo_obj_store_region);
+	fnvlist_add_string(vdev, zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS),
+	    ztest_opts.zo_obj_store_creds_file);
+	ASSERT0(load_obj_store_creds(ztest_opts.zo_obj_store_creds_file,
+	    ztest_opts.zo_obj_store_creds, MAXNAMELEN));
+	fnvlist_add_string(vdev, ZPOOL_CONFIG_OBJSTORE_CREDENTIALS,
+	    ztest_opts.zo_obj_store_creds);
+	return (vdev);
 }
 
 static nvlist_t *
@@ -1240,20 +1331,25 @@ make_vdev_root(char *path, char *aux, char *pool, size_t size, uint64_t ashift,
 
 	log = (class != NULL && strcmp(class, "log") == 0);
 
+	if (ztest_opts.zo_obj_store)
+		t = 1;
 	child = umem_alloc(t * sizeof (nvlist_t *), UMEM_NOFAIL);
 
-	for (c = 0; c < t; c++) {
-		child[c] = make_vdev_mirror(path, aux, pool, size, ashift,
-		    r, m);
-		fnvlist_add_uint64(child[c], ZPOOL_CONFIG_IS_LOG, log);
+	if (ztest_opts.zo_obj_store) {
+		child[0]  = make_vdev_obj_store();
+	} else {
+		for (c = 0; c < t; c++) {
+			child[c] = make_vdev_mirror(path, aux, pool, size,
+			    ashift, r, m);
+			fnvlist_add_uint64(child[c], ZPOOL_CONFIG_IS_LOG, log);
 
-		if (class != NULL && class[0] != '\0') {
-			ASSERT(m > 1 || log);   /* expecting a mirror */
-			fnvlist_add_string(child[c],
-			    ZPOOL_CONFIG_ALLOCATION_BIAS, class);
+			if (class != NULL && class[0] != '\0') {
+				ASSERT(m > 1 || log);   /* expecting a mirror */
+				fnvlist_add_string(child[c],
+				    ZPOOL_CONFIG_ALLOCATION_BIAS, class);
+			}
 		}
 	}
-
 	root = fnvlist_alloc();
 	fnvlist_add_string(root, ZPOOL_CONFIG_TYPE, VDEV_TYPE_ROOT);
 	fnvlist_add_nvlist_array(root, aux ? aux : ZPOOL_CONFIG_CHILDREN,
@@ -6683,6 +6779,12 @@ ztest_run_zdb(char *pool)
 	const int len = MAXPATHLEN + MAXNAMELEN + 20;
 	FILE *fp;
 
+	// XXX skip until zdb learns to access an object store.
+	if (ztest_opts.zo_obj_store) {
+		(void) printf("Skipping executing zdb.\n");
+		return;
+	}
+
 	bin = umem_alloc(len, UMEM_NOFAIL);
 	zdb = umem_alloc(len, UMEM_NOFAIL);
 	zbuf = umem_alloc(1024, UMEM_NOFAIL);
@@ -7925,14 +8027,23 @@ main(int argc, char **argv)
 	hasalt = (strlen(ztest_opts.zo_alt_ztest) != 0);
 
 	if (ztest_opts.zo_verbose >= 1) {
-		(void) printf("%llu vdevs, %d datasets, %d threads,"
-		    "%d %s disks, %llu seconds...\n\n",
-		    (u_longlong_t)ztest_opts.zo_vdevs,
-		    ztest_opts.zo_datasets,
-		    ztest_opts.zo_threads,
-		    ztest_opts.zo_raid_children,
-		    ztest_opts.zo_raid_type,
-		    (u_longlong_t)ztest_opts.zo_time);
+		if (ztest_opts.zo_obj_store) {
+			(void) printf("%d datasets, %d threads, object-store"
+			    " %s, %llu seconds...\n\n",
+			    ztest_opts.zo_datasets,
+			    ztest_opts.zo_threads,
+			    ztest_opts.zo_obj_store_endpoint,
+			    (u_longlong_t)ztest_opts.zo_time);
+		} else {
+			(void) printf("%llu vdevs, %d datasets, %d threads,"
+			    "%d %s disks, %llu seconds...\n\n",
+			    (u_longlong_t)ztest_opts.zo_vdevs,
+			    ztest_opts.zo_datasets,
+			    ztest_opts.zo_threads,
+			    ztest_opts.zo_raid_children,
+			    ztest_opts.zo_raid_type,
+			    (u_longlong_t)ztest_opts.zo_time);
+		}
 	}
 
 	cmd = umem_alloc(MAXNAMELEN, UMEM_NOFAIL);

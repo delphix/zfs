@@ -778,9 +778,7 @@ vdev_label_read_config(vdev_t *vd, uint64_t txg)
 		return (vdev_draid_read_config_spare(vd));
 
 	if (vdev_is_object_based(vd)) {
-#ifdef _KERNEL
 		return (vdev_object_store_get_config(vd));
-#endif
 	}
 
 	for (int l = 0; l < VDEV_LABELS; l++) {
@@ -1514,10 +1512,8 @@ vdev_uberblock_load_impl(zio_t *zio, vdev_t *vd, int flags,
 		vdev_uberblock_load_impl(zio, vd->vdev_child[c], flags, cbp);
 
 	if (vdev_is_object_based(vd)) {
-#ifdef _KERNEL
 		uberblock_t *ub = vdev_object_store_get_uberblock(vd);
 		vdev_uberblock_load_done_impl(zio->io_spa, vd, ub, zio);
-#endif
 	} else if (vd->vdev_ops->vdev_op_leaf && vdev_readable(vd) &&
 	    vd->vdev_ops != &vdev_draid_spare_ops) {
 		for (int l = 0; l < VDEV_LABELS; l++) {
@@ -1581,11 +1577,10 @@ vdev_uberblock_load(vdev_t *rvd, uberblock_t *ub, nvlist_t **config)
 			vdev_dbgmsg(cb.ubl_vd, "failed to read label config");
 		}
 	} else if (cb.ubl_vd != NULL && vdev_is_object_based(cb.ubl_vd)) {
-#ifdef _KERNEL
 		*config = vdev_object_store_get_config(cb.ubl_vd);
-#endif
 		if (*config == NULL) {
-			vdev_dbgmsg(cb.ubl_vd, "failed to read objstore label config");
+			vdev_dbgmsg(cb.ubl_vd, "failed to read objstore label "
+			"config");
 		}
 	}
 	spa_config_exit(spa, SCL_ALL, FTAG);
@@ -1939,7 +1934,6 @@ retry:
 
 	ASSERT3U(txg, <=, spa->spa_final_txg);
 
-#ifdef _KERNEL
 	if (spa->spa_root_vdev->vdev_child[0]->vdev_ops ==
 	    &vdev_object_store_ops) {
 		nvlist_t *label = spa_config_generate(spa,
@@ -1947,7 +1941,6 @@ retry:
 		object_store_end_txg(spa, label, txg);
 		return (0);
 	}
-#endif
 
 	/*
 	 * Flush the write cache of every disk that's been written to

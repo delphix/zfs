@@ -106,6 +106,7 @@ KERNEL_C = \
 	sa.c \
 	sha256.c \
 	skein_zfs.c \
+	sock.c \
 	spa.c \
 	spa_boot.c \
 	spa_checkpoint.c \
@@ -131,6 +132,7 @@ KERNEL_C = \
 	vdev_indirect_mapping.c \
 	vdev_initialize.c \
 	vdev_label.c \
+	vdev_object_store.c \
 	vdev_mirror.c \
 	vdev_missing.c \
 	vdev_queue.c \

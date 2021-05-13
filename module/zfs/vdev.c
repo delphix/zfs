@@ -226,9 +226,7 @@ static vdev_ops_t *vdev_ops_table[] = {
 	&vdev_missing_ops,
 	&vdev_hole_ops,
 	&vdev_indirect_ops,
-#ifdef _KERNEL
 	&vdev_object_store_ops,
-#endif
 	NULL
 };
 
@@ -5177,11 +5175,9 @@ vdev_is_concrete(vdev_t *vd)
 boolean_t
 vdev_is_object_based(vdev_t *vd)
 {
-#ifdef _KERNEL
 	vdev_ops_t *ops = vd->vdev_ops;
 	if (ops == &vdev_object_store_ops)
 		return (B_TRUE);
-#endif
 	return (B_FALSE);
 }
 

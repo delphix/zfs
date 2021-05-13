@@ -63,13 +63,7 @@ impl Client {
     }
 
     fn get_credential_string(aws_key_id: &str, secret_key: &str) -> String {
-        let credentials = format!(
-            "objectstore-access-key-id = {} \n objectstore-secret-access-key = {} \n",
-            aws_key_id, secret_key
-        )
-        .to_string();
-
-        credentials
+        format!("{}:{}", aws_key_id, secret_key).to_string()
     }
 
     pub async fn create_pool(

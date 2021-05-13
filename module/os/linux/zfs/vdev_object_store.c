@@ -31,12 +31,9 @@
 #include <sys/fs/zfs.h>
 #include <sys/fm/fs/zfs.h>
 #include <sys/abd.h>
-#include <sys/fcntl.h>
 #include <sys/metaslab_impl.h>
-#ifdef _KERNEL
-#include <linux/un.h>
-#include <linux/net.h>
-#endif
+#include <sys/sock.h>
+
 /*
  * Virtual device vector for object storage.
  */
@@ -91,7 +88,7 @@ typedef struct vdev_object_store {
 	kcondvar_t vos_cv;
 	boolean_t vos_agent_thread_exit;
 
-	struct socket *vos_sock;
+	ksocket_t vos_sock;
 
 	kmutex_t vos_outstanding_lock;
 	kcondvar_t vos_outstanding_cv;
@@ -119,68 +116,66 @@ vdev_object_store_open_mode(spa_mode_t spa_mode)
 	return (mode);
 }
 
-#ifdef _KERNEL
 static struct sockaddr_un zfs_kernel_socket = {
 	AF_UNIX, "/run/zfs_kernel_socket"
 };
-#endif
 
 static int
-zfs_object_store_open(char *bucket_name, int mode, struct socket **sock)
+zfs_object_store_open(char *bucket_name, int mode, ksocket_t *sock)
 {
-	struct socket *s = NULL;
+	ksocket_t s = INVALID_SOCKET;
 
-	int rc = sock_create(PF_UNIX, SOCK_STREAM, 0, &s);
+	int rc = ksock_create(PF_UNIX, SOCK_STREAM, 0, &s);
 	if (rc != 0) {
 		zfs_dbgmsg("zfs_object_store_open unable to create "
 		    "socket: %d", rc);
 		return (rc);
 	}
 
-	rc = s->ops->connect(s, (struct sockaddr *)&zfs_kernel_socket,
-	    sizeof (zfs_kernel_socket), 0);
+	rc = ksock_connect(s, (struct sockaddr *)&zfs_kernel_socket,
+	    sizeof (zfs_kernel_socket));
 	if (rc != 0) {
 		zfs_dbgmsg("zfs_object_store_open failed to "
 		    "connect: %d", rc);
-		sock_release(s);
-		s = NULL;
+		ksock_close(s);
+		s = INVALID_SOCKET;
 	} else {
 		zfs_dbgmsg("zfs_object_store_open, socket connection "
-		    "ready, %px", s);
+		    "ready, " SOCK_FMT, s);
 	}
 
-	VERIFY3P(*sock, ==, NULL);
+	VERIFY3P(*sock, ==, INVALID_SOCKET);
 	*sock = s;
-	zfs_dbgmsg("SOCKET OPEN(%px): %px", curthread, *sock);
+	zfs_dbgmsg("SOCKET OPEN(%px): " SOCK_FMT, curthread, *sock);
 	return (0);
 }
 
 static void
-zfs_object_store_shutdown(struct socket *sock)
+zfs_object_store_shutdown(ksocket_t sock)
 {
-	if (sock == NULL)
+	if (sock == INVALID_SOCKET)
 		return;
 
-	zfs_dbgmsg("SOCKET SHUTTING DOWN(%px): %px", curthread, sock);
-	kernel_sock_shutdown(sock, SHUT_RDWR);
+	zfs_dbgmsg("SOCKET SHUTTING DOWN(%px): " SOCK_FMT, curthread, sock);
+	ksock_shutdown(sock, SHUT_RDWR);
 }
 
 static void
-zfs_object_store_close(struct socket **sock)
+zfs_object_store_close(ksocket_t *sock)
 {
-	if (*sock == NULL)
+	if (*sock == INVALID_SOCKET)
 		return;
 
-	zfs_dbgmsg("SOCKET CLOSING(%px): %px", curthread, *sock);
-	sock_release(*sock);
-	*sock = NULL;
+	zfs_dbgmsg("SOCKET CLOSING(%px): " SOCK_FMT, curthread, *sock);
+	ksock_close(*sock);
+	*sock = INVALID_SOCKET;
 }
 
 static void
 agent_request(vdev_object_store_t *vos, nvlist_t *nv)
 {
 	struct msghdr msg = {};
-	struct kvec iov[2] = {};
+	kvec_t iov[2] = {};
 	size_t iov_size = 0;
 	char *iov_buf = fnvlist_pack(nv, &iov_size);
 	uint64_t size64 = iov_size;
@@ -194,7 +189,7 @@ agent_request(vdev_object_store_t *vos, nvlist_t *nv)
 	uint64_t total_size = sizeof (size64) + iov_size;
 	// XXX need locking on socket?
 	mutex_enter(&vos->vos_lock);
-	size_t sent = kernel_sendmsg(vos->vos_sock, &msg, iov,
+	size_t sent = ksock_send(vos->vos_sock, &msg, iov,
 	    2, total_size);
 	mutex_exit(&vos->vos_lock);
 	if (sent != total_size) {
@@ -236,7 +231,8 @@ again:
 		avl_add(&vq->vq_class[zio->io_priority].vqc_queued_tree, zio);
 		// XXX we really shouldn't be blocking in vdev_op_io_start
 		cv_wait(&vos->vos_outstanding_cv, &vos->vos_outstanding_lock);
-		avl_remove(&vq->vq_class[zio->io_priority].vqc_queued_tree, zio);
+		avl_remove(&vq->vq_class[zio->io_priority].vqc_queued_tree,
+		    zio);
 
 		goto again;
 	}
@@ -435,7 +431,7 @@ agent_read_all(vdev_object_store_t *vos, void *buf, size_t len)
 	size_t recvd_total = 0;
 	while (recvd_total < len) {
 		struct msghdr msg = {};
-		struct kvec iov = {};
+		kvec_t iov = {};
 
 		iov.iov_base = buf + recvd_total;
 		iov.iov_len = len - recvd_total;
@@ -449,7 +445,7 @@ agent_read_all(vdev_object_store_t *vos, void *buf, size_t len)
 		}
 		mutex_exit(&vos->vos_lock);
 
-		size_t recvd = kernel_recvmsg(vos->vos_sock,
+		size_t recvd = ksock_receive(vos->vos_sock,
 		    &msg, &iov, 1, len - recvd_total, 0);
 		if (recvd > 0) {
 			recvd_total += recvd;
@@ -593,22 +589,22 @@ vdev_agent_thread(void *arg)
 		mutex_enter(&vos->vos_lock);
 		zfs_object_store_shutdown(vos->vos_sock);
 		zfs_object_store_close(&vos->vos_sock);
-		ASSERT3P(vos->vos_sock, ==, NULL);
+		ASSERT3P(vos->vos_sock, ==, INVALID_SOCKET);
 		mutex_exit(&vos->vos_lock);
 
 		ASSERT3U(vd->vdev_state, ==, VDEV_STATE_HEALTHY);
 		while (!vos->vos_agent_thread_exit &&
-		    vos->vos_sock == NULL) {
+		    vos->vos_sock == INVALID_SOCKET) {
 			mutex_enter(&vos->vos_lock);
 			zfs_object_store_open(vd->vdev_path,
 			    vdev_object_store_open_mode(
 			    spa_mode(vd->vdev_spa)), &vos->vos_sock);
 			mutex_exit(&vos->vos_lock);
 
-			if (vos->vos_sock == NULL) {
+			if (vos->vos_sock == INVALID_SOCKET) {
 				delay(hz);
 			} else {
-				zfs_dbgmsg("REOPENED(%px) sock %px",
+				zfs_dbgmsg("REOPENED(%px) sock " SOCK_FMT,
 				    curthread, vos->vos_sock);
 			}
 		}
@@ -645,6 +641,7 @@ vdev_object_store_init(spa_t *spa, nvlist_t *nv, void **tsd)
 	char *val = NULL;
 
 	vos = *tsd = kmem_zalloc(sizeof (vdev_object_store_t), KM_SLEEP);
+	vos->vos_sock = INVALID_SOCKET;
 	mutex_init(&vos->vos_lock, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&vos->vos_outstanding_lock, NULL, MUTEX_DEFAULT, NULL);
 	cv_init(&vos->vos_cv, NULL, CV_DEFAULT, NULL);
@@ -671,8 +668,6 @@ vdev_object_store_init(spa_t *spa, nvlist_t *nv, void **tsd)
 	if (!nvlist_lookup_string(nv,
 	    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, &val)) {
 		vos->vos_credentials = kmem_strdup(val);
-	} else {
-		return (SET_ERROR(EINVAL));
 	}
 
 	zfs_dbgmsg("vdev_object_store_init, endpoint=%s region=%s cred=%s",
@@ -717,7 +712,7 @@ vdev_object_store_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
     uint64_t *logical_ashift, uint64_t *physical_ashift)
 {
 	vdev_object_store_t *vos;
-	int error;
+	int error = 0;
 
 	/*
 	 * Rotational optimizations only make sense on block devices.
@@ -763,13 +758,13 @@ vdev_object_store_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	 * fail the import instead.
 	 */
 	while (!vos->vos_agent_thread_exit &&
-	    vos->vos_sock == NULL) {
+	    vos->vos_sock == INVALID_SOCKET) {
 		mutex_enter(&vos->vos_lock);
 		error = zfs_object_store_open(vd->vdev_path,
 		    vdev_object_store_open_mode(
 		    spa_mode(vd->vdev_spa)), &vos->vos_sock);
 		mutex_exit(&vos->vos_lock);
-		if (vos->vos_sock == NULL) {
+		if (vos->vos_sock == INVALID_SOCKET) {
 			delay(hz);
 		}
 	}
@@ -823,7 +818,7 @@ vdev_object_store_close(vdev_t *vd)
 	}
 	zfs_object_store_close(&vos->vos_sock);
 	mutex_exit(&vos->vos_lock);
-	ASSERT3P(vos->vos_sock, ==, NULL);
+	ASSERT3P(vos->vos_sock, ==, INVALID_SOCKET);
 	vd->vdev_delayed_close = B_FALSE;
 }
 
@@ -897,6 +892,8 @@ vdev_object_store_config_generate(vdev_t *vd, nvlist_t *nv)
 	fnvlist_add_string(nv,
 	    zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS),
 	    vos->vos_credential_location);
+	fnvlist_add_string(nv, ZPOOL_CONFIG_OBJSTORE_CREDENTIALS,
+	    vos->vos_credentials);
 	fnvlist_add_string(nv,
 	    zpool_prop_to_name(ZPOOL_PROP_OBJ_ENDPOINT), vos->vos_endpoint);
 	fnvlist_add_string(nv,
