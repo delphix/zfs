@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_stream::stream;
 use bytes::Bytes;
 use core::time::Duration;
-use futures::Future;
+use futures::{Future, StreamExt};
 use lazy_static::lazy_static;
 use log::*;
 use lru::LruCache;
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::{io::AsyncReadExt, sync::Semaphore};
+use tokio::sync::Semaphore;
 
 struct ObjectCache {
     // XXX cache key should include Bucket
@@ -122,14 +122,19 @@ impl ObjectAccess {
         })
         .await;
         let begin = Instant::now();
-        let mut v = Vec::new();
+        let mut v = match output.content_length {
+            None => Vec::new(),
+            Some(len) => Vec::with_capacity(len as usize),
+        };
         output
             .body
             .unwrap()
-            .into_async_read()
-            .read_to_end(&mut v)
-            .await
-            .unwrap();
+            .for_each(|x| {
+                let b = x.unwrap();
+                v.extend_from_slice(&b);
+                async {}
+            })
+            .await;
         debug!(
             "{}: got {} bytes of data in additional {}ms",
             msg,
