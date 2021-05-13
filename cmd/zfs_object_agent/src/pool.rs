@@ -31,6 +31,11 @@ const FREE_LOWWATER_PCT: f64 = 9.0;
 const FREE_MIN_BLOCKS: u64 = 1000;
 const MAX_BYTES_PER_OBJECT: u32 = 1024 * 1024;
 
+// minimum number of chunks before we consider condensing
+const LOG_CONDENSE_MIN_CHUNKS: usize = 10;
+// when log is 3x as large as the condensed version
+const LOG_CONDENSE_MULTIPLE: usize = 3;
+
 #[derive(Serialize, Deserialize, Debug)]
 struct PoolPhys {
     guid: PoolGUID, // redundant with key, for verification
@@ -423,7 +428,8 @@ impl Pool {
             })
             .await;
         info!(
-            "loaded mapping with {} allocs and {} frees in {}ms",
+            "loaded mapping from {} objects with {} allocs and {} frees in {}ms",
+            syncing_state.storage_object_log.num_chunks,
             num_alloc_entries,
             num_free_entries,
             begin.elapsed().as_millis()
@@ -560,6 +566,7 @@ impl Pool {
         let state = self.state.clone();
         tokio::spawn(async move {
             let mut syncing_state = state.syncing_state.try_lock().unwrap();
+            try_condense_object_log(state.clone(), &mut syncing_state).await;
             let txg = syncing_state.syncing_txg.unwrap();
             Self::wait_for_pending_flushes(&mut syncing_state).await;
             syncing_state.rewriting_objects.clear();
@@ -981,6 +988,7 @@ async fn build_new_frees(
     syncing_state.stats.pending_frees_count = 0;
     syncing_state.stats.pending_frees_bytes = 0;
     for ent in remaining_frees {
+        // XXX could we build this in open context and then just add the new entries from syncing context?
         syncing_state.log_free(ent);
     }
     stream
@@ -1346,4 +1354,52 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
         }));
         assert!(r.is_ok()); // can not use .unwrap() because the type is not Debug
     });
+}
+
+//
+// following routines deal with condensing the StorageObjectLog
+//
+
+async fn try_condense_object_log(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState) {
+    // XXX change this to be based on bytes, once those stats are working?
+    let len = state.block_to_obj.read().unwrap().len();
+    if syncing_state.storage_object_log.num_chunks
+        < (LOG_CONDENSE_MIN_CHUNKS
+            + LOG_CONDENSE_MULTIPLE * (len + ENTRIES_PER_OBJECT) / ENTRIES_PER_OBJECT)
+            as u64
+    {
+        return;
+    }
+    let txg = syncing_state.syncing_txg.unwrap();
+    info!(
+        "{:?} OBM condense: starting; objects={} entries={} len={}",
+        txg,
+        syncing_state.storage_object_log.num_chunks,
+        syncing_state.storage_object_log.num_entries,
+        len
+    );
+
+    let begin = Instant::now();
+    syncing_state.storage_object_log.clear(txg).await;
+    {
+        let block_to_obj = state.block_to_obj.read().unwrap();
+        for ent in block_to_obj.iter() {
+            syncing_state.storage_object_log.append(
+                txg,
+                StorageObjectLogEntry::Alloc {
+                    obj: ent.obj,
+                    first_possible_block: ent.block,
+                },
+            );
+        }
+    }
+    syncing_state.storage_object_log.flush(txg).await;
+
+    info!(
+        "{:?} OBM condense: wrote {} entries to {} objects in {}ms",
+        txg,
+        syncing_state.storage_object_log.num_entries,
+        syncing_state.storage_object_log.num_chunks,
+        begin.elapsed().as_millis()
+    );
 }

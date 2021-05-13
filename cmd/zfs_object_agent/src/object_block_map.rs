@@ -10,9 +10,9 @@ pub struct ObjectBlockMap {
 }
 
 #[derive(Debug, Ord, PartialOrd, PartialEq, Eq, Copy, Clone)]
-struct ObjectBlockMapEntry {
-    obj: ObjectID,
-    block: BlockID,
+pub struct ObjectBlockMapEntry {
+    pub obj: ObjectID,
+    pub block: BlockID,
 }
 
 impl Borrow<ObjectID> for ObjectBlockMapEntry {
@@ -91,5 +91,9 @@ impl ObjectBlockMap {
 
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    pub fn iter(&self) -> std::collections::btree_set::Iter<ObjectBlockMapEntry> {
+        self.map.iter()
     }
 }

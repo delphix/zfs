@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::JoinHandle;
 
+pub const ENTRIES_PER_OBJECT: usize = 100_000;
+
 /*
  * Note: The OBLIterator returns a struct, not a reference. That way it doesn't
  * have to manage the reference lifetime.  It also means that the ObjectBasedLog
@@ -78,8 +80,8 @@ pub struct ObjectBasedLog<T: ObjectBasedLogEntry> {
     pool: Arc<PoolSharedState>,
     name: String,
     generation: u64,
-    num_chunks: u64,
-    num_entries: u64,
+    pub num_chunks: u64,
+    pub num_entries: u64,
     pending_entries: Vec<T>,
     recovered: bool,
     pending_flushes: Vec<JoinHandle<()>>,
@@ -214,6 +216,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         self.flush(txg).await;
         self.generation += 1;
         self.num_chunks = 0;
+        self.num_entries = 0;
     }
 
     pub async fn read(&self) -> Vec<T> {
