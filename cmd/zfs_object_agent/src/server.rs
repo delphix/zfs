@@ -30,6 +30,7 @@ impl Server {
         }
 
         let mut v = Vec::new();
+        // XXX would be nice if we didn't have to zero it out
         v.resize(len64 as usize, 0);
         pipe.read_exact(v.as_mut()).await?;
         let nvl = NvList::try_unpack(v.as_ref()).unwrap();

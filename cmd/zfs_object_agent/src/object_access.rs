@@ -32,6 +32,9 @@ lazy_static! {
     };
 }
 
+// log operations that take longer than this with info!()
+const LONG_OPERATION_DURATION: Duration = Duration::from_secs(2);
+
 #[derive(Clone)]
 pub struct ObjectAccess {
     bucket: s3::Bucket,
@@ -56,7 +59,18 @@ where
         match f().await {
             Err(e) => {
                 // XXX why can't we use {} with `e`?  lifetime error???
-                debug!("{} returned: {:?}; retrying in {:?}", msg, e, delay);
+                debug!(
+                    "{} returned: {:?}; retrying in {}ms",
+                    msg,
+                    e,
+                    delay.as_millis()
+                );
+                if delay > LONG_OPERATION_DURATION {
+                    info!(
+                        "long retry: {} returned: {:?}; retrying in {:?}",
+                        msg, e, delay
+                    );
+                }
             }
             Ok(result) => {
                 break result;
@@ -65,11 +79,14 @@ where
         tokio::time::sleep(delay).await;
         delay = delay.mul_f64(thread_rng().gen_range(1.5..2.5));
     };
-    debug!(
-        "{}: returned success in {}ms",
-        msg,
-        begin.elapsed().as_millis()
-    );
+    let elapsed = begin.elapsed();
+    debug!("{}: returned success in {}ms", msg, elapsed.as_millis());
+    if elapsed > LONG_OPERATION_DURATION {
+        info!(
+            "long completion: {}: returned success in {:?}",
+            msg, elapsed
+        );
+    }
     result
 }
 
@@ -229,6 +246,8 @@ impl ObjectAccess {
             let mykey = key.to_string();
             if c.cache.contains(&mykey) {
                 debug!("found {} in cache when putting - invalidating", key);
+                // XXX unfortuate to be copying; this happens every time when
+                // freeing (we get/modify/put the object)
                 c.cache.put(mykey, Arc::new(data.clone()));
             }
         }
