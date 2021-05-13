@@ -30,7 +30,6 @@ nvpair = { git = "https://github.com/ahrens/rust-libzfs", branch = "work"}
 rand = "0.8.3"
 rusoto_core = "0.46.0"
 rusoto_s3 = "0.46.0"
-rust-s3 = "0.27.0-rc1"
 serde = { version = "1.0.125", features = ["derive"] }
 serde_bytes = "0.11"
 stream-reduce = "0.1.0"

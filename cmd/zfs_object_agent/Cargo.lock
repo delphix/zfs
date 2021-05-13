@@ -725,7 +725,6 @@ dependencies = [
  "rand",
  "rusoto_core",
  "rusoto_s3",
- "rust-s3",
  "serde",
  "serde_bytes",
  "stream-reduce",
