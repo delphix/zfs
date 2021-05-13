@@ -37,7 +37,6 @@ const LONG_OPERATION_DURATION: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct ObjectAccess {
-    bucket: s3::Bucket,
     client: rusoto_s3::S3Client,
     bucket_str: String,
 }
@@ -47,17 +46,17 @@ pub fn prefixed(key: &str) -> String {
     format!("{}{}", *PREFIX, key)
 }
 
-async fn retry<F, O, E>(msg: &str, f: impl Fn() -> F) -> O
+async fn retry<F, O, E>(msg: &str, f: impl Fn() -> F) -> Result<O, RusotoError<E>>
 where
     E: core::fmt::Debug + core::fmt::Display + std::error::Error,
-    F: Future<Output = Result<O, RusotoError<E>>>,
+    F: Future<Output = (bool, Result<O, RusotoError<E>>)>,
 {
     debug!("{}: begin", msg);
     let begin = Instant::now();
     let mut delay = Duration::from_secs_f64(thread_rng().gen_range(0.001..0.2));
     let result = loop {
         match f().await {
-            Err(e) => {
+            (true, Err(e)) => {
                 // XXX why can't we use {} with `e`?  lifetime error???
                 debug!(
                     "{} returned: {:?}; retrying in {}ms",
@@ -72,8 +71,11 @@ where
                     );
                 }
             }
-            Ok(result) => {
-                break result;
+            (false, Err(e)) => {
+                break Err(e);
+            }
+            (_, o @ Ok(_)) => {
+                break o;
             }
         }
         tokio::time::sleep(delay).await;
@@ -92,23 +94,12 @@ where
 
 impl ObjectAccess {
     pub fn new(endpoint: &str, region_str: &str, bucket: &str, creds: &str) -> Self {
-        let region = s3::Region::Custom {
-            region: region_str.to_owned(),
-            endpoint: endpoint.to_owned(),
-        };
-        info!("region: {:?}", region);
+        info!("region: {:?}", region_str);
+        println!("Endpoint: {}", endpoint);
 
         let mut iter = creds.split(':');
         let access_key_id = iter.next().unwrap().trim();
         let secret_access_key = iter.next().unwrap().trim();
-        let credentials = s3::creds::Credentials::new(
-            Some(access_key_id),
-            Some(secret_access_key),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
 
         let http_client = rusoto_core::HttpClient::new().unwrap();
         let creds = rusoto_core::credential::StaticProvider::new(
@@ -121,7 +112,6 @@ impl ObjectAccess {
             rusoto_s3::S3Client::new_with(http_client, creds, rusoto_core::Region::UsWest2);
 
         ObjectAccess {
-            bucket: s3::Bucket::new(bucket, region, credentials).unwrap(),
             client,
             bucket_str: bucket.to_string(),
         }
@@ -135,9 +125,15 @@ impl ObjectAccess {
                 key: prefixed(key),
                 ..Default::default()
             };
-            self.client.get_object(req).await
+            let res = self.client.get_object(req).await;
+            match res {
+                Ok(_) => (true, res),
+                Err(RusotoError::Service(GetObjectError::NoSuchKey(_))) => (false, res),
+                Err(_) => (true, res),
+            }
         })
-        .await;
+        .await
+        .unwrap();
         let begin = Instant::now();
         let mut v = match output.content_length {
             None => Vec::new(),
@@ -213,9 +209,45 @@ impl ObjectAccess {
         &self,
         prefix: &str,
         delimiter: Option<String>,
-    ) -> Vec<s3::serde_types::ListBucketResult> {
+    ) -> Vec<ListObjectsV2Output> {
         let full_prefix = prefixed(prefix);
-        self.bucket.list(full_prefix, delimiter).await.unwrap()
+        retry(
+            &format!("list {} (delim {:?})", full_prefix, delimiter),
+            || async {
+                let mut results = Vec::new();
+                let mut continuation_token = None;
+                loop {
+                    let req = ListObjectsV2Request {
+                        bucket: self.bucket_str.clone(),
+                        continuation_token: continuation_token,
+                        delimiter: delimiter.clone(),
+                        encoding_type: None,
+                        expected_bucket_owner: None,
+                        fetch_owner: Some(false),
+                        max_keys: None,
+                        prefix: Some(full_prefix.clone()),
+                        request_payer: None,
+                        start_after: None,
+                    };
+                    let res = self.client.list_objects_v2(req).await;
+                    match res {
+                        Ok(output) => {
+                            continuation_token = output.next_continuation_token.clone();
+                            results.push(output);
+                            if continuation_token.is_none() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            return (true, Err(e));
+                        }
+                    }
+                }
+                (true, Ok(results))
+            },
+        )
+        .await
+        .unwrap()
     }
 
     async fn put_object_impl(&self, key: &str, data: Vec<u8>) {
@@ -233,10 +265,11 @@ impl ObjectAccess {
                     body: Some(stream),
                     ..Default::default()
                 };
-                self.client.put_object(req).await
+                (true, self.client.put_object(req).await)
             },
         )
-        .await;
+        .await
+        .unwrap();
     }
 
     pub async fn put_object(&self, key: &str, data: Vec<u8>) {
@@ -284,9 +317,10 @@ impl ObjectAccess {
                 },
                 ..Default::default()
             };
-            self.client.delete_objects(req).await
+            (true, self.client.delete_objects(req).await)
         })
-        .await;
+        .await
+        .unwrap();
         if let Some(errs) = output.errors {
             if !errs.is_empty() {}
             for err in errs {
@@ -311,18 +345,19 @@ impl ObjectAccess {
         let prefixed_key = prefixed(key);
         debug!("looking for {}", prefixed_key);
         let begin = Instant::now();
-        match self.bucket.list(prefixed_key, None).await {
-            Ok(results) => {
-                assert_eq!(results.len(), 1);
-                let list = &results[0];
-                debug!("list completed in {}ms", begin.elapsed().as_millis());
-                // Note need to check if this exact name is in the results. If we are looking
-                // for "x/y" and there is "x/y" and "x/yz", both will be returned.
-                list.contents.iter().any(|o| o.key == key)
+        let results = self.list_objects(key, None).await;
+
+        assert_eq!(results.len(), 1);
+        let list = &results[0];
+        debug!("list completed in {}ms", begin.elapsed().as_millis());
+        // Note need to check if this exact name is in the results. If we are looking
+        // for "x/y" and there is "x/y" and "x/yz", both will be returned.
+        list.contents.as_ref().unwrap_or(&vec![]).iter().any(|o| {
+            if let Some(k) = &o.key {
+                k == key
+            } else {
+                false
             }
-            Err(_) => {
-                return false;
-            }
-        }
+        })
     }
 }
