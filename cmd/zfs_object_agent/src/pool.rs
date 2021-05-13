@@ -32,9 +32,9 @@ const FREE_MIN_BLOCKS: u64 = 1000;
 const MAX_BYTES_PER_OBJECT: u32 = 1024 * 1024;
 
 // minimum number of chunks before we consider condensing
-const LOG_CONDENSE_MIN_CHUNKS: usize = 10;
-// when log is 3x as large as the condensed version
-const LOG_CONDENSE_MULTIPLE: usize = 3;
+const LOG_CONDENSE_MIN_CHUNKS: usize = 30;
+// when log is 5x as large as the condensed version
+const LOG_CONDENSE_MULTIPLE: usize = 5;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct PoolPhys {
@@ -1021,7 +1021,8 @@ async fn get_object_sizes(
                     object_sizes.insert(obj, num_bytes);
                 }
                 ObjectSizeLogEntry::Freed { obj } => {
-                    object_sizes.remove(&obj);
+                    // value must already exist
+                    object_sizes.remove(&obj).unwrap();
                 }
             }
             future::ready(())
@@ -1199,9 +1200,10 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
         syncing_state.stats.pending_frees_count, syncing_state.stats.blocks_count
     );
 
-    let (pending_frees_log_stream, num_chunks) = syncing_state.pending_frees_log.iterate_after(0);
+    let (pending_frees_log_stream, frees_num_chunks) =
+        syncing_state.pending_frees_log.iterate_after(0);
 
-    let object_size_log_stream = syncing_state.object_size_log.iterate();
+    let (object_size_log_stream, sizes_num_chunks) = syncing_state.object_size_log.iterate_after(0);
 
     let required_frees = syncing_state.stats.pending_frees_count
         - (syncing_state.stats.blocks_count as f64 * FREE_LOWWATER_PCT / 100f64) as u64;
@@ -1318,11 +1320,6 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
             remaining_frees.append(&mut frees);
         }
 
-        // release memory before waiting for i/o
-        drop(frees_per_obj);
-        drop(object_sizes);
-        drop(writing);
-
         let num_handles = join_handles.len();
         for jh in join_handles {
             let (obj, size) = jh.await.unwrap();
@@ -1345,8 +1342,9 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
                 syncing_state.stats.blocks_count -= freed_blocks_count;
                 syncing_state.stats.blocks_bytes -= freed_blocks_bytes;
 
-                build_new_frees(syncing_state, remaining_frees, num_chunks).await;
+                build_new_frees(syncing_state, remaining_frees, frees_num_chunks).await;
                 log_deleted_objects(state, syncing_state, deleted_objects);
+                try_condense_object_sizes(syncing_state, object_sizes, sizes_num_chunks).await;
                 log_new_sizes(syncing_state, rewritten_object_sizes);
 
                 syncing_state.reclaim_cb = None;
@@ -1357,7 +1355,7 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
 }
 
 //
-// following routines deal with condensing the StorageObjectLog
+// following routines deal with condensing other ObjectBasedLogs
 //
 
 async fn try_condense_object_log(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState) {
@@ -1372,7 +1370,7 @@ async fn try_condense_object_log(state: Arc<PoolState>, syncing_state: &mut Pool
     }
     let txg = syncing_state.syncing_txg.unwrap();
     info!(
-        "{:?} OBM condense: starting; objects={} entries={} len={}",
+        "{:?} storage_object_log condense: starting; objects={} entries={} len={}",
         txg,
         syncing_state.storage_object_log.num_chunks,
         syncing_state.storage_object_log.num_entries,
@@ -1396,10 +1394,69 @@ async fn try_condense_object_log(state: Arc<PoolState>, syncing_state: &mut Pool
     syncing_state.storage_object_log.flush(txg).await;
 
     info!(
-        "{:?} OBM condense: wrote {} entries to {} objects in {}ms",
+        "{:?} storage_object_log condense: wrote {} entries to {} objects in {}ms",
         txg,
         syncing_state.storage_object_log.num_entries,
         syncing_state.storage_object_log.num_chunks,
+        begin.elapsed().as_millis()
+    );
+}
+
+async fn try_condense_object_sizes(
+    syncing_state: &mut PoolSyncingState,
+    object_sizes: BTreeMap<ObjectID, u32>,
+    num_chunks: u64,
+) {
+    // XXX change this to be based on bytes, once those stats are working?
+    let len = object_sizes.len();
+    if syncing_state.object_size_log.num_chunks
+        < (LOG_CONDENSE_MIN_CHUNKS
+            + LOG_CONDENSE_MULTIPLE * (len + ENTRIES_PER_OBJECT) / ENTRIES_PER_OBJECT)
+            as u64
+    {
+        return;
+    }
+    let txg = syncing_state.syncing_txg.unwrap();
+    info!(
+        "{:?} object_size_log condense: starting; objects={} entries={} len={}",
+        txg,
+        syncing_state.object_size_log.num_chunks,
+        syncing_state.object_size_log.num_entries,
+        len
+    );
+
+    let begin = Instant::now();
+    // We need to call .iterate_after() before .clear(), otherwise we'd be
+    // iterating the new, empty generation.
+    syncing_state.object_size_log.flush(txg).await;
+    let (stream, _) = syncing_state.object_size_log.iterate_after(num_chunks);
+    syncing_state.object_size_log.clear(txg).await;
+    {
+        for (obj, num_bytes) in object_sizes.iter() {
+            syncing_state.object_size_log.append(
+                txg,
+                ObjectSizeLogEntry::Exists {
+                    obj: *obj,
+                    num_blocks: 0, // XXX need num blocks
+                    num_bytes: *num_bytes,
+                },
+            );
+        }
+    }
+
+    stream
+        .for_each(|ent| {
+            syncing_state.object_size_log.append(txg, ent);
+            future::ready(())
+        })
+        .await;
+    syncing_state.object_size_log.flush(txg).await;
+
+    info!(
+        "{:?} object_size_log condense: wrote {} entries to {} objects in {}ms",
+        txg,
+        syncing_state.object_size_log.num_entries,
+        syncing_state.object_size_log.num_chunks,
         begin.elapsed().as_millis()
     );
 }
