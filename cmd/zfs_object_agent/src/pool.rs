@@ -966,7 +966,8 @@ fn log_deleted_objects(
         syncing_state.objects_to_delete.push(obj);
     }
     info!(
-        "reclaim: logged {} deleted objects in {}ms",
+        "reclaim: {:?} logged {} deleted objects in {}ms",
+        txg,
         syncing_state.objects_to_delete.len(),
         begin.elapsed().as_millis()
     );
@@ -1002,7 +1003,8 @@ async fn build_new_frees(
     // info!() below.
     syncing_state.pending_frees_log.flush(txg).await;
     info!(
-        "reclaim: transferred {} freed blocks in {}ms",
+        "reclaim: {:?} transferred {} freed blocks in {}ms",
+        txg,
         syncing_state.stats.pending_frees_count,
         begin.elapsed().as_millis()
     );
@@ -1200,8 +1202,10 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
         return;
     }
     info!(
-        "reclaim: starting; pending_frees_count={} blocks_count={}",
-        syncing_state.stats.pending_frees_count, syncing_state.stats.blocks_count
+        "reclaim: {:?} starting; pending_frees_count={} blocks_count={}",
+        syncing_state.syncing_txg.unwrap(),
+        syncing_state.stats.pending_frees_count,
+        syncing_state.stats.blocks_count,
     );
 
     let (pending_frees_log_stream, frees_num_chunks) =
@@ -1341,8 +1345,6 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
 
         let r = s.send(Box::new(move |syncing_state| {
             Box::pin(async move {
-                info!("reclaim: complete; transferring tail of frees to new generation");
-
                 syncing_state.stats.blocks_count -= freed_blocks_count;
                 syncing_state.stats.blocks_bytes -= freed_blocks_bytes;
 
