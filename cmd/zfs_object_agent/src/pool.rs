@@ -976,14 +976,17 @@ fn log_deleted_objects(
 async fn build_new_frees(
     syncing_state: &mut PoolSyncingState,
     remaining_frees: Vec<PendingFreesLogEntry>,
-    num_chunks: u64,
+    remainder: ObjectBasedLogRemainder,
 ) {
     let txg = syncing_state.syncing_txg.unwrap();
     let begin = Instant::now();
 
     // We need to call .iterate_after() before .clear(), otherwise we'd be
     // iterating the new, empty generation.
-    let (stream, _) = syncing_state.pending_frees_log.iterate_after(num_chunks);
+    let stream = syncing_state
+        .pending_frees_log
+        .iter_remainder(txg, remainder)
+        .await;
     syncing_state.pending_frees_log.clear(txg).await;
 
     syncing_state.stats.pending_frees_count = 0;
@@ -1208,10 +1211,12 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
         syncing_state.stats.blocks_count,
     );
 
-    let (pending_frees_log_stream, frees_num_chunks) =
-        syncing_state.pending_frees_log.iterate_after(0);
+    // Note: the object size stream may or may not include entries added this
+    // txg.  Fortunately, the frees stream can't have any frees within object
+    // created this txg, so this is not a problem.
+    let (pending_frees_log_stream, frees_remainder) = syncing_state.pending_frees_log.iter_most();
 
-    let (object_size_log_stream, sizes_num_chunks) = syncing_state.object_size_log.iterate_after(0);
+    let (object_size_log_stream, sizes_remainder) = syncing_state.object_size_log.iter_most();
 
     let required_frees = syncing_state.stats.pending_frees_count
         - (syncing_state.stats.blocks_count as f64 * FREE_LOWWATER_PCT / 100f64) as u64;
@@ -1348,9 +1353,9 @@ fn try_reclaim_frees(state: Arc<PoolState>) {
                 syncing_state.stats.blocks_count -= freed_blocks_count;
                 syncing_state.stats.blocks_bytes -= freed_blocks_bytes;
 
-                build_new_frees(syncing_state, remaining_frees, frees_num_chunks).await;
+                build_new_frees(syncing_state, remaining_frees, frees_remainder).await;
                 log_deleted_objects(state, syncing_state, deleted_objects);
-                try_condense_object_sizes(syncing_state, object_sizes, sizes_num_chunks).await;
+                try_condense_object_sizes(syncing_state, object_sizes, sizes_remainder).await;
                 log_new_sizes(syncing_state, rewritten_object_sizes);
 
                 syncing_state.reclaim_cb = None;
@@ -1414,7 +1419,7 @@ async fn try_condense_object_log(state: Arc<PoolState>, syncing_state: &mut Pool
 async fn try_condense_object_sizes(
     syncing_state: &mut PoolSyncingState,
     object_sizes: BTreeMap<ObjectID, u32>,
-    num_chunks: u64,
+    remainder: ObjectBasedLogRemainder,
 ) {
     // XXX change this to be based on bytes, once those stats are working?
     let len = object_sizes.len();
@@ -1437,7 +1442,10 @@ async fn try_condense_object_sizes(
     let begin = Instant::now();
     // We need to call .iterate_after() before .clear(), otherwise we'd be
     // iterating the new, empty generation.
-    let (stream, _) = syncing_state.object_size_log.iterate_after(num_chunks);
+    let stream = syncing_state
+        .object_size_log
+        .iter_remainder(txg, remainder)
+        .await;
     syncing_state.object_size_log.clear(txg).await;
     {
         for (obj, num_bytes) in object_sizes.iter() {

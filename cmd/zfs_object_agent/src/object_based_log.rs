@@ -80,11 +80,16 @@ pub struct ObjectBasedLog<T: ObjectBasedLogEntry> {
     pool: Arc<PoolSharedState>,
     name: String,
     generation: u64,
+    num_flushed_chunks: u64,
     pub num_chunks: u64,
     pub num_entries: u64,
     pending_entries: Vec<T>,
     recovered: bool,
     pending_flushes: Vec<JoinHandle<()>>,
+}
+
+pub struct ObjectBasedLogRemainder {
+    chunk: u64,
 }
 
 impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
@@ -93,6 +98,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
             pool,
             name: name.to_string(),
             generation: 0,
+            num_flushed_chunks: 0,
             num_chunks: 0,
             num_entries: 0,
             recovered: true,
@@ -110,6 +116,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
             pool,
             name: name.to_string(),
             generation: phys.generation,
+            num_flushed_chunks: phys.num_chunks,
             num_chunks: phys.num_chunks,
             num_entries: phys.num_entries,
             recovered: false,
@@ -210,6 +217,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         for r in join_result {
             r.unwrap();
         }
+        self.num_flushed_chunks = self.num_chunks;
     }
 
     pub async fn clear(&mut self, txg: TXG) {
@@ -249,17 +257,28 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         entries
     }
 
+    /// Iterates the on-disk state; panics if there are pending changes.
     pub fn iterate(&self) -> impl Stream<Item = T> {
-        self.iterate_after(0).0
+        assert_eq!(self.num_flushed_chunks, self.num_chunks);
+        assert!(self.pending_entries.is_empty());
+        assert!(self.pending_flushes.is_empty());
+        self.iter_most().0
     }
 
     /// Iterates on-disk state, returns (stream, next_chunk), where the
     /// next_chunk can be passed in to a subsequent call to iterate the later
     /// entries that were not iterated by this stream
-    pub fn iterate_after(&self, first_chunk: u64) -> (impl Stream<Item = T>, u64) {
+    fn iter_impl(
+        &self,
+        first_chunk_opt: Option<ObjectBasedLogRemainder>,
+    ) -> (impl Stream<Item = T>, ObjectBasedLogRemainder) {
         let mut stream = FuturesOrdered::new();
         let generation = self.generation;
-        for chunk in first_chunk..self.num_chunks {
+        let first_chunk = match first_chunk_opt {
+            Some(rem) => rem.chunk,
+            None => 0,
+        };
+        for chunk in first_chunk..self.num_flushed_chunks {
             let pool = self.pool.clone();
             let n = self.name.clone();
             stream.push(async move {
@@ -280,7 +299,27 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
                     }
                 }
             },
-            self.num_chunks,
+            ObjectBasedLogRemainder {
+                chunk: self.num_flushed_chunks,
+            },
         )
+    }
+
+    /// Iterates the on-disk state; pending changes (including pending_entries
+    /// and pending_flushes) will not be visited.  Returns token for iterating
+    /// the remainder (entries after those visited here).
+    pub fn iter_most(&self) -> (impl Stream<Item = T>, ObjectBasedLogRemainder) {
+        self.iter_impl(None)
+    }
+
+    /// Iterates over the remainder of the log, starting from the token.  Waits
+    /// (async) for any pending changes to be flushed.
+    pub async fn iter_remainder(
+        &mut self,
+        txg: TXG,
+        first_chunk: ObjectBasedLogRemainder,
+    ) -> impl Stream<Item = T> {
+        self.flush(txg).await;
+        self.iter_impl(Some(first_chunk)).0
     }
 }
