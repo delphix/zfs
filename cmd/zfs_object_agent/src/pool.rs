@@ -997,6 +997,10 @@ async fn build_new_frees(
             future::ready(())
         })
         .await;
+    // Note: the caller (end_txg_cb()) is about to call flush(), but doing it
+    // here ensures that the time to PUT these objects is accounted for in the
+    // info!() below.
+    syncing_state.pending_frees_log.flush(txg).await;
     info!(
         "reclaim: transferred {} freed blocks in {}ms",
         syncing_state.stats.pending_frees_count,
@@ -1391,6 +1395,9 @@ async fn try_condense_object_log(state: Arc<PoolState>, syncing_state: &mut Pool
             );
         }
     }
+    // Note: the caller (end_txg_cb()) is about to call flush(), but doing it
+    // here ensures that the time to PUT these objects is accounted for in the
+    // info!() below.
     syncing_state.storage_object_log.flush(txg).await;
 
     info!(
@@ -1428,7 +1435,6 @@ async fn try_condense_object_sizes(
     let begin = Instant::now();
     // We need to call .iterate_after() before .clear(), otherwise we'd be
     // iterating the new, empty generation.
-    syncing_state.object_size_log.flush(txg).await;
     let (stream, _) = syncing_state.object_size_log.iterate_after(num_chunks);
     syncing_state.object_size_log.clear(txg).await;
     {
@@ -1450,6 +1456,9 @@ async fn try_condense_object_sizes(
             future::ready(())
         })
         .await;
+    // Note: the caller (end_txg_cb()) is about to call flush(), but doing it
+    // here ensures that the time to PUT these objects is accounted for in the
+    // info!() below.
     syncing_state.object_size_log.flush(txg).await;
 
     info!(
