@@ -211,43 +211,39 @@ impl ObjectAccess {
         delimiter: Option<String>,
     ) -> Vec<ListObjectsV2Output> {
         let full_prefix = prefixed(prefix);
-        retry(
-            &format!("list {} (delim {:?})", full_prefix, delimiter),
-            || async {
-                let mut results = Vec::new();
-                let mut continuation_token = None;
-                loop {
+        let mut results = Vec::new();
+        let mut continuation_token = None;
+        loop {
+            continuation_token = match retry(
+                &format!("list {} (delim {:?})", full_prefix, delimiter),
+                || async {
                     let req = ListObjectsV2Request {
                         bucket: self.bucket_str.clone(),
-                        continuation_token: continuation_token,
+                        continuation_token: continuation_token.clone(),
                         delimiter: delimiter.clone(),
-                        encoding_type: None,
-                        expected_bucket_owner: None,
                         fetch_owner: Some(false),
-                        max_keys: None,
                         prefix: Some(full_prefix.clone()),
-                        request_payer: None,
-                        start_after: None,
+                        ..Default::default()
                     };
-                    let res = self.client.list_objects_v2(req).await;
-                    match res {
-                        Ok(output) => {
-                            continuation_token = output.next_continuation_token.clone();
-                            results.push(output);
-                            if continuation_token.is_none() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            return (true, Err(e));
-                        }
-                    }
+                    (true, self.client.list_objects_v2(req).await)
+                },
+            )
+            .await
+            .unwrap()
+            {
+                #[rustfmt::skip]
+                output @ ListObjectsV2Output {next_continuation_token: Some(_), ..} => {
+                    let next_token = output.next_continuation_token.clone();
+                    results.push(output);
+                    next_token
                 }
-                (true, Ok(results))
-            },
-        )
-        .await
-        .unwrap()
+                output => {
+                    results.push(output);
+                    break;
+                }
+            }
+        }
+        results
     }
 
     async fn put_object_impl(&self, key: &str, data: Vec<u8>) {
@@ -344,12 +340,10 @@ impl ObjectAccess {
     pub async fn object_exists(&self, key: &str) -> bool {
         let prefixed_key = prefixed(key);
         debug!("looking for {}", prefixed_key);
-        let begin = Instant::now();
         let results = self.list_objects(key, None).await;
 
         assert_eq!(results.len(), 1);
         let list = &results[0];
-        debug!("list completed in {}ms", begin.elapsed().as_millis());
         // Note need to check if this exact name is in the results. If we are looking
         // for "x/y" and there is "x/y" and "x/yz", both will be returned.
         list.contents.as_ref().unwrap_or(&vec![]).iter().any(|o| {
