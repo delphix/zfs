@@ -6776,18 +6776,14 @@ ztest_run_zdb(char *pool)
 	char *bin;
 	char *zdb;
 	char *zbuf;
+	char *loc;
 	const int len = MAXPATHLEN + MAXNAMELEN + 20;
 	FILE *fp;
-
-	// XXX skip until zdb learns to access an object store.
-	if (ztest_opts.zo_obj_store) {
-		(void) printf("Skipping executing zdb.\n");
-		return;
-	}
 
 	bin = umem_alloc(len, UMEM_NOFAIL);
 	zdb = umem_alloc(len, UMEM_NOFAIL);
 	zbuf = umem_alloc(1024, UMEM_NOFAIL);
+	loc = umem_alloc(len, UMEM_NOFAIL);
 
 	ztest_get_zdb_bin(bin, len);
 
@@ -6795,17 +6791,28 @@ ztest_run_zdb(char *pool)
 	char *set_gvars_args_joined = join_strings(set_gvars_args, " ");
 	free(set_gvars_args);
 
+	if (ztest_opts.zo_obj_store) {
+		snprintf(loc, len, "-a %s -g %s -B %s -f %s ",
+		    ztest_opts.zo_obj_store_endpoint,
+		    ztest_opts.zo_obj_store_region,
+		    ztest_opts.zo_obj_store_bucket,
+		    ztest_opts.zo_obj_store_creds_file);
+	} else {
+		snprintf(loc, len, "-p %s ", ztest_opts.zo_dir);
+	}
+
 	size_t would = snprintf(zdb, len,
-	    "%s -bcc%s%s -G -d -Y -e -y %s -p %s %s",
+	    "%s -bcc%s%s -G -d -Y -e -y %s %s %s",
 	    bin,
 	    ztest_opts.zo_verbose >= 3 ? "s" : "",
 	    ztest_opts.zo_verbose >= 4 ? "v" : "",
 	    set_gvars_args_joined,
-	    ztest_opts.zo_dir,
+	    loc,
 	    pool);
 	ASSERT3U(would, <, len);
 
 	free(set_gvars_args_joined);
+	free(loc);
 
 	if (ztest_opts.zo_verbose >= 5)
 		(void) printf("Executing %s\n", strstr(zdb, "zdb "));

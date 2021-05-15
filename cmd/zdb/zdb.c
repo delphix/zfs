@@ -154,6 +154,7 @@ static int flagbits[256];
 uint64_t max_inflight_bytes = 256 * 1024 * 1024; /* 256MB */
 static int leaked_objects = 0;
 static range_tree_t *mos_refd_objs;
+static int objstore = 0;
 
 static void snprintf_blkptr_compact(char *, size_t, const blkptr_t *,
     boolean_t);
@@ -751,6 +752,9 @@ usage(void)
 	    "\t\t[<poolname>[/<dataset | objset id>] [<object | range> ...]]\n"
 	    "\t%s [-AdiPv] [-e [-V] [-p <path> ...]] [-U <cache>]\n"
 	    "\t\t[<poolname>[/<dataset | objset id>] [<object | range> ...]\n"
+	    "\t%s [-AdiPv] [-e [-V] -a <endpoint> -g <region> -B <bucket> "
+	    "-f <creds>]\n"
+	    "\t\t[<poolname>[/<dataset | objset id>] [<object | range> ...]\n"
 	    "\t%s [-v] <bookmark>\n"
 	    "\t%s -C [-A] [-U <cache>]\n"
 	    "\t%s -l [-Aqu] <device>\n"
@@ -764,7 +768,7 @@ usage(void)
 	    "\t%s -S [-AP] [-e [-V] [-p <path> ...]] [-U <cache>] "
 	    "<poolname>\n\n",
 	    cmdname, cmdname, cmdname, cmdname, cmdname, cmdname, cmdname,
-	    cmdname, cmdname, cmdname, cmdname);
+	    cmdname, cmdname, cmdname, cmdname, cmdname);
 
 	(void) fprintf(stderr, "    Dataset name must include at least one "
 	    "separator character '/' or '@'\n");
@@ -829,6 +833,12 @@ usage(void)
 	    "variable to an unsigned 32-bit integer\n");
 	(void) fprintf(stderr, "        -p <path> -- use one or more with "
 	    "-e to specify path to vdev dir\n");
+	(void) fprintf(stderr, "        -a <endpoint> -- use with "
+	    "-e to specify object-store endpoint\n");
+	(void) fprintf(stderr, "        -g <region> object-store region\n");
+	(void) fprintf(stderr, "        -B <bucket> object-store bucket\n");
+	(void) fprintf(stderr, "        -g <creds> object-store credential "
+	    "uri\n");
 	(void) fprintf(stderr, "        -P print numbers in parseable form\n");
 	(void) fprintf(stderr, "        -q don't print label contents\n");
 	(void) fprintf(stderr, "        -t <txg> -- highest txg to use when "
@@ -6310,6 +6320,16 @@ dump_block_stats(spa_t *spa)
 	int e, c, err;
 	bp_embedded_type_t i;
 
+	/*
+	 * For an objectstore based zpool, there are no space maps and zdb leak
+	 * detection will not work.
+	 */
+	if (objstore && !dump_opt['L']) {
+		(void) printf("\nSkipping leak detection for object-store "
+		    "based zpool.\n\n");
+		dump_opt['L'] = 1;
+	}
+
 	bzero(&zcb, sizeof (zcb));
 	(void) printf("\nTraversing all blocks %s%s%s%s%s...\n\n",
 	    (dump_opt['c'] || !dump_opt['L']) ? "to verify " : "",
@@ -8278,6 +8298,94 @@ zdb_embedded_block(char *thing)
 	free(buf);
 }
 
+
+static nvlist_t *
+make_objectstore_prop(char *endpoint, char *region, char *bucket,
+    char *creds)
+{
+	if (endpoint == NULL) {
+		(void) fprintf(stderr,
+		    "object-store endpoint not specified.\n");
+		usage();
+	}
+	if (region == NULL) {
+		(void) fprintf(stderr,
+		    "object-store region not specified.\n");
+		usage();
+	}
+	if (bucket == NULL) {
+		(void) fprintf(stderr,
+		    "object-store bucket not specified.\n");
+		usage();
+	}
+	if (creds == NULL) {
+		(void) fprintf(stderr,
+		    "object-store credentials not specified.\n");
+		usage();
+	}
+
+	nvlist_t *nv = fnvlist_alloc();
+	fnvlist_add_string(nv, ZPOOL_CONFIG_PATH, bucket);
+	fnvlist_add_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_ENDPOINT),
+	    endpoint);
+	fnvlist_add_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_REGION),
+	    region);
+	fnvlist_add_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS),
+	    creds);
+
+	return (nv);
+}
+
+static int
+load_obj_store_creds(char *obj_store_creds_file, char *obj_store_creds,
+    size_t cred_buf_size)
+{
+	int rc = 0;
+	char *file = obj_store_creds_file;
+	if (strlen(obj_store_creds_file) <= 8 ||
+	    strncmp("file:///", obj_store_creds_file, 8) == 0) {
+		file = obj_store_creds_file + 7;
+	} else {
+		return (EINVAL);
+	}
+
+	int fd = open(file, O_RDONLY);
+	if (fd == -1) {
+		(void) fprintf(stderr, "can't open %s", obj_store_creds_file);
+		return (errno);
+	}
+
+	int read_size = read(fd, obj_store_creds, cred_buf_size - 1);
+	if (read_size == -1) {
+		(void) fprintf(stderr, "can't read %s", obj_store_creds_file);
+		rc = errno;
+	} else {
+		obj_store_creds[read_size] = '\0';
+	}
+
+	(void) close(fd);
+
+	return (rc);
+}
+
+static int
+get_objstore_credentials(void *hdl, char *credloc, char **creds)
+{
+	char zo_obj_store_creds[MAXNAMELEN];
+
+	int rc = load_obj_store_creds(credloc, zo_obj_store_creds, MAXNAMELEN);
+	if (rc > 0) {
+		(void) fprintf(stderr,
+		    "Failed to read object-store credentials.\n");
+		exit(1);
+	}
+
+	*creds = umem_alloc(sizeof (zo_obj_store_creds), UMEM_NOFAIL);
+	bcopy(zo_obj_store_creds, *creds, sizeof (zo_obj_store_creds));
+
+	return (0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -8289,6 +8397,10 @@ main(int argc, char **argv)
 	int verbose = 0;
 	int error = 0;
 	char **searchdirs = NULL;
+	char *endpoint = NULL;
+	char *region = NULL;
+	char *bucket = NULL;
+	char *creds = NULL;
 	int nsearch = 0;
 	char *target, *target_pool, dsname[ZFS_MAX_DATASET_NAME_LEN];
 	nvlist_t *policy = NULL;
@@ -8323,7 +8435,7 @@ main(int argc, char **argv)
 	zfs_btree_verify_intensity = 3;
 
 	while ((c = getopt(argc, argv,
-	    "AbcCdDeEFGhiI:klLmMo:Op:PqrRsSt:uU:vVx:XYyZ")) != -1) {
+	    "a:AB:bcCdDeEf:Fg:GhiI:klLmMo:Op:PqrRsSt:uU:vVx:XYyZ")) != -1) {
 		switch (c) {
 		case 'b':
 		case 'c':
@@ -8408,6 +8520,22 @@ main(int argc, char **argv)
 				    "(i.e. start with a slash)\n");
 				usage();
 			}
+			break;
+		case 'a':
+			endpoint = optarg;
+			objstore = 1;
+			break;
+		case 'B':
+			bucket = optarg;
+			objstore = 1;
+			break;
+		case 'f':
+			creds = optarg;
+			objstore = 1;
+			break;
+		case 'g':
+			region = optarg;
+			objstore = 1;
 			break;
 		case 'v':
 			verbose++;
@@ -8564,7 +8692,13 @@ main(int argc, char **argv)
 		args.paths = nsearch;
 		args.path = searchdirs;
 		args.can_be_active = B_TRUE;
-
+		if (objstore) {
+			args.props = make_objectstore_prop(endpoint, region,
+			    bucket, creds);
+			args.handle_creds =
+			    (int (*)(void *, char *, char **))
+			    get_objstore_credentials;
+		}
 		error = zpool_find_config(NULL, target_pool, &cfg, &args,
 		    &libzpool_config_ops);
 
