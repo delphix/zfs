@@ -521,6 +521,18 @@ impl Pool {
         }
     }
 
+    pub fn get_prop(&self, name: &str) -> u64 {
+        // XXX get_prop() can be called while we are in the middle of end_txg,
+        // in which case the syncing_state lock will already be held
+        let stats = self.state.syncing_state.try_lock().unwrap().stats;
+        match name {
+            "zoa_allocated" => stats.pending_frees_bytes,
+            "zoa_freeing" => stats.pending_frees_bytes,
+            "zoa_objects" => stats.objects_count,
+            _ => panic!("invalid prop name: {}", name),
+        }
+    }
+
     pub fn begin_txg(&mut self, txg: TXG) {
         // the syncing_state is only held from the thread that owns the Pool
         // (i.e. this thread) and from end_txg(). It's not allowed to call this

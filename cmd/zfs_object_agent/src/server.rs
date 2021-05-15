@@ -137,6 +137,11 @@ impl Server {
                         trace!("got request: {:?}", nvl);
                         server.flush_writes();
                     }
+                    "get props" => {
+                        debug!("got request: {:?}", nvl);
+                        let props = nvl.lookup_nvlist("props").unwrap();
+                        server.get_props(props);
+                    }
                     "end txg" => {
                         debug!("got request: {:?}", nvl);
                         let uberblock = nvl.lookup("uberblock").unwrap().data();
@@ -275,6 +280,21 @@ impl Server {
     // no response
     fn flush_writes(&mut self) {
         self.pool.as_mut().unwrap().initiate_flush_object();
+    }
+
+    // sends response
+    fn get_props(&self, props: NvList) {
+        let mut response = NvList::new_unique_names();
+        let pool = self.pool.as_ref().unwrap();
+        for x in props.iter() {
+            let value = pool.get_prop(x.name().to_str().unwrap());
+            response.insert(x.name(), &value).unwrap();
+        }
+        let output = self.output.clone();
+        tokio::spawn(async move {
+            debug!("sending response: {:?}", response);
+            Self::send_response(&output, response).await;
+        });
     }
 
     // sends response when completed
