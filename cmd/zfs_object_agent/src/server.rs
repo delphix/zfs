@@ -15,7 +15,7 @@ pub struct Server {
     input: OwnedReadHalf,
     output: Arc<tokio::sync::Mutex<OwnedWriteHalf>>,
     // Pool is Some once we get a "open pool" request
-    pool: Option<Pool>,
+    pool: Option<Arc<Pool>>,
     num_outstanding_writes: Arc<std::sync::Mutex<usize>>,
 }
 
@@ -95,6 +95,7 @@ impl Server {
                         if server.pool.is_some()
                             && *server.num_outstanding_writes.lock().unwrap() > 0
                         {
+                            trace!("timeout; flushing writes");
                             server.flush_writes();
                         }
                         continue;
@@ -257,7 +258,7 @@ impl Server {
     /// initiate pool opening.  Responds when pool is open
     async fn open_pool(&mut self, object_access: &ObjectAccess, guid: PoolGUID) {
         let (pool, phys_opt, next_block) = Pool::open(object_access, guid).await;
-        self.pool = Some(pool);
+        self.pool = Some(Arc::new(pool));
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "pool open done").unwrap();
         nvl.insert("GUID", &guid.0).unwrap();
@@ -274,24 +275,33 @@ impl Server {
 
     // no response
     fn begin_txg(&mut self, txg: TXG) {
-        self.pool.as_mut().unwrap().begin_txg(txg);
+        let pool = self.pool.as_ref().unwrap().clone();
+        pool.begin_txg(txg);
     }
 
     // no response
     fn flush_writes(&mut self) {
-        self.pool.as_mut().unwrap().initiate_flush_object();
+        let pool = self.pool.as_ref().unwrap().clone();
+        tokio::spawn(async move {
+            pool.initiate_flush_object().await;
+        });
     }
 
     // sends response
     fn get_props(&self, props: NvList) {
-        let mut response = NvList::new_unique_names();
-        let pool = self.pool.as_ref().unwrap();
-        for x in props.iter() {
-            let value = pool.get_prop(x.name().to_str().unwrap());
-            response.insert(x.name(), &value).unwrap();
+        let pool = self.pool.as_ref().unwrap().clone();
+        let mut props_vec = Vec::new();
+        for p in props.iter() {
+            props_vec.push(p.name().to_str().unwrap().to_owned());
         }
         let output = self.output.clone();
+
         tokio::spawn(async move {
+            let mut response = NvList::new_unique_names();
+            for n in props_vec {
+                let value = pool.get_prop(n.as_ref()).await;
+                response.insert(n, &value).unwrap();
+            }
             debug!("sending response: {:?}", response);
             Self::send_response(&output, response).await;
         });
@@ -299,9 +309,13 @@ impl Server {
 
     // sends response when completed
     fn end_txg(&mut self, uberblock: Vec<u8>, config: Vec<u8>) {
-        let pool = self.pool.as_mut().unwrap();
+        let pool = self.pool.as_ref().unwrap().clone();
         let output = self.output.clone();
-        pool.end_txg_cb(uberblock, config, async move {
+        // client should have already flushed all writes
+        // XXX change to an error return
+        assert_eq!(*self.num_outstanding_writes.lock().unwrap(), 0);
+        tokio::spawn(async move {
+            pool.end_txg(uberblock, config).await;
             let mut nvl = NvList::new_unique_names();
             nvl.insert("Type", "end txg done").unwrap();
             debug!("sending response: {:?}", nvl);
@@ -312,14 +326,15 @@ impl Server {
     /// queue write, sends response when completed (persistent).  Does not block.
     /// completion may not happen until flush_pool() is called
     fn write_block(&mut self, block: BlockID, data: Vec<u8>, request_id: u64) {
-        let pool = self.pool.as_mut().unwrap();
+        let pool = self.pool.as_ref().unwrap().clone();
         let output = self.output.clone();
         let now = self.num_outstanding_writes.clone();
         let mut count = now.lock().unwrap();
         *count += 1;
         drop(count);
-        pool.write_block_cb(block, data, async move {
-            // Note: {braces} needed so that count goes away before the .await
+        tokio::spawn(async move {
+            pool.write_block(block, data).await;
+            // Note: {braces} needed so that lock is dropped before the .await
             {
                 let mut count = now.lock().unwrap();
                 *count -= 1;
@@ -335,14 +350,18 @@ impl Server {
 
     /// initiate free.  No response.  Does not block.  Completes when the current txg is ended.
     fn free_block(&mut self, block: BlockID, size: u32) {
-        self.pool.as_mut().unwrap().free_block(block, size);
+        let pool = self.pool.as_ref().unwrap().clone();
+        tokio::spawn(async move {
+            pool.free_block(block, size).await;
+        });
     }
 
     /// initiate read, sends response when completed.  Does not block.
     fn read_block(&mut self, block: BlockID, request_id: u64) {
-        let pool = self.pool.as_mut().unwrap();
+        let pool = self.pool.as_ref().unwrap().clone();
         let output = self.output.clone();
-        pool.read_block_cb(block, move |data| async move {
+        tokio::spawn(async move {
+            let data = pool.read_block(block).await;
             let mut nvl = NvList::new_unique_names();
             nvl.insert("Type", "read done").unwrap();
             nvl.insert("block", &block.0).unwrap();

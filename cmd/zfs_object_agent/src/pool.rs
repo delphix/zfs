@@ -3,7 +3,6 @@ use crate::object_block_map::ObjectBlockMap;
 use crate::{base_types::*, object_access::ObjectAccess};
 use core::future::Future;
 use futures::future;
-use futures::future::*;
 use futures::stream::*;
 use log::*;
 use more_asserts::*;
@@ -20,7 +19,6 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use stream_reduce::Reduce;
 use tokio::sync::*;
-use tokio::task::JoinHandle;
 
 // XXX need a real tunables infrastructure
 // start freeing when the pending frees are this % of the entire pool
@@ -249,21 +247,8 @@ pub struct Pool {
 
 //#[derive(Debug)]
 pub struct PoolState {
-    // The syncing_state mutex is either owned by the syncing task (spawned by
-    // end_txg_cb()) or by the owner of the containing Pool. When acquired by
-    // the containing pool, end_txg_cb() must not be running. In other words,
-    // the pool's logical contents can not be mutated (by writing/freeing a
-    // block) while end_txg_cb() is running. Given this access pattern, there is
-    // never any contention on the mutex and therefore we can always use
-    // try_lock() then return an error to the caller if the lock can't be
-    // acquired, which only happens due to incorrect usage as mentioned above.
-    // In other words, the Mutex is only used to pass ownership of the syncing
-    // state between the one "open context" thread and the one "syncing context"
-    // thread.
     syncing_state: tokio::sync::Mutex<PoolSyncingState>,
-
     block_to_obj: std::sync::RwLock<ObjectBlockMap>,
-
     pub readonly_state: Arc<PoolSharedState>,
 }
 
@@ -284,8 +269,8 @@ struct PoolSyncingState {
     // if we crashed while processing pending frees.
     pending_frees_log: ObjectBasedLog<PendingFreesLogEntry>,
 
-    pending_object: PendingObject,
-    pending_flushes: Vec<JoinHandle<()>>,
+    pending_object: PendingObjectState,
+    pending_unordered_writes: HashMap<BlockID, (ByteBuf, oneshot::Sender<()>)>,
     pub last_txg: TXG,
     pub syncing_txg: Option<TXG>,
     stats: PoolStatsPhys,
@@ -300,9 +285,25 @@ type SyncTask =
     Box<dyn FnOnce(&mut PoolSyncingState) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> + Send>;
 
 #[derive(Debug)]
-enum PendingObject {
-    Pending(DataObjectPhys, Arc<Semaphore>), // available to write
+enum PendingObjectState {
+    Pending(DataObjectPhys, Vec<oneshot::Sender<()>>), // available to write
     NotPending(BlockID), // not available to write; this is the next blockID to use
+}
+
+impl PendingObjectState {
+    fn as_mut_pending(&mut self) -> (&mut DataObjectPhys, &mut Vec<oneshot::Sender<()>>) {
+        match self {
+            PendingObjectState::Pending(phys, done) => (phys, done),
+            _ => panic!("invalid {:?}", self),
+        }
+    }
+
+    fn unwrap_pending(self) -> (DataObjectPhys, Vec<oneshot::Sender<()>>) {
+        match self {
+            PendingObjectState::Pending(phys, done) => (phys, done),
+            _ => panic!("invalid {:?}", self),
+        }
+    }
 }
 
 /*
@@ -319,8 +320,8 @@ pub struct PoolSharedState {
 impl PoolSyncingState {
     fn next_block(&self) -> BlockID {
         match &self.pending_object {
-            PendingObject::Pending(phys, _) => phys.next_block,
-            PendingObject::NotPending(next_block) => *next_block,
+            PendingObjectState::Pending(phys, _) => phys.next_block,
+            PendingObjectState::NotPending(next_block) => *next_block,
         }
     }
 
@@ -383,8 +384,8 @@ impl Pool {
                         &format!("zfs/{}/PendingFreesLog", pool_phys.guid),
                         &phys.pending_frees_log,
                     ),
-                    pending_object: PendingObject::NotPending(phys.next_block),
-                    pending_flushes: Vec::new(),
+                    pending_object: PendingObjectState::NotPending(phys.next_block),
+                    pending_unordered_writes: HashMap::new(),
                     stats: phys.stats,
                     reclaim_cb: None,
                     rewriting_objects: HashMap::new(),
@@ -394,7 +395,7 @@ impl Pool {
             }),
         };
 
-        let mut syncing_state = pool.state.syncing_state.lock().await;
+        let mut syncing_state = pool.state.syncing_state.try_lock().unwrap();
 
         syncing_state.storage_object_log.recover().await;
         syncing_state.object_size_log.recover().await;
@@ -442,29 +443,6 @@ impl Pool {
             syncing_state.stats.objects_count
         );
 
-        // load free map just to verify
-        /*
-        let begin = Instant::now();
-        let mut frees: HashSet<BlockID> = HashSet::new();
-        syncing_state
-            .pending_frees_log
-            .iterate()
-            .for_each(|ent| {
-                let inserted = frees.insert(ent.block);
-                if !inserted {
-                    println!("duplicate free entry {:?}", ent.block);
-                }
-                assert!(inserted);
-                future::ready(())
-            })
-            .await;
-        println!(
-            "loaded {} freed blocks in {}ms",
-            frees.len(),
-            begin.elapsed().as_millis()
-        );
-        */
-        //println!("{:#?}", frees);
         let next_block = syncing_state.next_block();
         drop(syncing_state);
 
@@ -502,8 +480,8 @@ impl Pool {
                             readonly_state.clone(),
                             &format!("zfs/{}/PendingFreesLog", guid),
                         ),
-                        pending_object: PendingObject::NotPending(BlockID(0)),
-                        pending_flushes: Vec::new(),
+                        pending_object: PendingObjectState::NotPending(BlockID(0)),
+                        pending_unordered_writes: HashMap::new(),
                         stats: PoolStatsPhys::default(),
                         reclaim_cb: None,
                         rewriting_objects: HashMap::new(),
@@ -521,10 +499,14 @@ impl Pool {
         }
     }
 
-    pub fn get_prop(&self, name: &str) -> u64 {
-        // XXX get_prop() can be called while we are in the middle of end_txg,
-        // in which case the syncing_state lock will already be held
-        let stats = self.state.syncing_state.try_lock().unwrap().stats;
+    pub async fn get_prop(&self, name: &str) -> u64 {
+        /*
+         * XXX find another way to get stats that doesn't invlove getting the
+         * syncing state lock. The problem is that we need benig_txg() to get the
+         * lock without waiting, which is otherwise OK since there can't be
+         * writes, frees, or end_txg's going on while we try to start a txg.
+         */
+        let stats = self.state.syncing_state.lock().await.stats;
         match name {
             "zoa_allocated" => stats.pending_frees_bytes,
             "zoa_freeing" => stats.pending_frees_bytes,
@@ -533,12 +515,12 @@ impl Pool {
         }
     }
 
-    pub fn begin_txg(&mut self, txg: TXG) {
-        // the syncing_state is only held from the thread that owns the Pool
-        // (i.e. this thread) and from end_txg(). It's not allowed to call this
-        // function while in the middle of an end_txg(), so the lock must not be
-        // held. XXX change this to return an error to the client
-        let syncing_state = &mut self.state.syncing_state.try_lock().unwrap();
+    pub fn begin_txg(&self, txg: TXG) {
+        // The syncing_state is only held while a txg is open (begun).  It's not
+        // allowed to call begin_txg() while a txg is already open, so the lock
+        // must not be held.
+        // XXX change this to return an error to the client
+        let mut syncing_state = self.state.syncing_state.try_lock().unwrap();
 
         assert!(syncing_state.syncing_txg.is_none());
         assert_gt!(txg.0, syncing_state.last_txg.0);
@@ -546,8 +528,8 @@ impl Pool {
         let last_obj = self.state.block_to_obj.read().unwrap().last_obj();
 
         match syncing_state.pending_object {
-            PendingObject::NotPending(next_block) => {
-                syncing_state.pending_object = PendingObject::Pending(
+            PendingObjectState::NotPending(next_block) => {
+                syncing_state.pending_object = PendingObjectState::Pending(
                     DataObjectPhys {
                         guid: self.state.readonly_state.guid,
                         object: last_obj.next(),
@@ -558,7 +540,7 @@ impl Pool {
                         blocks_size: 0,
                         blocks: HashMap::new(),
                     },
-                    Arc::new(Semaphore::new(0)),
+                    Vec::new(),
                 );
             }
             _ => {
@@ -567,114 +549,98 @@ impl Pool {
         }
     }
 
-    pub fn end_txg_cb<F>(&mut self, uberblock: Vec<u8>, config: Vec<u8>, cb: F)
-    where
-        F: Future + Send + 'static,
-    {
-        self.initiate_flush_object_impl(false);
+    pub async fn end_txg(&self, uberblock: Vec<u8>, config: Vec<u8>) {
+        let state = &self.state;
+        let mut syncing_state = state.syncing_state.lock().await;
 
-        try_reclaim_frees(self.state.clone());
+        // should have already been flushed; no pending writes
+        assert!(syncing_state.pending_unordered_writes.is_empty());
+        {
+            let (phys, senders) = syncing_state.pending_object.as_mut_pending();
+            assert!(phys.blocks.is_empty());
+            assert!(senders.is_empty());
 
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            let mut syncing_state = state.syncing_state.try_lock().unwrap();
-            try_condense_object_log(state.clone(), &mut syncing_state).await;
-            let txg = syncing_state.syncing_txg.unwrap();
-            Self::wait_for_pending_flushes(&mut syncing_state).await;
-            syncing_state.rewriting_objects.clear();
-
-            // Should only be adding to this during end_txg.
-            // XXX change to an Option?
-            assert!(syncing_state.objects_to_delete.is_empty());
-
-            if let Some(rt) = syncing_state.reclaim_cb.as_mut() {
-                if let Ok(cb) = rt.try_recv() {
-                    cb(&mut syncing_state).await;
-                }
-            }
-
-            syncing_state.storage_object_log.flush(txg).await;
-            syncing_state.object_size_log.flush(txg).await;
-            syncing_state.pending_frees_log.flush(txg).await;
-
-            // write uberblock
-            let u = UberblockPhys {
-                guid: state.readonly_state.guid,
-                txg,
-                date: SystemTime::now(),
-                storage_object_log: syncing_state.storage_object_log.to_phys(),
-                object_size_log: syncing_state.object_size_log.to_phys(),
-                pending_frees_log: syncing_state.pending_frees_log.to_phys(),
-                next_block: syncing_state.next_block(),
-                zfs_uberblock: TerseVec(uberblock),
-                stats: syncing_state.stats,
-                zfs_config: TerseVec(config),
-            };
-            u.put(&state.readonly_state.object_access).await;
-
-            // write super
-            let s = PoolPhys {
-                guid: state.readonly_state.guid,
-                name: state.readonly_state.name.clone(),
-                last_txg: txg,
-            };
-            s.put(&state.readonly_state.object_access).await;
-
-            // Now that the metadata state has been atomically moved forward, we
-            // can delete objects that are no longer needed
-            // Note: we don't care about waiting for the frees to complete.
-            // XXX need some mechanism to clean up these objects if we crash
-            // Note: we intentionally issue the delete calls serially because
-            // AWS doesn't like getting a lot of them at the same time (it
-            // returns HTTP 503 "Please reduce your request rate.")
-            let objects_to_delete = syncing_state.objects_to_delete.split_off(0);
-            let my_state = state.clone();
-            tokio::spawn(async move {
-                let begin = Instant::now();
-                let len = objects_to_delete.len();
-                for objs in objects_to_delete.chunks(900) {
-                    let mut v = Vec::new();
-                    for obj in objs {
-                        let key = DataObjectPhys::key(my_state.readonly_state.guid, *obj);
-                        v.push(key);
-                    }
-                    my_state
-                        .readonly_state
-                        .object_access
-                        .delete_objects(v)
-                        .await;
-                }
-                if len != 0 {
-                    info!(
-                        "deleted {} objects in {}ms",
-                        len,
-                        begin.elapsed().as_millis()
-                    );
-                }
-            });
-
-            // update txg
-            syncing_state.last_txg = txg;
-            syncing_state.syncing_txg = None;
-
-            // We need to drop the mutex before sending response (in callback).
-            // Otherwise we could send the response, and get another request
-            // which needs the mutex before we drop it. Since we are using
-            // try_enter().unwrap(), that would panic if we are still holding
-            // the mutex.
-            drop(syncing_state);
-            cb.await;
-        });
-    }
-
-    async fn wait_for_pending_flushes(syncing_state: &mut PoolSyncingState) {
-        // these should be equivalent
-        //let wait_for = self.pending_flushes.split_off(0);
-        let wait_for = mem::take(&mut syncing_state.pending_flushes);
-        let join_result = join_all(wait_for).await;
-        for r in join_result {
-            r.unwrap();
+            syncing_state.pending_object = PendingObjectState::NotPending(phys.next_block);
         }
+
+        try_reclaim_frees(state.clone(), &mut syncing_state);
+        try_condense_object_log(state.clone(), &mut syncing_state).await;
+
+        syncing_state.rewriting_objects.clear();
+
+        let txg = syncing_state.syncing_txg.unwrap();
+
+        // Should only be adding to this during end_txg.
+        // XXX change to an Option?
+        assert!(syncing_state.objects_to_delete.is_empty());
+
+        if let Some(rt) = syncing_state.reclaim_cb.as_mut() {
+            if let Ok(cb) = rt.try_recv() {
+                cb(&mut syncing_state).await;
+            }
+        }
+
+        // XXX await these 3 at the same time?
+        syncing_state.storage_object_log.flush(txg).await;
+        syncing_state.object_size_log.flush(txg).await;
+        syncing_state.pending_frees_log.flush(txg).await;
+
+        // write uberblock
+        let u = UberblockPhys {
+            guid: state.readonly_state.guid,
+            txg,
+            date: SystemTime::now(),
+            storage_object_log: syncing_state.storage_object_log.to_phys(),
+            object_size_log: syncing_state.object_size_log.to_phys(),
+            pending_frees_log: syncing_state.pending_frees_log.to_phys(),
+            next_block: syncing_state.next_block(),
+            zfs_uberblock: TerseVec(uberblock),
+            stats: syncing_state.stats,
+            zfs_config: TerseVec(config),
+        };
+        u.put(&state.readonly_state.object_access).await;
+
+        // write super
+        let s = PoolPhys {
+            guid: state.readonly_state.guid,
+            name: state.readonly_state.name.clone(),
+            last_txg: txg,
+        };
+        s.put(&state.readonly_state.object_access).await;
+
+        // Now that the metadata state has been atomically moved forward, we
+        // can delete objects that are no longer needed
+        // Note: we don't care about waiting for the frees to complete.
+        // XXX need some mechanism to clean up these objects if we crash
+        // Note: we intentionally issue the delete calls serially because
+        // AWS doesn't like getting a lot of them at the same time (it
+        // returns HTTP 503 "Please reduce your request rate.")
+        // XXX move this code to its own function?
+        let objects_to_delete = syncing_state.objects_to_delete.split_off(0);
+        let readonly_state = state.readonly_state.clone();
+        tokio::spawn(async move {
+            let begin = Instant::now();
+            let len = objects_to_delete.len();
+            for objs in objects_to_delete.chunks(900) {
+                let mut v = Vec::new();
+                for obj in objs {
+                    let key = DataObjectPhys::key(readonly_state.guid, *obj);
+                    v.push(key);
+                }
+                readonly_state.object_access.delete_objects(v).await;
+            }
+            if len != 0 {
+                info!(
+                    "deleted {} objects in {}ms",
+                    len,
+                    begin.elapsed().as_millis()
+                );
+            }
+        });
+
+        // update txg
+        syncing_state.last_txg = txg;
+        syncing_state.syncing_txg = None;
     }
 
     /*
@@ -686,73 +652,55 @@ impl Pool {
     pub async fn flush_up_to(&mut self, block: BlockID) {}
     */
 
-    pub fn initiate_flush_object(&mut self) {
-        self.initiate_flush_object_impl(true);
-    }
-
-    // completes when we've initiated the PUT to the object store.
-    // callers should wait on the semaphore to ensure it's completed
-    fn initiate_flush_object_impl(&mut self, new_pending: bool) {
-        // the syncing_state is only held from the thread that owns the Pool
-        // (i.e. this thread) and from end_txg(). It's not allowed to call this
-        // function while in the middle of an end_txg(), so the lock must not be
-        // held. XXX change this to return an error to the client
-        let syncing_state = &mut self.state.syncing_state.try_lock().unwrap();
-
+    // Note: only flushes writes that we've received, that are in-order.
+    // pending_unordered_writes are not flushed.
+    pub async fn initiate_flush_object(&self) {
+        let mut syncing_state = self.state.syncing_state.lock().await;
         // XXX because called when server times out waiting for request
         if syncing_state.syncing_txg.is_none() {
             return;
         }
 
+        Self::initiate_flush_object_impl(&self.state, &mut *syncing_state);
+    }
+
+    // completes when we've initiated the PUT to the object store.
+    // callers should wait on the semaphore to ensure it's completed
+    fn initiate_flush_object_impl(state: &PoolState, syncing_state: &mut PoolSyncingState) {
         let txg = syncing_state.syncing_txg.unwrap();
 
-        let (obj, next_block) = match &syncing_state.pending_object {
-            PendingObject::Pending(phys, _) => {
-                if phys.blocks.is_empty() {
-                    if !new_pending {
-                        syncing_state.pending_object = PendingObject::NotPending(phys.min_block);
-                    }
-                    return;
-                } else {
-                    (phys.object, phys.next_block)
-                }
+        let (obj, next_block) = {
+            let (phys, _) = syncing_state.pending_object.as_mut_pending();
+            if phys.blocks.is_empty() {
+                return;
+            } else {
+                (phys.object, phys.next_block)
             }
-            _ => panic!("invalid {:?}", syncing_state.pending_object),
         };
 
-        let (phys, done) = match {
-            mem::replace(
-                &mut syncing_state.pending_object,
-                match new_pending {
-                    true => PendingObject::Pending(
-                        DataObjectPhys {
-                            guid: self.state.readonly_state.guid,
-                            object: obj.next(),
-                            min_txg: txg,
-                            max_txg: txg,
-                            min_block: next_block,
-                            next_block,
-                            blocks_size: 0,
-                            blocks: HashMap::new(),
-                        },
-                        Arc::new(Semaphore::new(0)),
-                    ),
-                    false => PendingObject::NotPending(next_block),
+        let (phys, senders) = mem::replace(
+            &mut syncing_state.pending_object,
+            PendingObjectState::Pending(
+                DataObjectPhys {
+                    guid: state.readonly_state.guid,
+                    object: obj.next(),
+                    min_txg: txg,
+                    max_txg: txg,
+                    min_block: next_block,
+                    next_block,
+                    blocks_size: 0,
+                    blocks: HashMap::new(),
                 },
-            )
-        } {
-            PendingObject::Pending(phys, done) => (phys, done),
-            _ => panic!("invalid {:?}", syncing_state.pending_object),
-        };
+                Vec::new(),
+            ),
+        )
+        .unwrap_pending();
 
-        assert_eq!(phys.guid, self.state.readonly_state.guid);
+        assert_eq!(phys.guid, state.readonly_state.guid);
         assert_eq!(phys.min_txg, txg);
         assert_eq!(phys.max_txg, txg);
 
-        assert_eq!(
-            obj,
-            self.state.block_to_obj.read().unwrap().last_obj().next()
-        );
+        assert_eq!(obj, state.block_to_obj.read().unwrap().last_obj().next());
 
         // increment stats
         syncing_state.stats.objects_count += 1;
@@ -760,7 +708,7 @@ impl Pool {
         syncing_state.stats.blocks_count += phys.blocks.len() as u64;
 
         // add to in-memory block->object map
-        self.state
+        state
             .block_to_obj
             .write()
             .unwrap()
@@ -794,12 +742,14 @@ impl Pool {
             phys.min_block
         );
 
-        // write to object store
-        let readonly_state = self.state.readonly_state.clone();
-        syncing_state.pending_flushes.push(tokio::spawn(async move {
+        // write to object store and wake up waiters
+        let readonly_state = state.readonly_state.clone();
+        tokio::spawn(async move {
             phys.put(&readonly_state.object_access).await;
-            done.close();
-        }));
+            for s in senders {
+                s.send(()).unwrap();
+            }
+        });
     }
 
     fn do_overwrite_impl(
@@ -807,12 +757,11 @@ impl Pool {
         syncing_state: &mut PoolSyncingState,
         id: BlockID,
         data: Vec<u8>,
-    ) -> (Arc<Semaphore>, bool) {
+    ) -> oneshot::Receiver<()> {
         let obj = state.block_to_obj.read().unwrap().block_to_obj(id);
         let shared_state = state.readonly_state.clone();
         let txg = syncing_state.syncing_txg.unwrap();
-        let sem = Arc::new(Semaphore::new(0));
-        let sem2 = sem.clone();
+        let (s, r) = oneshot::channel();
 
         // lock is needed because client could concurrently overwrite 2
         // blocks in the same object. If the get/put's from the object store
@@ -844,93 +793,89 @@ impl Pool {
 
             obj_phys.blocks.insert(id, ByteBuf::from(data));
             obj_phys.put(&shared_state.object_access).await;
-            sem2.close();
+            s.send(()).unwrap();
         });
-        (sem, false)
+        r
     }
 
-    // XXX change to return a Future rather than Arc<Sem>?
-    fn do_write_impl(&mut self, id: BlockID, data: Vec<u8>) -> (Arc<Semaphore>, bool) {
-        // the syncing_state is only held from the thread that owns the Pool
-        // (i.e. this thread) and from end_txg(). It's not allowed to call
-        // this function while in the middle of an end_txg(), so the lock
-        // must not be held. XXX change this to return an error to the
-        // client
-        let mut syncing_state = self.state.syncing_state.try_lock().unwrap();
-        assert!(syncing_state.syncing_txg.is_some());
-        //assert!(id >= Self::next_block_locked(&syncing_state));
-        if id < syncing_state.next_block() {
-            // XXX the design is for this to not happen. Writes must be received
-            // in blockID-order. However, for now we allow overwrites during
-            // sync to convergence via this slow path.
-            return Self::do_overwrite_impl(&self.state, &mut syncing_state, id, data);
+    fn write_unordered_to_ordered(
+        state: &PoolState,
+        mut syncing_state: MutexGuard<PoolSyncingState>,
+    ) {
+        let mut nb = syncing_state.next_block();
+        while let Some((buf, s)) = syncing_state.pending_unordered_writes.remove(&nb) {
+            trace!(
+                "found next {:?} in unordered pending writes; transferring to pending object",
+                nb
+            );
+            let (phys, senders) = syncing_state.pending_object.as_mut_pending();
+            phys.blocks_size += buf.len() as u32;
+            phys.blocks.insert(phys.next_block, buf);
+            nb = nb.next();
+            phys.next_block = nb;
+            //let (_, senders) = syncing_state.pending_object.unwrap_pending();
+            senders.push(s);
+            if phys.blocks_size >= MAX_BYTES_PER_OBJECT {
+                Self::initiate_flush_object_impl(state, &mut syncing_state);
+            }
+        }
+    }
+
+    pub async fn write_block(&self, id: BlockID, data: Vec<u8>) {
+        let r;
+        // ensure that the syncig_state lock is dropped before we wait on `r`.
+        {
+            let mut syncing_state = self.state.syncing_state.lock().await;
+            // XXX change to return error
+            assert!(syncing_state.syncing_txg.is_some());
+
+            if id < syncing_state.next_block() {
+                // XXX the design is for this to not happen. Writes must be received
+                // in blockID-order. However, for now we allow overwrites during
+                // sync to convergence via this slow path.
+                r = Self::do_overwrite_impl(&self.state, &mut syncing_state, id, data);
+            } else {
+                let (s, myr) = oneshot::channel();
+                trace!("inserting {:?} to unordered pending writes", id);
+                syncing_state
+                    .pending_unordered_writes
+                    .insert(id, (ByteBuf::from(data), s));
+
+                Self::write_unordered_to_ordered(&self.state, syncing_state);
+                r = myr;
+            };
         }
 
-        let (phys, done) = match &mut syncing_state.pending_object {
-            PendingObject::Pending(phys, done) => (phys, done),
-            _ => panic!("invalid {:?}", syncing_state.pending_object),
-        };
-
-        phys.blocks_size += data.len() as u32;
-        phys.blocks.insert(id, ByteBuf::from(data));
-        assert_ge!(id, phys.min_block);
-        assert_ge!(id, phys.next_block);
-        phys.next_block = id.next();
-        let do_flush = phys.blocks_size >= MAX_BYTES_PER_OBJECT;
-        (done.clone(), do_flush)
+        r.await.unwrap();
     }
 
-    pub fn write_block_cb<F>(&mut self, id: BlockID, data: Vec<u8>, cb: F)
-    where
-        F: Future + Send + 'static,
-    {
-        // since initiate_flush_object() gets the syncing_state mutex, we need
-        // to drop the mutex before calling it
-        let (sem, do_flush) = self.do_write_impl(id, data);
-
-        if do_flush {
-            self.initiate_flush_object();
-        }
-
-        tokio::spawn(async move {
-            let res = sem.acquire().await;
-            assert!(res.is_err());
-            cb.await;
-        });
-    }
-
-    pub fn read_block_cb<F>(&self, id: BlockID, cb: impl FnOnce(Vec<u8>) -> F + Send + 'static)
-    where
-        F: Future + Send + 'static,
-    {
+    pub async fn read_block(&self, id: BlockID) -> Vec<u8> {
         let obj = self.state.block_to_obj.read().unwrap().block_to_obj(id);
         let readonly_state = self.state.readonly_state.clone();
         //let state = self.state.clone();
 
-        tokio::spawn(async move {
-            debug!("reading {:?} for {:?}", obj, id);
-            let block =
-                DataObjectPhys::get(&readonly_state.object_access, readonly_state.guid, obj).await;
-            // XXX consider using debug_assert_eq
-            assert_eq!(
-                block.blocks_size as usize,
-                block.blocks.values().map(|x| x.len()).sum::<usize>()
-            );
-            if block.blocks.get(&id).is_none() {
-                //println!("{:#?}", self.objects);
-                error!("{:#?}", block);
-            }
-            // XXX to_owned() copies the data; would be nice to pass a reference to the callback
-            cb(block.blocks.get(&id).unwrap().to_owned().into_vec()).await;
-        });
+        debug!("reading {:?} for {:?}", obj, id);
+        let block =
+            DataObjectPhys::get(&readonly_state.object_access, readonly_state.guid, obj).await;
+        // XXX consider using debug_assert_eq
+        assert_eq!(
+            block.blocks_size as usize,
+            block.blocks.values().map(|x| x.len()).sum::<usize>()
+        );
+        if block.blocks.get(&id).is_none() {
+            //println!("{:#?}", self.objects);
+            error!("{:#?}", block);
+        }
+        // XXX to_owned() copies the data; would be nice to pass a reference to the callback
+        block.blocks.get(&id).unwrap().to_owned().into_vec()
     }
 
-    pub fn free_block(&mut self, block: BlockID, size: u32) {
+    pub async fn free_block(&self, block: BlockID, size: u32) {
         // the syncing_state is only held from the thread that owns the Pool
         // (i.e. this thread) and from end_txg(). It's not allowed to call this
         // function while in the middle of an end_txg(), so the lock must not be
         // held. XXX change this to return an error to the client
-        let mut syncing_state = self.state.syncing_state.try_lock().unwrap();
+        let mut syncing_state = self.state.syncing_state.lock().await;
         syncing_state.log_free(PendingFreesLogEntry { block, size });
     }
 }
@@ -1202,8 +1147,7 @@ async fn reclaim_frees_object(
     (new_obj.object, new_obj.blocks_size)
 }
 
-fn try_reclaim_frees(state: Arc<PoolState>) {
-    let mut syncing_state = state.syncing_state.try_lock().unwrap();
+fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState) {
     if syncing_state.reclaim_cb.is_some() {
         return;
     }

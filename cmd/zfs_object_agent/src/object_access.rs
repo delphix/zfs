@@ -92,7 +92,7 @@ where
 impl ObjectAccess {
     pub fn new(endpoint: &str, region_str: &str, bucket: &str, creds: &str) -> Self {
         info!("region: {:?}", region_str);
-        println!("Endpoint: {}", endpoint);
+        info!("Endpoint: {}", endpoint);
 
         let mut iter = creds.split(':');
         let access_key_id = iter.next().unwrap().trim();
