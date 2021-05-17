@@ -407,16 +407,15 @@ void
 zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
     pthread_mutex_t *lock, avl_tree_t *cache)
 {
-	char *creds, *bucket, *endpoint, *region;
+	char *creds, *bucket = NULL, *endpoint, *region;
 	if ((nvlist_lookup_string(iarg->props,
 	    "object-credentials-location", &creds)) != 0) {
 		return;
 	}
-	// TODO: We don't handle not specifying the bucket name yet
-	if (iarg->path == NULL) {
-		return;
+	// TODO: We don't handle multiple search paths yet
+	if (iarg->path != NULL) {
+		bucket = iarg->path[0];
 	}
-	bucket = iarg->path[0];
 	if ((nvlist_lookup_string(iarg->props, "object-endpoint",
 	    &endpoint)) != 0) {
 		return;
@@ -433,7 +432,8 @@ zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
 		return;
 	}
 	fnvlist_add_string(msg, "Type", "get pools");
-	fnvlist_add_string(msg, "bucket", bucket);
+	if (bucket != NULL)
+		fnvlist_add_string(msg, "bucket", bucket);
 	fnvlist_add_string(msg, "region", region);
 	fnvlist_add_string(msg, "endpoint", endpoint);
 	fnvlist_add_string(msg, "credentials", credentials);

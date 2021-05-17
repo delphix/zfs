@@ -90,7 +90,7 @@ where
 }
 
 impl ObjectAccess {
-    pub fn new(endpoint: &str, region_str: &str, bucket: &str, creds: &str) -> Self {
+    pub fn get_client(endpoint: &str, region_str: &str, creds: &str) -> S3Client {
         info!("region: {:?}", region_str);
         println!("Endpoint: {}", endpoint);
 
@@ -105,13 +105,31 @@ impl ObjectAccess {
             None,
             None,
         );
-        let client =
-            rusoto_s3::S3Client::new_with(http_client, creds, rusoto_core::Region::UsWest2);
+        rusoto_s3::S3Client::new_with(http_client, creds, rusoto_core::Region::UsWest2)
+    }
+
+    pub fn from_client(client: rusoto_s3::S3Client, bucket: &str) -> Self {
+        ObjectAccess {
+            client,
+            bucket_str: bucket.to_string(),
+        }
+    }
+
+    pub fn new(endpoint: &str, region_str: &str, bucket: &str, creds: &str) -> Self {
+        let client = ObjectAccess::get_client(endpoint, region_str, creds);
 
         ObjectAccess {
             client,
             bucket_str: bucket.to_string(),
         }
+    }
+
+    pub fn release_client(&mut self) -> S3Client {
+        let old = std::mem::replace(
+            &mut self.client,
+            rusoto_s3::S3Client::new(rusoto_core::Region::UsWest2),
+        );
+        old
     }
 
     async fn get_object_impl(&self, key: &str) -> Vec<u8> {

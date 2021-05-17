@@ -3,6 +3,7 @@ use crate::object_access::ObjectAccess;
 use crate::pool::*;
 use log::*;
 use nvpair::{NvData, NvEncoding, NvList};
+use rusoto_s3::S3;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -58,8 +59,7 @@ impl Server {
                     "get pools" => {
                         // XXX nvl includes credentials; need to redact?
                         info!("got request: {:?}", nvl);
-                        let object_access = Self::get_object_access(&nvl);
-                        server.get_pools(&object_access).await;
+                        server.get_pools(&nvl).await;
                     }
                     other => {
                         panic!("bad type {:?} in request {:?}", other, nvl);
@@ -213,31 +213,60 @@ impl Server {
         )
     }
 
-    async fn get_pools(&mut self, object_access: &ObjectAccess) {
-        let objs = object_access
-            .list_objects("zfs/", Some("/super".to_string()))
-            .await;
-        let mut nvl = NvList::new_unique_names();
-        for res in objs {
-            if let Some(prefixes) = res.common_prefixes {
-                for prefix in prefixes {
-                    let pfx = prefix.prefix.unwrap();
-                    debug!("prefix: {}", pfx);
-                    let vector: Vec<&str> = pfx.rsplitn(3, '/').collect();
-                    let guid: &str = vector[1];
-                    let pool_config =
-                        Pool::get_config(object_access, PoolGUID(str::parse::<u64>(guid).unwrap()))
-                            .await;
-                    nvl.insert(
-                        pool_config.lookup_string("name").unwrap(),
-                        pool_config.as_ref(),
-                    )
-                    .unwrap();
+    async fn get_pools(&mut self, nvl: &NvList) {
+        let region_str = nvl.lookup_string("region").unwrap();
+        let endpoint = nvl.lookup_string("endpoint").unwrap();
+        let credential_str = nvl.lookup_string("credentials").unwrap();
+        let mut client = ObjectAccess::get_client(
+            endpoint.to_str().unwrap(),
+            region_str.to_str().unwrap(),
+            credential_str.to_str().unwrap(),
+        );
+        let mut resp = NvList::new_unique_names();
+        let mut buckets = vec![];
+        if let Ok(bucket) = nvl.lookup_string("bucket") {
+            buckets.push(bucket.into_string().unwrap());
+        } else {
+            buckets.append(
+                &mut client
+                    .list_buckets()
+                    .await
+                    .unwrap()
+                    .buckets
+                    .unwrap()
+                    .into_iter()
+                    .map(|b| b.name.unwrap())
+                    .collect(),
+            );
+        }
+
+        for buck in buckets {
+            let mut object_access = ObjectAccess::from_client(client, buck.as_str());
+            let objs = object_access
+                .list_objects("zfs/", Some("/".to_string()))
+                .await;
+            for res in objs {
+                if let Some(prefixes) = res.common_prefixes {
+                    for prefix in prefixes {
+                        let pfx = prefix.prefix.unwrap();
+                        debug!("prefix: {}", pfx);
+                        let vector: Vec<&str> = pfx.rsplitn(3, '/').collect();
+                        let guid: &str = vector[1];
+                        if let Ok(g) = str::parse::<u64>(guid) {
+                            let pool_config = Pool::get_config(&object_access, PoolGUID(g)).await;
+                            resp.insert(
+                                pool_config.lookup_string("name").unwrap(),
+                                pool_config.as_ref(),
+                            )
+                            .unwrap();
+                        }
+                    }
                 }
             }
+            client = object_access.release_client();
         }
-        debug!("sending response: {:?}", nvl);
-        Self::send_response(&self.output, nvl).await;
+        debug!("sending response: {:?}", resp);
+        Self::send_response(&self.output, resp).await;
     }
 
     async fn create_pool(&mut self, object_access: &ObjectAccess, guid: PoolGUID, name: &str) {
