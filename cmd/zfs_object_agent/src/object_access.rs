@@ -71,11 +71,8 @@ where
                     );
                 }
             }
-            (false, Err(e)) => {
-                break Err(e);
-            }
-            (_, o @ Ok(_)) => {
-                break o;
+            (_, res) => {
+                break res;
             }
         }
         tokio::time::sleep(delay).await;
