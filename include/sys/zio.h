@@ -446,6 +446,7 @@ struct zio {
 	int		io_cmd;
 	zio_priority_t	io_priority;
 	uint8_t		io_reexecute;
+	boolean_t	io_flush_writes;
 	uint8_t		io_state[ZIO_WAIT_TYPES];
 	uint64_t	io_txg;
 	spa_t		*io_spa;

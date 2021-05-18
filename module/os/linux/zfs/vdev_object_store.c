@@ -506,6 +506,20 @@ agent_end_txg(vdev_object_store_t *vos, uint64_t txg, void *ub_buf,
 }
 
 static void
+agent_flush_writes(vdev_object_store_t *vos)
+{
+	nvlist_t *nv = fnvlist_alloc();
+	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_FLUSH_WRITES);
+	zfs_dbgmsg("agent_flush");
+
+	mutex_enter(&vos->vos_sock_lock);
+	zfs_object_store_wait(vos, VOS_SOCK_READY);
+	agent_request(vos, nv);
+	mutex_exit(&vos->vos_sock_lock);
+	fnvlist_free(nv);
+}
+
+static void
 agent_reissue_zio(void *arg)
 {
 	vdev_t *vd = arg;
@@ -601,6 +615,15 @@ object_store_free_block(vdev_t *vd, uint64_t offset, uint64_t asize)
 	ASSERT3P(vd->vdev_ops, ==, &vdev_object_store_ops);
 	vdev_object_store_t *vos = vd->vdev_tsd;
 	agent_free_block(vos, offset, asize);
+}
+
+void
+object_store_flush_writes(spa_t *spa)
+{
+	vdev_t *vd = spa->spa_root_vdev->vdev_child[0];
+	ASSERT3P(vd->vdev_ops, ==, &vdev_object_store_ops);
+	vdev_object_store_t *vos = vd->vdev_tsd;
+	agent_flush_writes(vos);
 }
 
 static int

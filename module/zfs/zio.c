@@ -4578,6 +4578,13 @@ zio_done(zio_t *zio)
 	zio_link_t *zl = NULL;
 
 	/*
+	 * For object store pools, we need to flush writes if we
+	 * have a zio waiting on writes.
+	 */
+	boolean_t flush_writes_needed =
+	    !spa_normal_class(zio->io_spa)->mc_ops->msop_block_based;
+
+	/*
 	 * If our children haven't all completed,
 	 * wait for them and then repeat this pipeline stage.
 	 */
@@ -4918,11 +4925,25 @@ zio_done(zio_t *zio)
 	for (pio = zio_walk_parents(zio, &zl); pio != NULL; pio = pio_next) {
 		zio_link_t *remove_zl = zl;
 		pio_next = zio_walk_parents(zio, &zl);
+
+		if (flush_writes_needed && zio->io_type == ZIO_TYPE_WRITE &&
+		    pio->io_waiter) {
+			zfs_dbgmsg("ZIO set write_flush: %px", pio);
+			mutex_enter(&pio->io_lock);
+			pio->io_flush_writes = B_TRUE;
+			mutex_exit(&pio->io_lock);
+		}
+
 		zio_remove_child(pio, zio, remove_zl);
 		zio_notify_parent(pio, zio, ZIO_WAIT_DONE, &next_to_execute);
 	}
 
 	if (zio->io_waiter != NULL) {
+		if (zio->io_flush_writes) {
+			ASSERT(flush_writes_needed);
+			zfs_dbgmsg("ZIO agent flush requested");
+			object_store_flush_writes(zio->io_spa);
+		}
 		mutex_enter(&zio->io_lock);
 		zio->io_executor = NULL;
 		cv_broadcast(&zio->io_cv);
