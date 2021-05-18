@@ -241,7 +241,7 @@ impl Server {
         }
 
         for buck in buckets {
-            let mut object_access = ObjectAccess::from_client(client, buck.as_str());
+            let object_access = ObjectAccess::from_client(client, buck.as_str());
             let objs = object_access
                 .list_objects("zfs/", Some("/".to_string()))
                 .await;
@@ -251,14 +251,11 @@ impl Server {
                         let pfx = prefix.prefix.unwrap();
                         debug!("prefix: {}", pfx);
                         let vector: Vec<&str> = pfx.rsplitn(3, '/').collect();
-                        let guid: &str = vector[1];
-                        if let Ok(g) = str::parse::<u64>(guid) {
-                            let pool_config = Pool::get_config(&object_access, PoolGUID(g)).await;
-                            resp.insert(
-                                pool_config.lookup_string("name").unwrap(),
-                                pool_config.as_ref(),
-                            )
-                            .unwrap();
+                        let guid_str: &str = vector[1];
+                        if let Ok(guid) = str::parse::<u64>(guid_str) {
+                            let pool_config =
+                                Pool::get_config(&object_access, PoolGUID(guid)).await;
+                            resp.insert(guid_str, pool_config.as_ref()).unwrap();
                         }
                     }
                 }
