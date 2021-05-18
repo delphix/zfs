@@ -1579,8 +1579,8 @@ vdev_uberblock_load(vdev_t *rvd, uberblock_t *ub, nvlist_t **config)
 	} else if (cb.ubl_vd != NULL && vdev_is_object_based(cb.ubl_vd)) {
 		*config = vdev_object_store_get_config(cb.ubl_vd);
 		if (*config == NULL) {
-			vdev_dbgmsg(cb.ubl_vd, "failed to read objstore label "
-			"config");
+			vdev_dbgmsg(cb.ubl_vd, "failed to read objstore "
+			    "label config");
 		}
 	}
 	spa_config_exit(spa, SCL_ALL, FTAG);
