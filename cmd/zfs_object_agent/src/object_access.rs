@@ -124,12 +124,8 @@ impl ObjectAccess {
         }
     }
 
-    pub fn release_client(mut self) -> S3Client {
-        let old = std::mem::replace(
-            &mut self.client,
-            rusoto_s3::S3Client::new(rusoto_core::Region::UsWest2),
-        );
-        old
+    pub fn release_client(self) -> S3Client {
+        self.client
     }
 
     async fn get_object_impl(&self, key: &str) -> Vec<u8> {
