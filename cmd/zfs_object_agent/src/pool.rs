@@ -279,6 +279,8 @@ struct PoolSyncingState {
     rewriting_objects: HashMap<ObjectID, Arc<tokio::sync::Mutex<()>>>,
     // objects to delete at the end of this txg
     objects_to_delete: Vec<ObjectID>,
+    // Flush immediately once we have one of these blocks (and all previous blocks)
+    pending_flushes: BTreeSet<BlockID>,
 }
 
 type SyncTask =
@@ -390,6 +392,7 @@ impl Pool {
                     reclaim_cb: None,
                     rewriting_objects: HashMap::new(),
                     objects_to_delete: Vec::new(),
+                    pending_flushes: BTreeSet::new(),
                 }),
                 block_to_obj: std::sync::RwLock::new(ObjectBlockMap::new()),
             }),
@@ -486,6 +489,7 @@ impl Pool {
                         reclaim_cb: None,
                         rewriting_objects: HashMap::new(),
                         objects_to_delete: Vec::new(),
+                        pending_flushes: BTreeSet::new(),
                     }),
                     block_to_obj: std::sync::RwLock::new(ObjectBlockMap::new()),
                 }),
@@ -643,25 +647,34 @@ impl Pool {
         syncing_state.syncing_txg = None;
     }
 
-    /*
-    pub async fn flush_writes(&mut self) {
-        self.initiate_flush_object();
-        Self::wait_for_pending_flushes(&mut self.syncing_state.try_lock().unwrap());
+    fn check_pending_flushes(state: &PoolState, syncing_state: &mut PoolSyncingState) {
+        let mut do_flush = false;
+        let next_block = syncing_state.pending_object.as_mut_pending().0.next_block;
+        while let Some(flush_block_ref) = syncing_state.pending_flushes.iter().next() {
+            let flush_block = *flush_block_ref;
+            if flush_block < next_block {
+                do_flush = true;
+                syncing_state.pending_flushes.remove(&flush_block);
+            }
+        }
+        if do_flush {
+            Self::initiate_flush_object_impl(state, syncing_state);
+        }
     }
 
-    pub async fn flush_up_to(&mut self, block: BlockID) {}
-    */
-
-    // Note: only flushes writes that we've received, that are in-order.
-    // pending_unordered_writes are not flushed.
-    pub async fn initiate_flush_object(&self) {
+    // Begin writing out all blocks up to and including the given BlockID.  We
+    // may not have called write_block() on all these blocks yet, but we will
+    // soon.
+    // Basically, as soon as we have this blockID and all the previous ones,
+    // start writing that pending object immediately.
+    pub async fn initiate_flush(&self, block: BlockID) {
         let mut syncing_state = self.state.syncing_state.lock().await;
         // XXX because called when server times out waiting for request
         if syncing_state.syncing_txg.is_none() {
             return;
         }
-
-        Self::initiate_flush_object_impl(&self.state, &mut *syncing_state);
+        syncing_state.pending_flushes.insert(block);
+        Self::check_pending_flushes(&self.state, &mut syncing_state);
     }
 
     // completes when we've initiated the PUT to the object store.
@@ -798,7 +811,7 @@ impl Pool {
         r
     }
 
-    fn write_unordered_to_ordered(
+    fn write_unordered_to_pending_object(
         state: &PoolState,
         mut syncing_state: MutexGuard<PoolSyncingState>,
     ) {
@@ -813,12 +826,12 @@ impl Pool {
             phys.blocks.insert(phys.next_block, buf);
             nb = nb.next();
             phys.next_block = nb;
-            //let (_, senders) = syncing_state.pending_object.unwrap_pending();
             senders.push(s);
             if phys.blocks_size >= MAX_BYTES_PER_OBJECT {
                 Self::initiate_flush_object_impl(state, &mut syncing_state);
             }
         }
+        Self::check_pending_flushes(state, &mut syncing_state);
     }
 
     pub async fn write_block(&self, id: BlockID, data: Vec<u8>) {
@@ -841,7 +854,7 @@ impl Pool {
                     .pending_unordered_writes
                     .insert(id, (ByteBuf::from(data), s));
 
-                Self::write_unordered_to_ordered(&self.state, syncing_state);
+                Self::write_unordered_to_pending_object(&self.state, syncing_state);
                 r = myr;
             };
         }

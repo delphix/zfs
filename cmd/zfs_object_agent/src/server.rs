@@ -4,7 +4,7 @@ use crate::pool::*;
 use log::*;
 use nvpair::{NvData, NvEncoding, NvList};
 use rusoto_s3::S3;
-use std::sync::Arc;
+use std::{cmp::max, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixListener;
@@ -18,6 +18,8 @@ pub struct Server {
     // Pool is Some once we get a "open pool" request
     pool: Option<Arc<Pool>>,
     num_outstanding_writes: Arc<std::sync::Mutex<usize>>,
+    // XXX make Option?
+    max_blockid: BlockID, // Maximum blockID that we've received a write for
 }
 
 impl Server {
@@ -45,6 +47,7 @@ impl Server {
             output: Arc::new(Mutex::new(w)),
             pool: None,
             num_outstanding_writes: Arc::new(std::sync::Mutex::new(0)),
+            max_blockid: BlockID(0),
         };
         tokio::spawn(async move {
             loop {
@@ -76,6 +79,7 @@ impl Server {
             output: Arc::new(Mutex::new(w)),
             pool: None,
             num_outstanding_writes: Arc::new(std::sync::Mutex::new(0)),
+            max_blockid: BlockID(0),
         };
         tokio::spawn(async move {
             loop {
@@ -308,8 +312,9 @@ impl Server {
     // no response
     fn flush_writes(&mut self) {
         let pool = self.pool.as_ref().unwrap().clone();
+        let max_blockid = self.max_blockid;
         tokio::spawn(async move {
-            pool.initiate_flush_object().await;
+            pool.initiate_flush(max_blockid).await;
         });
     }
 
@@ -352,6 +357,7 @@ impl Server {
     /// queue write, sends response when completed (persistent).  Does not block.
     /// completion may not happen until flush_pool() is called
     fn write_block(&mut self, block: BlockID, data: Vec<u8>, request_id: u64) {
+        self.max_blockid = max(block, self.max_blockid);
         let pool = self.pool.as_ref().unwrap().clone();
         let output = self.output.clone();
         let now = self.num_outstanding_writes.clone();
