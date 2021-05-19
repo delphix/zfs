@@ -435,6 +435,7 @@ agent_create_pool(vdev_t *vd, vdev_object_store_t *vos)
 	agent_request(vos, nv);
 	mutex_exit(&vos->vos_sock_lock);
 	fnvlist_free(nv);
+	agent_wait_serial(vos);
 }
 
 static void
@@ -460,6 +461,7 @@ agent_open_pool(vdev_t *vd, vdev_object_store_t *vos)
 	agent_request(vos, nv);
 	mutex_exit(&vos->vos_sock_lock);
 	fnvlist_free(nv);
+	agent_wait_serial(vos);
 }
 
 static void
@@ -480,6 +482,7 @@ agent_begin_txg(vdev_object_store_t *vos, uint64_t txg)
 	agent_request(vos, nv);
 	mutex_exit(&vos->vos_sock_lock);
 	fnvlist_free(nv);
+	//agent_wait_serial(vos);
 }
 
 static void
@@ -503,6 +506,7 @@ agent_end_txg(vdev_object_store_t *vos, uint64_t txg, void *ub_buf,
 	agent_request(vos, nv);
 	mutex_exit(&vos->vos_sock_lock);
 	fnvlist_free(nv);
+	agent_wait_serial(vos);
 }
 
 static void
@@ -517,6 +521,7 @@ agent_flush_writes(vdev_object_store_t *vos)
 	agent_request(vos, nv);
 	mutex_exit(&vos->vos_sock_lock);
 	fnvlist_free(nv);
+	//agent_wait_serial(vos);
 }
 
 static void
@@ -540,10 +545,8 @@ agent_reissue_zio(void *arg)
 	 */
 	if (vd->vdev_spa->spa_load_state == SPA_LOAD_CREATE) {
 		agent_create_pool(vd, vos);
-		agent_wait_serial(vos);
 	}
 	agent_open_pool(vd, vos);
-	agent_wait_serial(vos);
 
 	if (vos->vos_send_txg) {
 		agent_begin_txg(vos, spa_syncing_txg(vd->vdev_spa));
@@ -600,7 +603,6 @@ object_store_end_txg(spa_t *spa, nvlist_t *config, uint64_t txg)
 	char *nvbuf = fnvlist_pack(config, &nvlen);
 	agent_end_txg(vos, txg,
 	    &spa->spa_uberblock, sizeof (spa->spa_uberblock), nvbuf, nvlen);
-	agent_wait_serial(vos);
 	fnvlist_pack_free(nvbuf, nvlen);
 
 	if (vos->vos_config != NULL)
@@ -1004,10 +1006,8 @@ vdev_object_store_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 
 	if (vd->vdev_spa->spa_load_state == SPA_LOAD_CREATE) {
 		agent_create_pool(vd, vos);
-		agent_wait_serial(vos);
 	}
 	agent_open_pool(vd, vos);
-	agent_wait_serial(vos);
 
 	/*
 	 * Socket is now ready for communication, wake up
