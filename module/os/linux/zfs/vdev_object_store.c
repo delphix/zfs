@@ -482,7 +482,6 @@ agent_begin_txg(vdev_object_store_t *vos, uint64_t txg)
 	agent_request(vos, nv);
 	mutex_exit(&vos->vos_sock_lock);
 	fnvlist_free(nv);
-	//agent_wait_serial(vos);
 }
 
 static void
@@ -521,7 +520,6 @@ agent_flush_writes(vdev_object_store_t *vos)
 	agent_request(vos, nv);
 	mutex_exit(&vos->vos_sock_lock);
 	fnvlist_free(nv);
-	//agent_wait_serial(vos);
 }
 
 static void
@@ -563,7 +561,12 @@ agent_reissue_zio(void *arg)
 			zfs_dbgmsg("ZIO REISSUE (%px) req %llu, blk %llu",
 			    zio, vosr->vosr_req, zio->io_offset);
 			mutex_enter(&vos->vos_sock_lock);
-			agent_request(vos, vosr->vosr_nv);
+			if (agent_request(vos, vosr->vosr_nv) != 0) {
+				zfs_dbgmsg("agent_reissue_zio failed");
+				mutex_exit(&vos->vos_sock_lock);
+				mutex_exit(&vos->vos_outstanding_lock);
+				return;
+			}
 			mutex_exit(&vos->vos_sock_lock);
 		}
 	}
