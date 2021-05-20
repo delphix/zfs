@@ -140,7 +140,7 @@ impl PoolPhys {
 
     async fn get(object_access: &ObjectAccess, guid: PoolGUID) -> Self {
         let buf = object_access.get_object(&Self::key(guid)).await;
-        let this: Self = bincode::deserialize(&buf).unwrap();
+        let this: Self = serde_json::from_slice(&buf).unwrap();
         debug!("got {:#?}", this);
         assert_eq!(this.guid, guid);
         this
@@ -148,7 +148,7 @@ impl PoolPhys {
 
     async fn put(&self, object_access: &ObjectAccess) {
         debug!("putting {:#?}", self);
-        let buf = bincode::serialize(&self).unwrap();
+        let buf = serde_json::to_vec(&self).unwrap();
         object_access.put_object(&Self::key(self.guid), buf).await;
     }
 }
@@ -168,7 +168,7 @@ impl UberblockPhys {
 
     async fn get(object_access: &ObjectAccess, guid: PoolGUID, txg: TXG) -> Self {
         let buf = object_access.get_object(&Self::key(guid, txg)).await;
-        let this: Self = bincode::deserialize(&buf).unwrap();
+        let this: Self = serde_json::from_slice(&buf).unwrap();
         debug!("got {:#?}", this);
         assert_eq!(this.guid, guid);
         assert_eq!(this.txg, txg);
@@ -177,7 +177,7 @@ impl UberblockPhys {
 
     async fn put(&self, object_access: &ObjectAccess) {
         debug!("putting {:#?}", self);
-        let buf = bincode::serialize(&self).unwrap();
+        let buf = serde_json::to_vec(&self).unwrap();
         object_access
             .put_object(&Self::key(self.guid, self.txg), buf)
             .await;

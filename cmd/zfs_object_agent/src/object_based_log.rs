@@ -50,7 +50,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLogChunk<T> {
             .get_object(&Self::key(name, generation, chunk))
             .await;
         let begin = Instant::now();
-        let this: Self = bincode::deserialize(&buf).unwrap();
+        let this: Self = serde_json::from_slice(&buf).unwrap();
         debug!(
             "deserialized {} log entries in {}ms",
             this.entries.len(),
@@ -63,7 +63,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLogChunk<T> {
 
     async fn put(&self, object_access: &ObjectAccess, name: &str) {
         let begin = Instant::now();
-        let buf = bincode::serialize(&self).unwrap();
+        let buf = serde_json::to_vec(&self).unwrap();
         debug!(
             "serialized {} log entries in {}ms",
             self.entries.len(),

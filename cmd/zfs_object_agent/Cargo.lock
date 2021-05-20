@@ -727,6 +727,7 @@ dependencies = [
  "rusoto_s3",
  "serde",
  "serde_bytes",
+ "serde_json",
  "stream-reduce",
  "tokio",
  "tokio-stream",
