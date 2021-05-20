@@ -186,7 +186,7 @@ impl UberblockPhys {
 
 impl DataObjectPhys {
     fn key(guid: PoolGUID, obj: ObjectID) -> String {
-        format!("zfs/{}/data/{}", guid, obj)
+        format!("zfs/{}/data/{}/{}", guid, obj.0 % 64, obj)
     }
 
     fn verify(&self) {
