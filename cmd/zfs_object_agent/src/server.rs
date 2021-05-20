@@ -138,6 +138,15 @@ impl Server {
                         let txg = TXG(nvl.lookup_uint64("TXG").unwrap());
                         server.begin_txg(txg);
                     }
+                    "resume txg" => {
+                        debug!("got request: {:?}", nvl);
+                        let txg = TXG(nvl.lookup_uint64("TXG").unwrap());
+                        server.resume_txg(txg);
+                    }
+                    "resume complete" => {
+                        debug!("got request: {:?}", nvl);
+                        server.resume_complete().await;
+                    }
                     "flush writes" => {
                         trace!("got request: {:?}", nvl);
                         server.flush_writes();
@@ -253,7 +262,7 @@ impl Server {
         for buck in buckets {
             let object_access = ObjectAccess::from_client(client, buck.as_str());
             let objs = object_access
-                .list_objects("zfs/", Some("/".to_string()))
+                .list_objects("zfs/", Some("/".to_string()), None)
                 .await;
             for res in objs {
                 if let Some(prefixes) = res.common_prefixes {
@@ -307,6 +316,20 @@ impl Server {
     fn begin_txg(&mut self, txg: TXG) {
         let pool = self.pool.as_ref().unwrap().clone();
         pool.begin_txg(txg);
+    }
+
+    // no response
+    fn resume_txg(&mut self, txg: TXG) {
+        let pool = self.pool.as_ref().unwrap().clone();
+        pool.resume_txg(txg);
+    }
+
+    // no response
+    // This is .await'ed by the server's thread, so we can't see any new writes
+    // come in while it's in progress.
+    async fn resume_complete(&mut self) {
+        let pool = self.pool.as_ref().unwrap().clone();
+        pool.resume_complete().await;
     }
 
     // no response

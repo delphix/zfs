@@ -12,7 +12,7 @@ pub struct TXG(pub u64);
 impl OnDisk for TXG {}
 impl Display for TXG {
     fn fmt(&self, f: &mut Formatter) -> Result {
-        write!(f, "{}", self.0)
+        write!(f, "{:020}", self.0)
     }
 }
 
@@ -21,7 +21,7 @@ pub struct PoolGUID(pub u64);
 impl OnDisk for PoolGUID {}
 impl Display for PoolGUID {
     fn fmt(&self, f: &mut Formatter) -> Result {
-        write!(f, "{}", self.0)
+        write!(f, "{:020}", self.0)
     }
 }
 
@@ -30,7 +30,7 @@ pub struct ObjectID(pub u64);
 impl OnDisk for ObjectID {}
 impl Display for ObjectID {
     fn fmt(&self, f: &mut Formatter) -> Result {
-        write!(f, "{}", self.0)
+        write!(f, "{:020}", self.0)
     }
 }
 impl ObjectID {

@@ -9,7 +9,6 @@ use more_asserts::*;
 use nvpair::NvList;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
-use std::cmp::{max, min};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::mem;
@@ -17,8 +16,12 @@ use std::ops::Bound::*;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
+use std::{
+    cmp::{max, min},
+    time::Duration,
+};
 use stream_reduce::Reduce;
-use tokio::sync::*;
+use tokio::{sync::*, time::sleep};
 
 // XXX need a real tunables infrastructure
 // start freeing when the pending frees are this % of the entire pool
@@ -184,9 +187,25 @@ impl UberblockPhys {
     }
 }
 
+const NUM_DATA_PREFIXES: i32 = 64;
+
 impl DataObjectPhys {
     fn key(guid: PoolGUID, obj: ObjectID) -> String {
-        format!("zfs/{}/data/{}/{}", guid, obj.0 % 64, obj)
+        format!(
+            "zfs/{}/data/{:03}/{}",
+            guid,
+            obj.0 % NUM_DATA_PREFIXES as u64,
+            obj
+        )
+    }
+
+    // Could change this to return an Iterator
+    fn prefixes(guid: PoolGUID) -> Vec<String> {
+        let mut ret = Vec::new();
+        for x in 0..NUM_DATA_PREFIXES {
+            ret.push(format!("zfs/{}/data/{:03}/", guid, x));
+        }
+        ret
     }
 
     fn verify(&self) {
@@ -306,6 +325,36 @@ impl PendingObjectState {
             _ => panic!("invalid {:?}", self),
         }
     }
+
+    fn is_pending(&self) -> bool {
+        match self {
+            PendingObjectState::Pending(..) => true,
+            PendingObjectState::NotPending(..) => false,
+        }
+    }
+
+    fn next_block(&self) -> BlockID {
+        match self {
+            PendingObjectState::Pending(phys, _) => phys.next_block,
+            PendingObjectState::NotPending(next_block) => *next_block,
+        }
+    }
+
+    fn new_pending(guid: PoolGUID, object: ObjectID, next_block: BlockID, txg: TXG) -> Self {
+        PendingObjectState::Pending(
+            DataObjectPhys {
+                guid,
+                object,
+                min_block: next_block,
+                next_block,
+                min_txg: txg,
+                max_txg: txg,
+                blocks_size: 0,
+                blocks: HashMap::new(),
+            },
+            Vec::new(),
+        )
+    }
 }
 
 /*
@@ -321,10 +370,7 @@ pub struct PoolSharedState {
 
 impl PoolSyncingState {
     fn next_block(&self) -> BlockID {
-        match &self.pending_object {
-            PendingObjectState::Pending(phys, _) => phys.next_block,
-            PendingObjectState::NotPending(next_block) => *next_block,
-        }
+        self.pending_object.next_block()
     }
 
     fn log_free(&mut self, ent: PendingFreesLogEntry) {
@@ -519,7 +565,7 @@ impl Pool {
         }
     }
 
-    pub fn begin_txg(&self, txg: TXG) {
+    pub fn resume_txg(&self, txg: TXG) {
         // The syncing_state is only held while a txg is open (begun).  It's not
         // allowed to call begin_txg() while a txg is already open, so the lock
         // must not be held.
@@ -529,28 +575,229 @@ impl Pool {
         assert!(syncing_state.syncing_txg.is_none());
         assert_gt!(txg.0, syncing_state.last_txg.0);
         syncing_state.syncing_txg = Some(txg);
-        let last_obj = self.state.block_to_obj.read().unwrap().last_obj();
 
-        match syncing_state.pending_object {
-            PendingObjectState::NotPending(next_block) => {
-                syncing_state.pending_object = PendingObjectState::Pending(
-                    DataObjectPhys {
-                        guid: self.state.readonly_state.guid,
-                        object: last_obj.next(),
-                        min_block: next_block,
-                        next_block,
-                        min_txg: txg,
-                        max_txg: txg,
-                        blocks_size: 0,
-                        blocks: HashMap::new(),
-                    },
-                    Vec::new(),
+        // Resuming state is indicated by pending_object = NotPending
+        assert!(!syncing_state.pending_object.is_pending());
+    }
+
+    async fn recover_objects(
+        state: &Arc<PoolState>,
+        readonly_state: &Arc<PoolSharedState>,
+        txg: TXG,
+    ) -> BTreeMap<ObjectID, DataObjectPhys> {
+        let begin = Instant::now();
+        let last_obj = state.block_to_obj.read().unwrap().last_obj();
+        let list_stream = FuturesUnordered::new();
+        for prefix in DataObjectPhys::prefixes(readonly_state.guid) {
+            let readonly_state = readonly_state.clone();
+            list_stream.push(async move {
+                readonly_state
+                    .object_access
+                    .list_objects(
+                        &prefix,
+                        Some("/".to_string()),
+                        Some(format!("{}{}", prefix, last_obj)),
+                    )
+                    .await
+            });
+        }
+        let get_stream = FuturesUnordered::new();
+        list_stream
+            .for_each(|v| async {
+                for output in v {
+                    for vec in output.contents {
+                        for object in vec {
+                            let key = object.key.unwrap();
+                            let object = ObjectID(
+                                u64::from_str_radix(key.rsplit('/').next().unwrap(), 10).unwrap(),
+                            );
+                            let readonly_state = readonly_state.clone();
+                            get_stream.push(async move {
+                                async move {
+                                    DataObjectPhys::get(
+                                        &readonly_state.object_access,
+                                        readonly_state.guid,
+                                        object,
+                                    )
+                                    .await
+                                }
+                            });
+                        }
+                    }
+                }
+            })
+            .await;
+        info!(
+            "resume: listing found {} objects in {}ms",
+            get_stream.len(),
+            begin.elapsed().as_millis()
+        );
+        let begin = Instant::now();
+        let recovered = get_stream
+            .buffer_unordered(50)
+            .fold(BTreeMap::new(), |mut map, data| async move {
+                assert_eq!(data.guid, readonly_state.guid);
+                assert_eq!(data.min_txg, txg);
+                assert_eq!(data.max_txg, txg);
+                debug!(
+                    "resume: found {:?}, min={:?} next={:?}",
+                    data.object, data.min_block, data.next_block
                 );
-            }
-            _ => {
-                panic!("invalid {:?}", syncing_state.pending_object);
+                map.insert(data.object, data);
+                map
+            })
+            .await;
+        info!(
+            "resume: read {} objects in {}ms",
+            recovered.len(),
+            begin.elapsed().as_millis()
+        );
+        recovered
+    }
+
+    pub async fn resume_complete(&self) {
+        // XXX we need to wait for all writes to be added to
+        // pending_unordered_writes, but there's no way to do that
+        sleep(Duration::from_secs(1)).await;
+
+        let state = &self.state;
+        let mut syncing_state = state.syncing_state.lock().await;
+        let readonly_state = &state.readonly_state;
+        let txg = syncing_state.syncing_txg.unwrap();
+
+        // verify that we're in resuming state
+        assert!(!syncing_state.pending_object.is_pending());
+
+        let mut recovered_objects = Self::recover_objects(state, readonly_state, txg).await;
+
+        let mut ordered_writes: BTreeSet<BlockID> = syncing_state
+            .pending_unordered_writes
+            .keys()
+            .map(|x| *x)
+            .collect();
+
+        //debug!("recovered_objects = {:?}", recovered_objects);
+        //debug!("block_to_obj = {:?}", state.block_to_obj);
+
+        loop {
+            let next_write_blockid = ordered_writes.iter().next();
+            let next_object_blockid = recovered_objects
+                .iter()
+                .next()
+                .and_then(|x| Some(&x.1.min_block));
+
+            trace!(
+                "resume: next_write={:?} next_object={:?}",
+                next_write_blockid,
+                next_object_blockid
+            );
+            if next_object_blockid.is_some()
+                && (next_write_blockid.is_none() || next_write_blockid >= next_object_blockid)
+            {
+                // already-written object is next
+                let recovered_obj = recovered_objects.iter().next().unwrap().1;
+                let object = recovered_obj.object;
+                debug!(
+                    "resume: next is {:?}, min={:?} next={:?}",
+                    object, recovered_obj.min_block, recovered_obj.next_block
+                );
+
+                Self::account_new_object(state, &mut syncing_state, recovered_obj);
+
+                // The kernel may not have known that this was already written
+                // (e.g. we didn't quite get to sending the "write done"
+                // response), so it sent us the write again.  In this case we
+                // can notify it now, since the blocks are already persistent.
+                // Note that .split_off() removes and returns the tail (entries
+                // >= next_block), but we want to remove and the head.
+                let new_ordered_writes = ordered_writes.split_off(&recovered_obj.next_block);
+                let obsolete_writes = ordered_writes;
+                ordered_writes = new_ordered_writes;
+                for obsolete_write in obsolete_writes {
+                    trace!(
+                        "resume: {:?} is obsoleted by existing {:?}",
+                        obsolete_write,
+                        object
+                    );
+                    let (_, sender) = syncing_state
+                        .pending_unordered_writes
+                        .remove(&obsolete_write)
+                        .unwrap();
+                    sender.send(()).unwrap();
+                }
+                assert!(!syncing_state.pending_object.is_pending());
+                syncing_state.pending_object =
+                    PendingObjectState::NotPending(recovered_obj.next_block);
+
+                recovered_objects.remove(&object);
+            } else if next_write_blockid.is_some() && next_object_blockid.is_some() {
+                // writes are next, and there are objects after this
+
+                assert!(!syncing_state.pending_object.is_pending());
+                syncing_state.pending_object = PendingObjectState::new_pending(
+                    self.state.readonly_state.guid,
+                    state.block_to_obj.read().unwrap().last_obj().next(),
+                    syncing_state.pending_object.next_block(),
+                    txg,
+                );
+
+                // XXX Unless there is already an object at object.next(), we
+                // should limit the object size as normal.
+                Self::write_unordered_to_pending_object(state, &mut syncing_state, None);
+
+                let (phys, _) = syncing_state.pending_object.as_mut_pending();
+                debug!(
+                    "resume: writes are next; creating {:?}, min={:?} next={:?}",
+                    phys.object, phys.min_block, phys.next_block
+                );
+
+                Self::initiate_flush_object_impl(state, &mut syncing_state);
+                let next_block = syncing_state.pending_object.next_block();
+                syncing_state.pending_object = PendingObjectState::NotPending(next_block);
+
+                // remove from ordered_writes
+                ordered_writes = ordered_writes.split_off(&next_block);
+            } else {
+                // nothing left; move ordered portion to pending
+
+                assert!(!syncing_state.pending_object.is_pending());
+                syncing_state.pending_object = PendingObjectState::new_pending(
+                    self.state.readonly_state.guid,
+                    state.block_to_obj.read().unwrap().last_obj().next(),
+                    syncing_state.pending_object.next_block(),
+                    txg,
+                );
+
+                debug!("resume: moving last writes to pending_object");
+                Self::write_unordered_to_pending_object(
+                    state,
+                    &mut syncing_state,
+                    Some(MAX_BYTES_PER_OBJECT),
+                );
+                info!("resume: completed");
+                break;
             }
         }
+    }
+
+    pub fn begin_txg(&self, txg: TXG) {
+        // The syncing_state is only held while a txg is open (begun).  It's not
+        // allowed to call begin_txg() while a txg is already open, so the lock
+        // must not be held.
+        // XXX change this to return an error to the client
+        let mut syncing_state = self.state.syncing_state.try_lock().unwrap();
+
+        assert!(syncing_state.syncing_txg.is_none());
+        assert_gt!(txg, syncing_state.last_txg);
+        syncing_state.syncing_txg = Some(txg);
+
+        assert!(!syncing_state.pending_object.is_pending());
+        syncing_state.pending_object = PendingObjectState::new_pending(
+            self.state.readonly_state.guid,
+            self.state.block_to_obj.read().unwrap().last_obj().next(),
+            syncing_state.pending_object.next_block(),
+            txg,
+        );
     }
 
     pub async fn end_txg(&self, uberblock: Vec<u8>, config: Vec<u8>) {
@@ -673,8 +920,48 @@ impl Pool {
         if syncing_state.syncing_txg.is_none() {
             return;
         }
+        if !syncing_state.pending_object.is_pending() {
+            return;
+        }
+
         syncing_state.pending_flushes.insert(block);
         Self::check_pending_flushes(&self.state, &mut syncing_state);
+    }
+
+    fn account_new_object(
+        state: &PoolState,
+        syncing_state: &mut PoolSyncingState,
+        phys: &DataObjectPhys,
+    ) {
+        let txg = syncing_state.syncing_txg.unwrap();
+        let obj = phys.object;
+        assert_eq!(phys.guid, state.readonly_state.guid);
+        assert_eq!(phys.min_txg, txg);
+        assert_eq!(phys.max_txg, txg);
+        assert_ge!(obj, state.block_to_obj.read().unwrap().last_obj().next());
+        syncing_state.stats.objects_count += 1;
+        syncing_state.stats.blocks_bytes += phys.blocks_size as u64;
+        syncing_state.stats.blocks_count += phys.blocks.len() as u64;
+        state
+            .block_to_obj
+            .write()
+            .unwrap()
+            .insert(obj, phys.min_block);
+        syncing_state.storage_object_log.append(
+            txg,
+            StorageObjectLogEntry::Alloc {
+                first_possible_block: phys.min_block,
+                obj,
+            },
+        );
+        syncing_state.object_size_log.append(
+            txg,
+            ObjectSizeLogEntry::Exists {
+                obj,
+                num_blocks: phys.blocks.len() as u32,
+                num_bytes: phys.blocks_size,
+            },
+        );
     }
 
     // completes when we've initiated the PUT to the object store.
@@ -693,58 +980,13 @@ impl Pool {
 
         let (phys, senders) = mem::replace(
             &mut syncing_state.pending_object,
-            PendingObjectState::Pending(
-                DataObjectPhys {
-                    guid: state.readonly_state.guid,
-                    object: obj.next(),
-                    min_txg: txg,
-                    max_txg: txg,
-                    min_block: next_block,
-                    next_block,
-                    blocks_size: 0,
-                    blocks: HashMap::new(),
-                },
-                Vec::new(),
-            ),
+            PendingObjectState::new_pending(state.readonly_state.guid, obj.next(), next_block, txg),
         )
         .unwrap_pending();
 
-        assert_eq!(phys.guid, state.readonly_state.guid);
-        assert_eq!(phys.min_txg, txg);
-        assert_eq!(phys.max_txg, txg);
+        assert_eq!(obj, phys.object);
 
-        assert_eq!(obj, state.block_to_obj.read().unwrap().last_obj().next());
-
-        // increment stats
-        syncing_state.stats.objects_count += 1;
-        syncing_state.stats.blocks_bytes += phys.blocks_size as u64;
-        syncing_state.stats.blocks_count += phys.blocks.len() as u64;
-
-        // add to in-memory block->object map
-        state
-            .block_to_obj
-            .write()
-            .unwrap()
-            .insert(obj, phys.min_block);
-
-        // log to on-disk block->object map
-        syncing_state.storage_object_log.append(
-            txg,
-            StorageObjectLogEntry::Alloc {
-                first_possible_block: phys.min_block,
-                obj,
-            },
-        );
-
-        // log to on-disk size
-        syncing_state.object_size_log.append(
-            txg,
-            ObjectSizeLogEntry::Exists {
-                obj,
-                num_blocks: phys.blocks.len() as u32,
-                num_bytes: phys.blocks_size,
-            },
-        );
+        Self::account_new_object(state, syncing_state, &phys);
 
         debug!(
             "{:?}: writing {:?}: blocks={} bytes={} min={:?}",
@@ -813,8 +1055,14 @@ impl Pool {
 
     fn write_unordered_to_pending_object(
         state: &PoolState,
-        mut syncing_state: MutexGuard<PoolSyncingState>,
+        syncing_state: &mut PoolSyncingState,
+        size_limit_opt: Option<u32>,
     ) {
+        // If we're in the middle of resuming, we aren't building the pending object, so skip this
+        if !syncing_state.pending_object.is_pending() {
+            return;
+        }
+
         let mut nb = syncing_state.next_block();
         while let Some((buf, s)) = syncing_state.pending_unordered_writes.remove(&nb) {
             trace!(
@@ -827,11 +1075,13 @@ impl Pool {
             nb = nb.next();
             phys.next_block = nb;
             senders.push(s);
-            if phys.blocks_size >= MAX_BYTES_PER_OBJECT {
-                Self::initiate_flush_object_impl(state, &mut syncing_state);
+            if let Some(size_limit) = size_limit_opt {
+                if phys.blocks_size >= size_limit {
+                    Self::initiate_flush_object_impl(state, syncing_state);
+                }
             }
         }
-        Self::check_pending_flushes(state, &mut syncing_state);
+        Self::check_pending_flushes(state, syncing_state);
     }
 
     pub async fn write_block(&self, id: BlockID, data: Vec<u8>) {
@@ -854,7 +1104,11 @@ impl Pool {
                     .pending_unordered_writes
                     .insert(id, (ByteBuf::from(data), s));
 
-                Self::write_unordered_to_pending_object(&self.state, syncing_state);
+                Self::write_unordered_to_pending_object(
+                    &self.state,
+                    &mut syncing_state,
+                    Some(MAX_BYTES_PER_OBJECT),
+                );
                 r = myr;
             };
         }

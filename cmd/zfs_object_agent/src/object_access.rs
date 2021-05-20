@@ -220,13 +220,21 @@ impl ObjectAccess {
         &self,
         prefix: &str,
         delimiter: Option<String>,
+        start_after: Option<String>,
     ) -> Vec<ListObjectsV2Output> {
         let full_prefix = prefixed(prefix);
+        let full_start_after = match start_after {
+            Some(sa) => Some(prefixed(&sa)),
+            None => None,
+        };
         let mut results = Vec::new();
         let mut continuation_token = None;
         loop {
             continuation_token = match retry(
-                &format!("list {} (delim {:?})", full_prefix, delimiter),
+                &format!(
+                    "list {} (delim {:?}, after {:?})",
+                    full_prefix, delimiter, full_start_after
+                ),
                 || async {
                     let req = ListObjectsV2Request {
                         bucket: self.bucket_str.clone(),
@@ -234,6 +242,7 @@ impl ObjectAccess {
                         delimiter: delimiter.clone(),
                         fetch_owner: Some(false),
                         prefix: Some(full_prefix.clone()),
+                        start_after: full_start_after.clone(),
                         ..Default::default()
                     };
                     (true, self.client.list_objects_v2(req).await)
@@ -351,7 +360,7 @@ impl ObjectAccess {
     pub async fn object_exists(&self, key: &str) -> bool {
         let prefixed_key = prefixed(key);
         debug!("looking for {}", prefixed_key);
-        let results = self.list_objects(key, None).await;
+        let results = self.list_objects(key, None, None).await;
 
         assert_eq!(results.len(), 1);
         let list = &results[0];

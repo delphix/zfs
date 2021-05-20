@@ -42,7 +42,7 @@ impl<T: ObjectBasedLogEntry> OnDisk for ObjectBasedLogChunk<T> {}
 
 impl<T: ObjectBasedLogEntry> ObjectBasedLogChunk<T> {
     fn key(name: &str, generation: u64, chunk: u64) -> String {
-        format!("{}/{}/{}", name, generation, chunk)
+        format!("{}/{:020}/{:020}", name, generation, chunk)
     }
 
     async fn get(object_access: &ObjectAccess, name: &str, generation: u64, chunk: u64) -> Self {
@@ -141,7 +141,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
 
         // Delete any chunks past the logical end of the log
         for c in self.num_chunks.. {
-            let key = &format!("{}/{}/{}", self.name, self.generation, c);
+            let key = &format!("{}/{:020}/{:020}", self.name, self.generation, c);
             if self.pool.object_access.object_exists(&key).await {
                 self.pool.object_access.delete_object(&key).await;
             } else {
@@ -151,7 +151,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
 
         // Delete the partially-complete generation (if present)
         for c in 0.. {
-            let key = &format!("{}/{}/{}", self.name, self.generation + 1, c);
+            let key = &format!("{}/{:020}/{:020}", self.name, self.generation + 1, c);
             if self.pool.object_access.object_exists(key).await {
                 self.pool.object_access.delete_object(key).await;
             } else {
@@ -291,8 +291,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         let mut buffered_stream = stream.buffered(50);
         (
             stream! {
-                while let Some(fut) = buffered_stream.next().await {
-                    let chunk = fut;
+                while let Some(chunk) = buffered_stream.next().await {
                     trace!("yielding entries of chunk {}", chunk.chunk);
                     for ent in chunk.entries {
                         yield ent;

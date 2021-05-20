@@ -48,6 +48,8 @@
 #define	AGENT_TYPE_WRITE_BLOCK		"write block"
 #define	AGENT_TYPE_FREE_BLOCK		"free block"
 #define	AGENT_TYPE_BEGIN_TXG		"begin txg"
+#define	AGENT_TYPE_RESUME_TXG		"resume txg"
+#define	AGENT_TYPE_RESUME_COMPLETE	"resume complete"
 #define	AGENT_TYPE_END_TXG		"end txg"
 #define	AGENT_TYPE_FLUSH_WRITES		"flush writes"
 #define	AGENT_NAME		"name"
@@ -496,6 +498,44 @@ agent_begin_txg(vdev_object_store_t *vos, uint64_t txg)
 }
 
 static void
+agent_resume_txg(vdev_object_store_t *vos, uint64_t txg)
+{
+	ASSERT(MUTEX_HELD(&vos->vos_sock_lock));
+	/*
+	 * We need to ensure that we only issue a request when the
+	 * socket is ready. Otherwise, we block here since the agent
+	 * might be in recovery.
+	 */
+	zfs_object_store_wait(vos, VOS_SOCK_OPEN);
+
+	nvlist_t *nv = fnvlist_alloc();
+	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_RESUME_TXG);
+	fnvlist_add_uint64(nv, AGENT_TXG, txg);
+	zfs_dbgmsg("agent_resume_txg(%llu)",
+	    txg);
+	agent_request(vos, nv);
+	fnvlist_free(nv);
+}
+
+static void
+agent_resume_complete(vdev_object_store_t *vos)
+{
+	ASSERT(MUTEX_HELD(&vos->vos_sock_lock));
+	/*
+	 * We need to ensure that we only issue a request when the
+	 * socket is ready. Otherwise, we block here since the agent
+	 * might be in recovery.
+	 */
+	zfs_object_store_wait(vos, VOS_SOCK_OPEN);
+
+	nvlist_t *nv = fnvlist_alloc();
+	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_RESUME_COMPLETE);
+	zfs_dbgmsg("agent_resume_complete()");
+	agent_request(vos, nv);
+	fnvlist_free(nv);
+}
+
+static void
 agent_end_txg(vdev_object_store_t *vos, uint64_t txg, void *ub_buf,
     size_t ub_len, void *config_buf, size_t config_len)
 {
@@ -561,11 +601,11 @@ agent_reissue_zio(void *arg)
 	}
 	agent_open_pool(vd, vos);
 
+	mutex_enter(&vos->vos_sock_lock);
 	if (vos->vos_send_txg) {
-		agent_begin_txg(vos, spa_syncing_txg(vd->vdev_spa));
+		agent_resume_txg(vos, spa_syncing_txg(vd->vdev_spa));
 	}
 
-	mutex_enter(&vos->vos_sock_lock);
 	mutex_enter(&vos->vos_outstanding_lock);
 	for (uint64_t req = 0; req < VOS_MAXREQ; req++) {
 		zio_t *zio = vos->vos_outstanding_requests[req];
@@ -588,6 +628,10 @@ agent_reissue_zio(void *arg)
 		}
 	}
 	mutex_exit(&vos->vos_outstanding_lock);
+
+	if (vos->vos_send_txg) {
+		agent_resume_complete(vos);
+	}
 
 	/*
 	 * Once we've reissued all pending I/Os, mark the socket
