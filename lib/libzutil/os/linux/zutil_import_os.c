@@ -437,6 +437,8 @@ zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
 	fnvlist_add_string(msg, "region", region);
 	fnvlist_add_string(msg, "endpoint", endpoint);
 	fnvlist_add_string(msg, "credentials", credentials);
+	if (iarg->guid != 0)
+		fnvlist_add_uint64(msg, "guid", iarg->guid);
 	int sock = socket(AF_UNIX, SOCK_STREAM, 0);
 	int err = connect(sock, (struct sockaddr *)&zfs_user_socket,
 	    sizeof (zfs_user_socket));

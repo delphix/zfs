@@ -142,6 +142,13 @@ impl PoolPhys {
         format!("zfs/{}/super", guid)
     }
 
+    async fn exists(object_access: &ObjectAccess, guid: PoolGUID) -> bool {
+        object_access.list_objects(&Self::key(guid), None).await[0]
+            .key_count
+            .unwrap()
+            > 0
+    }
+
     async fn get(object_access: &ObjectAccess, guid: PoolGUID) -> Result<Self> {
         let key = Self::key(guid);
         let buf = object_access.get_object(&key).await?;
@@ -390,6 +397,10 @@ impl PoolSyncingState {
 }
 
 impl Pool {
+    pub async fn exists(object_access: &ObjectAccess, guid: PoolGUID) -> bool {
+        PoolPhys::exists(object_access, guid).await
+    }
+
     pub async fn get_config(object_access: &ObjectAccess, guid: PoolGUID) -> Result<NvList> {
         let pool_phys = PoolPhys::get(object_access, guid).await?;
         let ubphys = UberblockPhys::get(object_access, pool_phys.guid, pool_phys.last_txg).await?;

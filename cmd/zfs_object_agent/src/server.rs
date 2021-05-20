@@ -261,6 +261,18 @@ impl Server {
 
         for buck in buckets {
             let object_access = ObjectAccess::from_client(client, buck.as_str());
+            if let Ok(guid) = nvl.lookup_uint64("guid") {
+                if !Pool::exists(&object_access, PoolGUID(guid)).await {
+                    client = object_access.release_client();
+                    continue;
+                }
+                let pool_config = Pool::get_config(&object_access, PoolGUID(guid)).await;
+                resp.insert(format!("{}", guid), pool_config.as_ref())
+                    .unwrap();
+                debug!("sending response: {:?}", resp);
+                Self::send_response(&self.output, resp).await;
+                return;
+            }
             let objs = object_access
                 .list_objects("zfs/", Some("/".to_string()), None)
                 .await;
