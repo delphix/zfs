@@ -121,8 +121,6 @@ typedef struct vdev_object_store {
 	nvlist_t *vos_config;
 } vdev_object_store_t;
 
-static int vdev_object_store_io_strategy(zio_t *, vdev_object_store_t *);
-
 static mode_t
 vdev_object_store_open_mode(spa_mode_t spa_mode)
 {
@@ -282,7 +280,7 @@ agent_request(vdev_object_store_t *vos, nvlist_t *nv)
  * Send request to agent; returns request ID (index in
  * vos_outstanding_requests).  nvlist may be modified.
  */
-static uint64_t
+static void
 agent_request_zio(vdev_object_store_t *vos, zio_t *zio, nvlist_t *nv)
 {
 	ASSERT(MUTEX_HELD(&vos->vos_sock_lock));
@@ -332,7 +330,6 @@ again:
 	mutex_exit(&vos->vos_outstanding_lock);
 
 	agent_request(vos, nv);
-	return (req);
 }
 
 static zio_t *
@@ -366,22 +363,33 @@ agent_wait_serial(vdev_object_store_t *vos)
 	mutex_exit(&vos->vos_outstanding_lock);
 }
 
-static int
-agent_read_block(vdev_object_store_t *vos, zio_t *zio)
+static nvlist_t *
+agent_io_block_alloc(zio_t *zio)
 {
-	ASSERT(MUTEX_HELD(&vos->vos_sock_lock));
-
 	uint64_t blockid = zio->io_offset >> 9;
 	nvlist_t *nv = fnvlist_alloc();
-	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_READ_BLOCK);
+
+	if (zio->io_type == ZIO_TYPE_WRITE) {
+		fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_WRITE_BLOCK);
+		void *buf = abd_borrow_buf_copy(zio->io_abd, zio->io_size);
+		fnvlist_add_uint8_array(nv, AGENT_DATA, buf, zio->io_size);
+		abd_return_buf(zio->io_abd, buf, zio->io_size);
+	} else {
+		ASSERT3U(zio->io_type, ==, ZIO_TYPE_READ);
+		fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_READ_BLOCK);
+	}
 	fnvlist_add_uint64(nv, AGENT_SIZE, zio->io_size);
 	fnvlist_add_uint64(nv, AGENT_BLKID, blockid);
-	zfs_dbgmsg("agent_read_block(guid=%llu blkid=%llu)",
-	    spa_guid(zio->io_spa), blockid);
-	int err = agent_request_zio(vos, zio, nv);
-	fnvlist_free(nv);
-	return (err);
+	zfs_dbgmsg("agent_io_block_alloc(guid=%llu blkid=%llu len=%llu) %s",
+	    spa_guid(zio->io_spa), blockid, zio->io_size,
+	    zio->io_type == ZIO_TYPE_WRITE ? "WRITE" : "READ" );
+	return (nv);
+}
 
+static inline void
+agent_io_block_free(nvlist_t *nv)
+{
+	fnvlist_free(nv);
 }
 
 static void
@@ -406,30 +414,11 @@ agent_free_block(vdev_object_store_t *vos, uint64_t offset, uint64_t asize)
 	fnvlist_free(nv);
 }
 
-static int
-agent_write_block(vdev_object_store_t *vos, zio_t *zio)
-{
-	ASSERT(MUTEX_HELD(&vos->vos_sock_lock));
-
-	uint64_t blockid = zio->io_offset >> 9;
-	nvlist_t *nv = fnvlist_alloc();
-	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_WRITE_BLOCK);
-	fnvlist_add_uint64(nv, AGENT_BLKID, blockid);
-	void *buf = abd_borrow_buf_copy(zio->io_abd, zio->io_size);
-	fnvlist_add_uint8_array(nv, AGENT_DATA, buf, zio->io_size);
-	abd_return_buf(zio->io_abd, buf, zio->io_size);
-	zfs_dbgmsg("agent_write_block(guid=%llu blkid=%llu len=%llu)",
-	    spa_guid(zio->io_spa),
-	    blockid,
-	    zio->io_size);
-	int err = agent_request_zio(vos, zio, nv);
-	fnvlist_free(nv);
-	return (err);
-}
-
 static void
 agent_create_pool(vdev_t *vd, vdev_object_store_t *vos)
 {
+	ASSERT(vos->vos_serial_done == B_FALSE);
+
 	/*
 	 * We need to ensure that we only issue a request when the
 	 * socket is ready. Otherwise, we block here since the agent
@@ -459,6 +448,8 @@ agent_create_pool(vdev_t *vd, vdev_object_store_t *vos)
 static void
 agent_open_pool(vdev_t *vd, vdev_object_store_t *vos)
 {
+	ASSERT(vos->vos_serial_done == B_FALSE);
+
 	/*
 	 * We need to ensure that we only issue a request when the
 	 * socket is ready. Otherwise, we block here since the agent
@@ -508,6 +499,8 @@ static void
 agent_end_txg(vdev_object_store_t *vos, uint64_t txg, void *ub_buf,
     size_t ub_len, void *config_buf, size_t config_len)
 {
+	ASSERT(vos->vos_serial_done == B_FALSE);
+
 	/*
 	 * We need to ensure that we only issue a request when the
 	 * socket is ready. Otherwise, we block here since the agent
@@ -580,14 +573,18 @@ agent_reissue_zio(void *arg)
 			vdev_object_store_request_t *vosr = zio->io_vsd;
 			VERIFY3U(vosr->vosr_req, ==, req);
 
+			nvlist_t *nv = agent_io_block_alloc(zio);
+			fnvlist_add_uint64(nv, AGENT_REQUEST_ID, req);
 			zfs_dbgmsg("ZIO REISSUE (%px) req %llu, blk %llu",
-			    zio, req, zio->io_offset);
-			if (vdev_object_store_io_strategy(zio, vos) != 0) {
+			    zio, req, zio->io_offset >> 9);
+			if (agent_request(vos, nv) != 0) {
 				zfs_dbgmsg("agent_reissue_zio failed");
+				agent_io_block_free(nv);
 				mutex_exit(&vos->vos_outstanding_lock);
 				mutex_exit(&vos->vos_sock_lock);
 				return;
 			}
+			agent_io_block_free(nv);
 		}
 	}
 	mutex_exit(&vos->vos_outstanding_lock);
@@ -884,6 +881,13 @@ vdev_agent_thread(void *arg)
 		ASSERT3P(vos->vos_sock, ==, INVALID_SOCKET);
 		VERIFY3U(vos->vos_sock_state, ==, VOS_SOCK_CLOSED);
 
+		/*
+		 * Reset the state of for serial requests.
+		 */
+		mutex_enter(&vos->vos_outstanding_lock);
+		vos->vos_serial_done = B_FALSE;
+		mutex_exit(&vos->vos_outstanding_lock);
+
 		vdev_object_store_socket_open(vd);
 		zfs_dbgmsg("REOPENED(%px) sock " SOCK_FMT, curthread,
 		    vos->vos_sock);
@@ -1084,21 +1088,6 @@ vdev_object_store_close(vdev_t *vd)
 	vd->vdev_delayed_close = B_FALSE;
 }
 
-static int
-vdev_object_store_io_strategy(zio_t *zio, vdev_object_store_t *vos)
-{
-	ASSERT(MUTEX_HELD(&vos->vos_sock_lock));
-	int err;
-
-	if (zio->io_type == ZIO_TYPE_READ) {
-		err = agent_read_block(vos, zio);
-	} else {
-		ASSERT3U(zio->io_type, ==, ZIO_TYPE_WRITE);
-		err = agent_write_block(vos, zio);
-	}
-	return (err);
-}
-
 static void
 vdev_object_store_io_start(zio_t *zio)
 {
@@ -1137,6 +1126,9 @@ vdev_object_store_io_start(zio_t *zio)
 		return;
 	}
 
+	zio->io_vsd = vdev_object_store_request_alloc();
+	zio->io_vsd_ops = &vdev_object_store_vsd_ops;
+
 	/*
 	 * We need to ensure that we only issue a request when the
 	 * socket is ready. Otherwise, we block here since the agent
@@ -1145,10 +1137,12 @@ vdev_object_store_io_start(zio_t *zio)
 	mutex_enter(&vos->vos_sock_lock);
 	zfs_object_store_wait(vos, VOS_SOCK_READY);
 
-	zio->io_vsd = vdev_object_store_request_alloc();
-	zio->io_vsd_ops = &vdev_object_store_vsd_ops;
 	zio->io_target_timestamp = zio_handle_io_delay(zio);
-	vdev_object_store_io_strategy(zio, vos);
+
+	nvlist_t *nv = agent_io_block_alloc(zio);
+	agent_request_zio(vos, zio, nv);
+	agent_io_block_free(nv);
+
 	mutex_exit(&vos->vos_sock_lock);
 }
 
