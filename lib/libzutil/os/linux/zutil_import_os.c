@@ -517,7 +517,7 @@ zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
 		if (nvlist_lookup_uint64(tree, ZPOOL_CONFIG_GUID, &guid) != 0) {
 			continue;
 		}
-		
+
 		slice = zutil_alloc(hdl, sizeof (rdsk_node_t));
 		if (asprintf(&slice->rn_name, "%s", fnvlist_lookup_string(tree,
 		    ZPOOL_CONFIG_PATH)) == -1) {
