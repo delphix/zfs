@@ -271,10 +271,16 @@ impl Server {
                         debug!("prefix: {}", pfx);
                         let vector: Vec<&str> = pfx.rsplitn(3, '/').collect();
                         let guid_str: &str = vector[1];
-                        if let Ok(guid) = str::parse::<u64>(guid_str) {
-                            let pool_config =
-                                Pool::get_config(&object_access, PoolGUID(guid)).await;
-                            resp.insert(guid_str, pool_config.as_ref()).unwrap();
+                        if let Ok(guid64) = str::parse::<u64>(guid_str) {
+                            let guid = PoolGUID(guid64);
+                            match Pool::get_config(&object_access, guid).await {
+                                Ok(pool_config) => {
+                                    resp.insert(guid_str, pool_config.as_ref()).unwrap()
+                                }
+                                Err(e) => {
+                                    error!("skipping {:?}: {}", guid, e);
+                                }
+                            }
                         }
                     }
                 }

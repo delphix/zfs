@@ -9,7 +9,6 @@ use more_asserts::*;
 use nvpair::NvList;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::mem;
 use std::ops::Bound::*;
@@ -19,6 +18,10 @@ use std::time::{Instant, SystemTime};
 use std::{
     cmp::{max, min},
     time::Duration,
+};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    error::Error,
 };
 use stream_reduce::Reduce;
 use tokio::{sync::*, time::sleep};
@@ -141,12 +144,15 @@ impl PoolPhys {
         format!("zfs/{}/super", guid)
     }
 
-    async fn get(object_access: &ObjectAccess, guid: PoolGUID) -> Self {
-        let buf = object_access.get_object(&Self::key(guid)).await;
-        let this: Self = serde_json::from_slice(&buf).unwrap();
+    async fn get(
+        object_access: &ObjectAccess,
+        guid: PoolGUID,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let buf = object_access.get_object(&Self::key(guid)).await?;
+        let this: Self = serde_json::from_slice(&buf)?;
         debug!("got {:#?}", this);
         assert_eq!(this.guid, guid);
-        this
+        Ok(this)
     }
 
     async fn put(&self, object_access: &ObjectAccess) {
@@ -169,13 +175,17 @@ impl UberblockPhys {
         &self.zfs_config.0
     }
 
-    async fn get(object_access: &ObjectAccess, guid: PoolGUID, txg: TXG) -> Self {
-        let buf = object_access.get_object(&Self::key(guid, txg)).await;
-        let this: Self = serde_json::from_slice(&buf).unwrap();
+    async fn get(
+        object_access: &ObjectAccess,
+        guid: PoolGUID,
+        txg: TXG,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let buf = object_access.get_object(&Self::key(guid, txg)).await?;
+        let this: Self = serde_json::from_slice(&buf)?;
         debug!("got {:#?}", this);
         assert_eq!(this.guid, guid);
         assert_eq!(this.txg, txg);
-        this
+        Ok(this)
     }
 
     async fn put(&self, object_access: &ObjectAccess) {
@@ -221,10 +231,14 @@ impl DataObjectPhys {
         }
     }
 
-    async fn get(object_access: &ObjectAccess, guid: PoolGUID, obj: ObjectID) -> Self {
-        let buf = object_access.get_object(&Self::key(guid, obj)).await;
+    async fn get(
+        object_access: &ObjectAccess,
+        guid: PoolGUID,
+        obj: ObjectID,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let buf = object_access.get_object(&Self::key(guid, obj)).await?;
         let begin = Instant::now();
-        let this: Self = bincode::deserialize(&buf).unwrap();
+        let this: Self = bincode::deserialize(&buf)?;
         debug!(
             "{:?}: deserialized {} blocks from {} bytes in {}ms",
             obj,
@@ -235,7 +249,7 @@ impl DataObjectPhys {
         assert_eq!(this.guid, guid);
         assert_eq!(this.object, obj);
         this.verify();
-        this
+        Ok(this)
     }
 
     async fn put(&self, object_access: &ObjectAccess) {
@@ -383,10 +397,14 @@ impl PoolSyncingState {
 }
 
 impl Pool {
-    pub async fn get_config(object_access: &ObjectAccess, guid: PoolGUID) -> NvList {
-        let pool_phys = PoolPhys::get(object_access, guid).await;
-        let ubphys = UberblockPhys::get(object_access, pool_phys.guid, pool_phys.last_txg).await;
-        NvList::try_unpack(&ubphys.zfs_config.0).unwrap()
+    pub async fn get_config(
+        object_access: &ObjectAccess,
+        guid: PoolGUID,
+    ) -> Result<NvList, Box<dyn Error + Send + Sync>> {
+        let pool_phys = PoolPhys::get(object_access, guid).await?;
+        let ubphys = UberblockPhys::get(object_access, pool_phys.guid, pool_phys.last_txg).await?;
+        let nvl = NvList::try_unpack(&ubphys.zfs_config.0)?;
+        Ok(nvl)
     }
 
     pub async fn create(object_access: &ObjectAccess, name: &str, guid: PoolGUID) {
@@ -404,7 +422,9 @@ impl Pool {
         pool_phys: &PoolPhys,
         txg: TXG,
     ) -> (Pool, Option<UberblockPhys>, BlockID) {
-        let phys = UberblockPhys::get(object_access, pool_phys.guid, txg).await;
+        let phys = UberblockPhys::get(object_access, pool_phys.guid, txg)
+            .await
+            .unwrap();
 
         let readonly_state = Arc::new(PoolSharedState {
             object_access: object_access.clone(),
@@ -504,7 +524,7 @@ impl Pool {
         object_access: &ObjectAccess,
         guid: PoolGUID,
     ) -> (Pool, Option<UberblockPhys>, BlockID) {
-        let phys = PoolPhys::get(object_access, guid).await;
+        let phys = PoolPhys::get(object_access, guid).await.unwrap();
         if phys.last_txg.0 == 0 {
             let readonly_state = Arc::new(PoolSharedState {
                 object_access: object_access.clone(),
@@ -635,7 +655,8 @@ impl Pool {
         let begin = Instant::now();
         let recovered = get_stream
             .buffer_unordered(50)
-            .fold(BTreeMap::new(), |mut map, data| async move {
+            .fold(BTreeMap::new(), |mut map, data_res| async move {
+                let data = data_res.unwrap();
                 assert_eq!(data.guid, readonly_state.guid);
                 assert_eq!(data.min_txg, txg);
                 assert_eq!(data.max_txg, txg);
@@ -1032,7 +1053,9 @@ impl Pool {
             let _guard = mtx.lock().await;
             debug!("rewriting {:?} to overwrite {:?}", obj, id);
             let mut obj_phys =
-                DataObjectPhys::get(&shared_state.object_access, shared_state.guid, obj).await;
+                DataObjectPhys::get(&shared_state.object_access, shared_state.guid, obj)
+                    .await
+                    .unwrap();
             // must have been written this txg
             assert_eq!(obj_phys.min_txg, txg);
             assert_eq!(obj_phys.max_txg, txg);
@@ -1122,8 +1145,9 @@ impl Pool {
         //let state = self.state.clone();
 
         debug!("reading {:?} for {:?}", obj, id);
-        let block =
-            DataObjectPhys::get(&readonly_state.object_access, readonly_state.guid, obj).await;
+        let block = DataObjectPhys::get(&readonly_state.object_access, readonly_state.guid, obj)
+            .await
+            .unwrap();
         // XXX consider using debug_assert_eq
         assert_eq!(
             block.blocks_size as usize,
@@ -1325,7 +1349,8 @@ async fn reclaim_frees_object(
             async move {
                 let mut obj_phys =
                     DataObjectPhys::get(&my_shared_state.object_access, my_shared_state.guid, obj)
-                        .await;
+                        .await
+                        .unwrap();
                 // XXX This is not true, because the object could have been
                 // rewritten as part of a previous reclaim that we crashed in
                 // the middle of.  In this case the actual size may be larger or

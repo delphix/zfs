@@ -48,7 +48,8 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLogChunk<T> {
     async fn get(object_access: &ObjectAccess, name: &str, generation: u64, chunk: u64) -> Self {
         let buf = object_access
             .get_object(&Self::key(name, generation, chunk))
-            .await;
+            .await
+            .unwrap();
         let begin = Instant::now();
         let this: Self = serde_json::from_slice(&buf).unwrap();
         debug!(

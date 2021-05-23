@@ -128,7 +128,7 @@ impl ObjectAccess {
         self.client
     }
 
-    async fn get_object_impl(&self, key: &str) -> Vec<u8> {
+    async fn get_object_impl(&self, key: &str) -> Result<Vec<u8>, RusotoError<GetObjectError>> {
         let msg = format!("get {}", prefixed(key));
         let output = retry(&msg, || async {
             let req = GetObjectRequest {
@@ -143,8 +143,7 @@ impl ObjectAccess {
                 Err(_) => (true, res),
             }
         })
-        .await
-        .unwrap();
+        .await?;
         let begin = Instant::now();
         let mut v = match output.content_length {
             None => Vec::new(),
@@ -152,7 +151,7 @@ impl ObjectAccess {
         };
         output
             .body
-            .unwrap()
+            .unwrap() // XXX could the connection die while we're reading the bytestream?
             .for_each(|x| {
                 let b = x.unwrap();
                 v.extend_from_slice(&b);
@@ -166,10 +165,10 @@ impl ObjectAccess {
             begin.elapsed().as_millis()
         );
 
-        v
+        Ok(v)
     }
 
-    pub async fn get_object(&self, key: &str) -> Arc<Vec<u8>> {
+    pub async fn get_object(&self, key: &str) -> Result<Arc<Vec<u8>>, RusotoError<GetObjectError>> {
         // XXX restructure so that this block "returns" an async func that does the
         // 2nd half?
         loop {
@@ -183,7 +182,7 @@ impl ObjectAccess {
                 match c.cache.get(&mykey) {
                     Some(v) => {
                         debug!("found {} in cache", key);
-                        return v.clone();
+                        return Ok(v.clone());
                     }
                     None => match c.reading.get(key) {
                         None => {
@@ -200,12 +199,12 @@ impl ObjectAccess {
                 }
             }
             if reader {
-                let v = Arc::new(self.get_object_impl(key).await);
+                let v = Arc::new(self.get_object_impl(key).await?);
                 let mut c = CACHE.lock().unwrap();
                 mysem.close();
                 c.cache.put(key.to_string(), v.clone());
                 c.reading.remove(key);
-                return v;
+                return Ok(v);
             } else {
                 let res = mysem.acquire().await;
                 assert!(res.is_err());
