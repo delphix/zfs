@@ -277,9 +277,7 @@ impl Server {
                 Self::send_response(&self.output, resp).await;
                 return;
             }
-            let objs = object_access
-                .list_objects("zfs/", Some("/".to_string()), None)
-                .await;
+            let objs = object_access.list_objects("zfs/", None).await;
             for res in objs {
                 if let Some(prefixes) = res.common_prefixes {
                     for prefix in prefixes {

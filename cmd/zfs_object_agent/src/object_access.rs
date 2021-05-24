@@ -217,7 +217,6 @@ impl ObjectAccess {
     pub async fn list_objects(
         &self,
         prefix: &str,
-        delimiter: Option<String>,
         start_after: Option<String>,
     ) -> Vec<ListObjectsV2Output> {
         let full_prefix = prefixed(prefix);
@@ -229,15 +228,12 @@ impl ObjectAccess {
         let mut continuation_token = None;
         loop {
             continuation_token = match retry(
-                &format!(
-                    "list {} (delim {:?}, after {:?})",
-                    full_prefix, delimiter, full_start_after
-                ),
+                &format!("list {} (after {:?})", full_prefix, full_start_after),
                 || async {
                     let req = ListObjectsV2Request {
                         bucket: self.bucket_str.clone(),
                         continuation_token: continuation_token.clone(),
-                        delimiter: delimiter.clone(),
+                        delimiter: Some("/".to_owned()),
                         fetch_owner: Some(false),
                         prefix: Some(full_prefix.clone()),
                         start_after: full_start_after.clone(),
@@ -259,7 +255,7 @@ impl ObjectAccess {
                     results.push(output);
                     break;
                 }
-            }
+            };
         }
         results
     }

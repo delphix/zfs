@@ -611,11 +611,7 @@ impl Pool {
             list_stream.push(async move {
                 readonly_state
                     .object_access
-                    .list_objects(
-                        &prefix,
-                        Some("/".to_string()),
-                        Some(format!("{}{}", prefix, last_obj)),
-                    )
+                    .list_objects(&prefix, Some(format!("{}{}", prefix, last_obj)))
                     .await
             });
         }

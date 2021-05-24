@@ -146,6 +146,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         // we can easily find any after the last chunk.
 
         // Delete any chunks past the logical end of the log
+        /*
         for c in self.num_chunks.. {
             let key = &format!("{}/{:020}/{:020}", self.name, self.generation, c);
             if self.pool.object_access.object_exists(&key).await {
@@ -164,6 +165,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
                 break;
             }
         }
+        */
 
         // XXX verify that there are no chunks/generations past what we deleted
 
