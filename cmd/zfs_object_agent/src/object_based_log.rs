@@ -1,5 +1,6 @@
 use crate::pool::PoolSharedState;
 use crate::{base_types::*, object_access::ObjectAccess};
+use anyhow::{Context, Result};
 use async_stream::stream;
 use futures::future;
 use futures::future::join_all;
@@ -45,13 +46,17 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLogChunk<T> {
         format!("{}/{:020}/{:020}", name, generation, chunk)
     }
 
-    async fn get(object_access: &ObjectAccess, name: &str, generation: u64, chunk: u64) -> Self {
-        let buf = object_access
-            .get_object(&Self::key(name, generation, chunk))
-            .await
-            .unwrap();
+    async fn get(
+        object_access: &ObjectAccess,
+        name: &str,
+        generation: u64,
+        chunk: u64,
+    ) -> Result<Self> {
+        let key = Self::key(name, generation, chunk);
+        let buf = object_access.get_object(&key).await?;
         let begin = Instant::now();
-        let this: Self = serde_json::from_slice(&buf).unwrap();
+        let this: Self = serde_json::from_slice(&buf)
+            .context(format!("Failed to decode contents of {}", key))?;
         debug!(
             "deserialized {} log entries in {}ms",
             this.entries.len(),
@@ -59,7 +64,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLogChunk<T> {
         );
         assert_eq!(this.generation, generation);
         assert_eq!(this.chunk, chunk);
-        this
+        Ok(this)
     }
 
     async fn put(&self, object_access: &ObjectAccess, name: &str) {
@@ -243,7 +248,8 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         // XXX may need to use stream.buffered() so we don't have too many outstanding fd's / connections
         // XXX or retire this in favor of the iterate() interface
         stream
-            .for_each(|mut chunk| {
+            .for_each(|res| {
+                let mut chunk = res.unwrap();
                 debug!(
                     "appending {} entries of chunk {}",
                     chunk.entries.len(),
@@ -283,7 +289,11 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
             let pool = self.pool.clone();
             let n = self.name.clone();
             stream.push(async move {
-                async move { ObjectBasedLogChunk::get(&pool.object_access, &n, generation, chunk).await }
+                async move {
+                    ObjectBasedLogChunk::get(&pool.object_access, &n, generation, chunk)
+                        .await
+                        .unwrap()
+                }
             });
         }
         // Note: buffered() is needed because rust-s3 creates one connection for

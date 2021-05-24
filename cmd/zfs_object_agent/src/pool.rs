@@ -1,6 +1,7 @@
 use crate::object_based_log::*;
 use crate::object_block_map::ObjectBlockMap;
 use crate::{base_types::*, object_access::ObjectAccess};
+use anyhow::{Context, Result};
 use core::future::Future;
 use futures::future;
 use futures::stream::*;
@@ -9,6 +10,7 @@ use more_asserts::*;
 use nvpair::NvList;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::mem;
 use std::ops::Bound::*;
@@ -18,10 +20,6 @@ use std::time::{Instant, SystemTime};
 use std::{
     cmp::{max, min},
     time::Duration,
-};
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    error::Error,
 };
 use stream_reduce::Reduce;
 use tokio::{sync::*, time::sleep};
@@ -144,12 +142,11 @@ impl PoolPhys {
         format!("zfs/{}/super", guid)
     }
 
-    async fn get(
-        object_access: &ObjectAccess,
-        guid: PoolGUID,
-    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let buf = object_access.get_object(&Self::key(guid)).await?;
-        let this: Self = serde_json::from_slice(&buf)?;
+    async fn get(object_access: &ObjectAccess, guid: PoolGUID) -> Result<Self> {
+        let key = Self::key(guid);
+        let buf = object_access.get_object(&key).await?;
+        let this: Self = serde_json::from_slice(&buf)
+            .context(format!("Failed to decode contents of {}", key))?;
         debug!("got {:#?}", this);
         assert_eq!(this.guid, guid);
         Ok(this)
@@ -175,13 +172,11 @@ impl UberblockPhys {
         &self.zfs_config.0
     }
 
-    async fn get(
-        object_access: &ObjectAccess,
-        guid: PoolGUID,
-        txg: TXG,
-    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let buf = object_access.get_object(&Self::key(guid, txg)).await?;
-        let this: Self = serde_json::from_slice(&buf)?;
+    async fn get(object_access: &ObjectAccess, guid: PoolGUID, txg: TXG) -> Result<Self> {
+        let key = Self::key(guid, txg);
+        let buf = object_access.get_object(&key).await?;
+        let this: Self = serde_json::from_slice(&buf)
+            .context(format!("Failed to decode contents of {}", key))?;
         debug!("got {:#?}", this);
         assert_eq!(this.guid, guid);
         assert_eq!(this.txg, txg);
@@ -231,14 +226,12 @@ impl DataObjectPhys {
         }
     }
 
-    async fn get(
-        object_access: &ObjectAccess,
-        guid: PoolGUID,
-        obj: ObjectID,
-    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let buf = object_access.get_object(&Self::key(guid, obj)).await?;
+    async fn get(object_access: &ObjectAccess, guid: PoolGUID, obj: ObjectID) -> Result<Self> {
+        let key = Self::key(guid, obj);
+        let buf = object_access.get_object(&key).await?;
         let begin = Instant::now();
-        let this: Self = bincode::deserialize(&buf)?;
+        let this: Self =
+            bincode::deserialize(&buf).context(format!("Failed to decode contents of {}", key))?;
         debug!(
             "{:?}: deserialized {} blocks from {} bytes in {}ms",
             obj,
@@ -397,10 +390,7 @@ impl PoolSyncingState {
 }
 
 impl Pool {
-    pub async fn get_config(
-        object_access: &ObjectAccess,
-        guid: PoolGUID,
-    ) -> Result<NvList, Box<dyn Error + Send + Sync>> {
+    pub async fn get_config(object_access: &ObjectAccess, guid: PoolGUID) -> Result<NvList> {
         let pool_phys = PoolPhys::get(object_access, guid).await?;
         let ubphys = UberblockPhys::get(object_access, pool_phys.guid, pool_phys.last_txg).await?;
         let nvl = NvList::try_unpack(&ubphys.zfs_config.0)?;

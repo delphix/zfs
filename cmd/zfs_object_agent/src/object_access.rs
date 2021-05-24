@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_stream::stream;
 use bytes::Bytes;
 use core::time::Duration;
@@ -79,12 +79,9 @@ where
         delay = delay.mul_f64(thread_rng().gen_range(1.5..2.5));
     };
     let elapsed = begin.elapsed();
-    debug!("{}: returned success in {}ms", msg, elapsed.as_millis());
+    debug!("{}: returned in {}ms", msg, elapsed.as_millis());
     if elapsed > LONG_OPERATION_DURATION {
-        info!(
-            "long completion: {}: returned success in {:?}",
-            msg, elapsed
-        );
+        info!("long completion: {}: returned in {:?}", msg, elapsed);
     }
     result
 }
@@ -128,7 +125,7 @@ impl ObjectAccess {
         self.client
     }
 
-    async fn get_object_impl(&self, key: &str) -> Result<Vec<u8>, RusotoError<GetObjectError>> {
+    async fn get_object_impl(&self, key: &str) -> Result<Vec<u8>> {
         let msg = format!("get {}", prefixed(key));
         let output = retry(&msg, || async {
             let req = GetObjectRequest {
@@ -143,7 +140,8 @@ impl ObjectAccess {
                 Err(_) => (true, res),
             }
         })
-        .await?;
+        .await
+        .with_context(|| format!("Failed to {}", msg))?;
         let begin = Instant::now();
         let mut v = match output.content_length {
             None => Vec::new(),
@@ -168,7 +166,7 @@ impl ObjectAccess {
         Ok(v)
     }
 
-    pub async fn get_object(&self, key: &str) -> Result<Arc<Vec<u8>>, RusotoError<GetObjectError>> {
+    pub async fn get_object(&self, key: &str) -> Result<Arc<Vec<u8>>> {
         // XXX restructure so that this block "returns" an async func that does the
         // 2nd half?
         loop {
