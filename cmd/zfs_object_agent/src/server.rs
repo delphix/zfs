@@ -278,7 +278,7 @@ impl Server {
                                     resp.insert(guid_str, pool_config.as_ref()).unwrap()
                                 }
                                 Err(e) => {
-                                    error!("skipping {:?}: {}", guid, e);
+                                    error!("skipping {:?}: {:?}", guid, e);
                                 }
                             }
                         }

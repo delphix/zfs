@@ -22,10 +22,12 @@ fn setup_logging(verbosity: u64, file_name: Option<&str>) {
     };
 
     let mut config = fern::Dispatch::new().format(|out, message, record| {
+        let target = record.target();
+        let stripped_target = target.strip_prefix("libzoa").unwrap_or(target);
         out.finish(format_args!(
             "[{}][{}][{}] {}",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.6f"),
-            record.target(),
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+            stripped_target,
             record.level(),
             message
         ))
