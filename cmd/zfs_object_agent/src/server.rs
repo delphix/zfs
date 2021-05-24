@@ -283,6 +283,7 @@ impl Server {
                 let guid_str: &str = split[1];
                 if let Ok(guid64) = str::parse::<u64>(guid_str) {
                     let guid = PoolGUID(guid64);
+                    // XXX do this in parallel for all guids?
                     match Pool::get_config(&object_access, guid).await {
                         Ok(pool_config) => resp.insert(guid_str, pool_config.as_ref()).unwrap(),
                         Err(e) => {

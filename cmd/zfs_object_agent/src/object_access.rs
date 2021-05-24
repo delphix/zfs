@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_stream::stream;
 use bytes::Bytes;
 use core::time::Duration;
-use futures::{Future, StreamExt};
+use futures::{future::Either, Future, StreamExt};
 use http::StatusCode;
 use lazy_static::lazy_static;
 use log::*;
@@ -14,12 +14,12 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Semaphore;
+use tokio::sync::watch;
 
 struct ObjectCache {
     // XXX cache key should include Bucket
     cache: LruCache<String, Arc<Vec<u8>>>,
-    reading: HashMap<String, Arc<Semaphore>>,
+    reading: HashMap<String, watch::Receiver<Option<Arc<Vec<u8>>>>>,
 }
 
 lazy_static! {
@@ -168,50 +168,58 @@ impl ObjectAccess {
     }
 
     pub async fn get_object(&self, key: &str) -> Result<Arc<Vec<u8>>> {
-        // XXX restructure so that this block "returns" an async func that does the
-        // 2nd half?
-        loop {
-            let mysem;
-            let reader;
+        let either = {
             // need this block separate so that we can drop the mutex before the .await
-            // note: the compiler doesn't realize that drop(c) actually drops it
-            {
-                let mut c = CACHE.lock().unwrap();
-                let mykey = key.to_string();
-                match c.cache.get(&mykey) {
-                    Some(v) => {
-                        debug!("found {} in cache", key);
-                        return Ok(v.clone());
-                    }
-                    None => match c.reading.get(key) {
-                        None => {
-                            mysem = Arc::new(Semaphore::new(0));
-                            c.reading.insert(mykey, mysem.clone());
-                            reader = true;
-                        }
-                        Some(sem) => {
-                            debug!("found {} read in progress", key);
-                            mysem = sem.clone();
-                            reader = false;
-                        }
-                    },
+            let mut c = CACHE.lock().unwrap();
+            let mykey = key.to_string();
+            match c.cache.get(&mykey) {
+                Some(v) => {
+                    debug!("found {} in cache", key);
+                    return Ok(v.clone());
                 }
+                None => match c.reading.get(key) {
+                    None => {
+                        let (tx, rx) = watch::channel::<Option<Arc<Vec<u8>>>>(None);
+                        c.reading.insert(mykey, rx);
+                        Either::Left(async move {
+                            let v = Arc::new(self.get_object_impl(key).await?);
+                            let mut myc = CACHE.lock().unwrap();
+                            tx.send(Some(v.clone())).unwrap();
+                            myc.cache.put(key.to_string(), v.clone());
+                            myc.reading.remove(key);
+                            Ok(v)
+                        })
+                    }
+                    Some(rx) => {
+                        debug!("found {} read in progress", key);
+                        let mut myrx = rx.clone();
+                        Either::Right(async move {
+                            if let Some(vec) = myrx.borrow().as_ref() {
+                                return Ok(vec.clone());
+                            }
+                            // Note: "else" or "match" statement not allowed
+                            // here because the .borrow()'ed Ref is not dropped
+                            // until the end of the else/match
+
+                            // XXX if the sender drops due to
+                            // get_object_impl() failing, we don't get a
+                            // very good error message, but maybe that
+                            // doesn't matter since the behavior is
+                            // otherwise correct (we return an Error)
+                            // XXX should we make a wrapper around the
+                            // watch::channel that has borrow() wait until the
+                            // first value is sent?
+                            myrx.changed().await?;
+                            let b = myrx.borrow();
+                            // Note: we assume that the once it's changed, it
+                            // has to be Some()
+                            Ok(b.as_ref().unwrap().clone())
+                        })
+                    }
+                },
             }
-            if reader {
-                let v = Arc::new(self.get_object_impl(key).await?);
-                let mut c = CACHE.lock().unwrap();
-                mysem.close();
-                c.cache.put(key.to_string(), v.clone());
-                c.reading.remove(key);
-                return Ok(v);
-            } else {
-                let res = mysem.acquire().await;
-                assert!(res.is_err());
-                // XXX restructure so that new value is sent via tokio::sync::watch,
-                // so we don't have to look up in the cache again?  although this
-                // case is uncommon
-            }
-        }
+        };
+        either.await
     }
 
     pub async fn list_objects(
