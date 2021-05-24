@@ -295,8 +295,8 @@ agent_request_zio(vdev_object_store_t *vos, zio_t *zio, nvlist_t *nv)
 	 * XXX need locking on requests array since this could be
 	 * called concurrently
 	 */
-	mutex_enter(&vos->vos_outstanding_lock);
 again:
+	mutex_enter(&vos->vos_outstanding_lock);
 	for (req = 0; req < VOS_MAXREQ; req++) {
 		if (vos->vos_outstanding_requests[req] == NULL) {
 			vos->vos_outstanding_requests[req] = zio;
@@ -314,9 +314,16 @@ again:
 		mutex_exit(&vos->vos_sock_lock);
 		// XXX we really shouldn't be blocking in vdev_op_io_start
 		cv_wait(&vos->vos_outstanding_cv, &vos->vos_outstanding_lock);
-		mutex_enter(&vos->vos_sock_lock);
 		avl_remove(&vq->vq_class[zio->io_priority].vqc_queued_tree,
 		    zio);
+
+		/*
+		 * Drop the outstanding lock so that we can
+		 * retry the operation again with the proper
+		 * locking order.
+		 */
+		mutex_exit(&vos->vos_outstanding_lock);
+		mutex_enter(&vos->vos_sock_lock);
 
 		goto again;
 	}
