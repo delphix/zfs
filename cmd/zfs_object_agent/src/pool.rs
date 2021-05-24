@@ -231,20 +231,24 @@ impl DataObjectPhys {
     }
 
     async fn get(object_access: &ObjectAccess, guid: PoolGUID, obj: ObjectID) -> Result<Self> {
-        let key = Self::key(guid, obj);
-        let buf = object_access.get_object(&key).await?;
+        let this = Self::get_from_key(object_access, &Self::key(guid, obj)).await?;
+        assert_eq!(this.guid, guid);
+        assert_eq!(this.object, obj);
+        Ok(this)
+    }
+
+    async fn get_from_key(object_access: &ObjectAccess, key: &str) -> Result<Self> {
+        let buf = object_access.get_object(key).await?;
         let begin = Instant::now();
         let this: Self =
             bincode::deserialize(&buf).context(format!("Failed to decode contents of {}", key))?;
         debug!(
             "{:?}: deserialized {} blocks from {} bytes in {}ms",
-            obj,
+            this.object,
             this.blocks.len(),
             buf.len(),
             begin.elapsed().as_millis()
         );
-        assert_eq!(this.guid, guid);
-        assert_eq!(this.object, obj);
         this.verify();
         Ok(this)
     }
@@ -611,33 +615,20 @@ impl Pool {
             list_stream.push(async move {
                 readonly_state
                     .object_access
-                    .list_objects(&prefix, Some(format!("{}{}", prefix, last_obj)))
+                    .collect_objects(&prefix, Some(format!("{}{}", prefix, last_obj)))
                     .await
             });
         }
         let get_stream = FuturesUnordered::new();
         list_stream
-            .for_each(|v| async {
-                for output in v {
-                    for vec in output.contents {
-                        for object in vec {
-                            let key = object.key.unwrap();
-                            let object = ObjectID(
-                                u64::from_str_radix(key.rsplit('/').next().unwrap(), 10).unwrap(),
-                            );
-                            let readonly_state = readonly_state.clone();
-                            get_stream.push(async move {
-                                async move {
-                                    DataObjectPhys::get(
-                                        &readonly_state.object_access,
-                                        readonly_state.guid,
-                                        object,
-                                    )
-                                    .await
-                                }
-                            });
+            .for_each(|vec| async {
+                for key in vec {
+                    let readonly_state = readonly_state.clone();
+                    get_stream.push(async move {
+                        async move {
+                            DataObjectPhys::get_from_key(&readonly_state.object_access, &key).await
                         }
-                    }
+                    });
                 }
             })
             .await;

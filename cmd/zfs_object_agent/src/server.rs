@@ -277,24 +277,16 @@ impl Server {
                 Self::send_response(&self.output, resp).await;
                 return;
             }
-            let objs = object_access.list_objects("zfs/", None).await;
-            for res in objs {
-                if let Some(prefixes) = res.common_prefixes {
-                    for prefix in prefixes {
-                        let pfx = prefix.prefix.unwrap();
-                        debug!("prefix: {}", pfx);
-                        let vector: Vec<&str> = pfx.rsplitn(3, '/').collect();
-                        let guid_str: &str = vector[1];
-                        if let Ok(guid64) = str::parse::<u64>(guid_str) {
-                            let guid = PoolGUID(guid64);
-                            match Pool::get_config(&object_access, guid).await {
-                                Ok(pool_config) => {
-                                    resp.insert(guid_str, pool_config.as_ref()).unwrap()
-                                }
-                                Err(e) => {
-                                    error!("skipping {:?}: {:?}", guid, e);
-                                }
-                            }
+            for prefix in object_access.collect_prefixes("zfs/").await {
+                debug!("prefix: {}", prefix);
+                let split: Vec<&str> = prefix.rsplitn(3, '/').collect();
+                let guid_str: &str = split[1];
+                if let Ok(guid64) = str::parse::<u64>(guid_str) {
+                    let guid = PoolGUID(guid64);
+                    match Pool::get_config(&object_access, guid).await {
+                        Ok(pool_config) => resp.insert(guid_str, pool_config.as_ref()).unwrap(),
+                        Err(e) => {
+                            error!("skipping {:?}: {:?}", guid, e);
                         }
                     }
                 }

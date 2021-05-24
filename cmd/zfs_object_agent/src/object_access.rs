@@ -260,6 +260,30 @@ impl ObjectAccess {
         results
     }
 
+    pub async fn collect_objects(&self, prefix: &str, start_after: Option<String>) -> Vec<String> {
+        let mut vec = Vec::new();
+        for output in self.list_objects(prefix, start_after).await {
+            for objects in output.contents {
+                for object in objects {
+                    vec.push(object.key.unwrap());
+                }
+            }
+        }
+        vec
+    }
+
+    pub async fn collect_prefixes(&self, prefix: &str) -> Vec<String> {
+        let mut vec = Vec::new();
+        for output in self.list_objects(prefix, None).await {
+            if let Some(prefixes) = output.common_prefixes {
+                for prefix in prefixes {
+                    vec.push(prefix.prefix.unwrap());
+                }
+            }
+        }
+        vec
+    }
+
     pub async fn object_exists(&self, key: &str) -> bool {
         let res = retry(&format!("head {}", prefixed(key)), || async {
             let req = HeadObjectRequest {
