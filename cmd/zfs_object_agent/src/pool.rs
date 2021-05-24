@@ -619,6 +619,21 @@ impl Pool {
                     .await
             });
         }
+
+        let get_stream = list_stream.flat_map(|vec| {
+            let sub_stream = FuturesUnordered::new();
+            for key in vec {
+                let readonly_state = readonly_state.clone();
+                sub_stream.push(async move {
+                    async move {
+                        DataObjectPhys::get_from_key(&readonly_state.object_access, &key).await
+                    }
+                });
+            }
+            sub_stream
+        });
+
+        /*
         let get_stream = FuturesUnordered::new();
         list_stream
             .for_each(|vec| async {
@@ -632,12 +647,15 @@ impl Pool {
                 }
             })
             .await;
+            */
+        /*
         info!(
             "resume: listing found {} objects in {}ms",
             get_stream.len(),
             begin.elapsed().as_millis()
         );
-        let begin = Instant::now();
+        */
+        //let begin = Instant::now();
         let recovered = get_stream
             .buffer_unordered(50)
             .fold(BTreeMap::new(), |mut map, data_res| async move {
@@ -654,7 +672,7 @@ impl Pool {
             })
             .await;
         info!(
-            "resume: read {} objects in {}ms",
+            "resume: listed and read {} objects in {}ms",
             recovered.len(),
             begin.elapsed().as_millis()
         );
