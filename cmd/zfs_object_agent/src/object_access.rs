@@ -264,7 +264,7 @@ impl ObjectAccess {
         results
     }
 
-    pub async fn exists(&self, key: &str) -> bool {
+    pub async fn object_exists(&self, key: &str) -> bool {
         let res = retry(&format!("head {}", prefixed(key)), || async {
             let req = HeadObjectRequest {
                 bucket: self.bucket_str.clone(),
@@ -375,23 +375,5 @@ impl ObjectAccess {
     // XXX should we split them up here?
     pub async fn delete_objects(&self, keys: Vec<String>) {
         while self.delete_objects_impl(&keys).await {}
-    }
-
-    pub async fn object_exists(&self, key: &str) -> bool {
-        let prefixed_key = prefixed(key);
-        debug!("looking for {}", prefixed_key);
-        let results = self.list_objects(key, None, None).await;
-
-        assert_eq!(results.len(), 1);
-        let list = &results[0];
-        // Note need to check if this exact name is in the results. If we are looking
-        // for "x/y" and there is "x/y" and "x/yz", both will be returned.
-        list.contents.as_ref().unwrap_or(&vec![]).iter().any(|o| {
-            if let Some(k) = &o.key {
-                k == key
-            } else {
-                false
-            }
-        })
     }
 }

@@ -267,7 +267,11 @@ impl Server {
                     continue;
                 }
                 let pool_config = Pool::get_config(&object_access, PoolGUID(guid)).await;
-                resp.insert(format!("{}", guid), pool_config.as_ref())
+                if let Err(_) = pool_config {
+                    client = object_access.release_client();
+                    continue;
+                }
+                resp.insert(format!("{}", guid), pool_config.unwrap().as_ref())
                     .unwrap();
                 debug!("sending response: {:?}", resp);
                 Self::send_response(&self.output, resp).await;
