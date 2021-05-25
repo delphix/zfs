@@ -464,11 +464,6 @@ struct vdev {
 	zfs_ratelimit_t vdev_delay_rl;
 	zfs_ratelimit_t vdev_deadman_rl;
 	zfs_ratelimit_t vdev_checksum_rl;
-
-	/*
-	 * For now, we associate this with a vdev.
-	 */
-	struct socket *sock;
 };
 
 #define	VDEV_PAD_SIZE		(8 << 10)
@@ -614,10 +609,11 @@ extern vdev_ops_t vdev_spare_ops;
 extern vdev_ops_t vdev_indirect_ops;
 extern vdev_ops_t vdev_object_store_ops;
 
-void object_store_begin_txg(spa_t *, uint64_t);
-void object_store_end_txg(spa_t *, nvlist_t *, uint64_t);
+void object_store_begin_txg(vdev_t *, uint64_t);
+void object_store_end_txg(vdev_t *, nvlist_t *, uint64_t);
 void object_store_free_block(vdev_t *, uint64_t, uint64_t);
 void object_store_flush_writes(spa_t *);
+void object_store_restart_agent(vdev_t *vd);
 
 /*
  * Common size functions

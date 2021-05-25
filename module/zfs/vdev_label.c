@@ -1934,11 +1934,10 @@ retry:
 
 	ASSERT3U(txg, <=, spa->spa_final_txg);
 
-	if (spa->spa_root_vdev->vdev_child[0]->vdev_ops ==
-	    &vdev_object_store_ops) {
+	if (svd[0]->vdev_ops == &vdev_object_store_ops) {
 		nvlist_t *label = spa_config_generate(spa,
-		    spa->spa_root_vdev->vdev_child[0], txg, B_FALSE);
-		object_store_end_txg(spa, label, txg);
+		    svd[0], txg, B_FALSE);
+		object_store_end_txg(svd[0], label, txg);
 		return (0);
 	}
 
