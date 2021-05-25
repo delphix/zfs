@@ -602,7 +602,7 @@ impl Pool {
         assert!(!syncing_state.pending_object.is_pending());
     }
 
-    async fn recover_objects(
+    async fn get_recovered_objects(
         state: &Arc<PoolState>,
         readonly_state: &Arc<PoolSharedState>,
         txg: TXG,
@@ -620,43 +620,19 @@ impl Pool {
             });
         }
 
-        let get_stream = list_stream.flat_map(|vec| {
-            let sub_stream = FuturesUnordered::new();
-            for key in vec {
-                let readonly_state = readonly_state.clone();
-                sub_stream.push(async move {
-                    async move {
-                        DataObjectPhys::get_from_key(&readonly_state.object_access, &key).await
-                    }
-                });
-            }
-            sub_stream
-        });
-
-        /*
-        let get_stream = FuturesUnordered::new();
-        list_stream
-            .for_each(|vec| async {
+        let recovered = list_stream
+            .flat_map(|vec| {
+                let sub_stream = FuturesUnordered::new();
                 for key in vec {
                     let readonly_state = readonly_state.clone();
-                    get_stream.push(async move {
+                    sub_stream.push(async move {
                         async move {
                             DataObjectPhys::get_from_key(&readonly_state.object_access, &key).await
                         }
                     });
                 }
+                sub_stream
             })
-            .await;
-            */
-        /*
-        info!(
-            "resume: listing found {} objects in {}ms",
-            get_stream.len(),
-            begin.elapsed().as_millis()
-        );
-        */
-        //let begin = Instant::now();
-        let recovered = get_stream
             .buffer_unordered(50)
             .fold(BTreeMap::new(), |mut map, data_res| async move {
                 let data = data_res.unwrap();
@@ -692,116 +668,108 @@ impl Pool {
         // verify that we're in resuming state
         assert!(!syncing_state.pending_object.is_pending());
 
-        let mut recovered_objects = Self::recover_objects(state, readonly_state, txg).await;
+        let recovered_objects = Self::get_recovered_objects(state, readonly_state, txg).await;
 
-        let mut ordered_writes: BTreeSet<BlockID> = syncing_state
+        let ordered_writes: BTreeSet<BlockID> = syncing_state
             .pending_unordered_writes
             .keys()
             .map(|x| *x)
             .collect();
 
-        //debug!("recovered_objects = {:?}", recovered_objects);
-        //debug!("block_to_obj = {:?}", state.block_to_obj);
+        let mut recovered_objects_iter = recovered_objects.into_iter().peekable();
+        let mut ordered_writes_iter = ordered_writes.into_iter().peekable();
 
-        loop {
-            let next_write_blockid = ordered_writes.iter().next();
-            let next_object_blockid = recovered_objects
-                .iter()
-                .next()
-                .and_then(|x| Some(&x.1.min_block));
+        while let Some((_, next_recovered_object)) = recovered_objects_iter.peek() {
+            match ordered_writes_iter.peek() {
+                Some(next_ordered_write)
+                    if next_ordered_write < &next_recovered_object.min_block =>
+                {
+                    // writes are next, and there are objects after this
 
-            trace!(
-                "resume: next_write={:?} next_object={:?}",
-                next_write_blockid,
-                next_object_blockid
-            );
-            if next_object_blockid.is_some()
-                && (next_write_blockid.is_none() || next_write_blockid >= next_object_blockid)
-            {
-                // already-written object is next
-                let recovered_obj = recovered_objects.iter().next().unwrap().1;
-                let object = recovered_obj.object;
-                debug!(
-                    "resume: next is {:?}, min={:?} next={:?}",
-                    object, recovered_obj.min_block, recovered_obj.next_block
-                );
-
-                Self::account_new_object(state, &mut syncing_state, recovered_obj);
-
-                // The kernel may not have known that this was already written
-                // (e.g. we didn't quite get to sending the "write done"
-                // response), so it sent us the write again.  In this case we
-                // can notify it now, since the blocks are already persistent.
-                // Note that .split_off() removes and returns the tail (entries
-                // >= next_block), but we want to remove and the head.
-                let new_ordered_writes = ordered_writes.split_off(&recovered_obj.next_block);
-                let obsolete_writes = ordered_writes;
-                ordered_writes = new_ordered_writes;
-                for obsolete_write in obsolete_writes {
-                    trace!(
-                        "resume: {:?} is obsoleted by existing {:?}",
-                        obsolete_write,
-                        object
+                    assert!(!syncing_state.pending_object.is_pending());
+                    syncing_state.pending_object = PendingObjectState::new_pending(
+                        self.state.readonly_state.guid,
+                        state.block_to_obj.read().unwrap().last_obj().next(),
+                        syncing_state.pending_object.next_block(),
+                        txg,
                     );
-                    let (_, sender) = syncing_state
-                        .pending_unordered_writes
-                        .remove(&obsolete_write)
-                        .unwrap();
-                    sender.send(()).unwrap();
+
+                    // XXX Unless there is already an object at object.next(), we
+                    // should limit the object size as normal.
+                    // XXX we need to limit the unordered writes to be only those before the next object
+                    Self::write_unordered_to_pending_object(state, &mut syncing_state, None);
+
+                    let (phys, _) = syncing_state.pending_object.as_mut_pending();
+                    debug!(
+                        "resume: writes are next; creating {:?}, min={:?} next={:?}",
+                        phys.object, phys.min_block, phys.next_block
+                    );
+
+                    Self::initiate_flush_object_impl(state, &mut syncing_state);
+                    let next_block = syncing_state.pending_object.next_block();
+                    syncing_state.pending_object = PendingObjectState::NotPending(next_block);
+
+                    // skip over writes that were moved to pending_object and written out
+                    while let Some(_) =
+                        peekable_next_if(&mut ordered_writes_iter, |b| b < &next_block)
+                    {
+                    }
                 }
-                assert!(!syncing_state.pending_object.is_pending());
-                syncing_state.pending_object =
-                    PendingObjectState::NotPending(recovered_obj.next_block);
+                _ => {
+                    // already-written object is next
 
-                recovered_objects.remove(&object);
-            } else if next_write_blockid.is_some() && next_object_blockid.is_some() {
-                // writes are next, and there are objects after this
+                    let (_, recovered_obj) = recovered_objects_iter.next().unwrap();
+                    debug!(
+                        "resume: next is {:?}, min={:?} next={:?}",
+                        recovered_obj.object, recovered_obj.min_block, recovered_obj.next_block
+                    );
 
-                assert!(!syncing_state.pending_object.is_pending());
-                syncing_state.pending_object = PendingObjectState::new_pending(
-                    self.state.readonly_state.guid,
-                    state.block_to_obj.read().unwrap().last_obj().next(),
-                    syncing_state.pending_object.next_block(),
-                    txg,
-                );
+                    Self::account_new_object(state, &mut syncing_state, &recovered_obj);
 
-                // XXX Unless there is already an object at object.next(), we
-                // should limit the object size as normal.
-                Self::write_unordered_to_pending_object(state, &mut syncing_state, None);
-
-                let (phys, _) = syncing_state.pending_object.as_mut_pending();
-                debug!(
-                    "resume: writes are next; creating {:?}, min={:?} next={:?}",
-                    phys.object, phys.min_block, phys.next_block
-                );
-
-                Self::initiate_flush_object_impl(state, &mut syncing_state);
-                let next_block = syncing_state.pending_object.next_block();
-                syncing_state.pending_object = PendingObjectState::NotPending(next_block);
-
-                // remove from ordered_writes
-                ordered_writes = ordered_writes.split_off(&next_block);
-            } else {
-                // nothing left; move ordered portion to pending
-
-                assert!(!syncing_state.pending_object.is_pending());
-                syncing_state.pending_object = PendingObjectState::new_pending(
-                    self.state.readonly_state.guid,
-                    state.block_to_obj.read().unwrap().last_obj().next(),
-                    syncing_state.pending_object.next_block(),
-                    txg,
-                );
-
-                debug!("resume: moving last writes to pending_object");
-                Self::write_unordered_to_pending_object(
-                    state,
-                    &mut syncing_state,
-                    Some(MAX_BYTES_PER_OBJECT),
-                );
-                info!("resume: completed");
-                break;
+                    // The kernel may not have known that this was already
+                    // written (e.g. we didn't quite get to sending the "write
+                    // done" response), so it sent us the write again.  In this
+                    // case we will not create a object, since the blocks are
+                    // already persistent, so we need to notify the waiter now.
+                    while let Some(obsolete_write) =
+                        peekable_next_if(&mut ordered_writes_iter, |b| {
+                            b < &recovered_obj.next_block
+                        })
+                    {
+                        trace!(
+                            "resume: {:?} is obsoleted by existing {:?}",
+                            obsolete_write,
+                            recovered_obj.object,
+                        );
+                        let (_, sender) = syncing_state
+                            .pending_unordered_writes
+                            .remove(&obsolete_write)
+                            .unwrap();
+                        sender.send(()).unwrap();
+                    }
+                    assert!(!syncing_state.pending_object.is_pending());
+                    syncing_state.pending_object =
+                        PendingObjectState::NotPending(recovered_obj.next_block);
+                }
             }
         }
+
+        // no recovered objects left; move ordered portion of writes to pending_object
+        assert!(!syncing_state.pending_object.is_pending());
+        syncing_state.pending_object = PendingObjectState::new_pending(
+            self.state.readonly_state.guid,
+            state.block_to_obj.read().unwrap().last_obj().next(),
+            syncing_state.pending_object.next_block(),
+            txg,
+        );
+
+        debug!("resume: moving last writes to pending_object");
+        Self::write_unordered_to_pending_object(
+            state,
+            &mut syncing_state,
+            Some(MAX_BYTES_PER_OBJECT),
+        );
+        info!("resume: completed");
     }
 
     pub fn begin_txg(&self, txg: TXG) {
@@ -1729,4 +1697,15 @@ async fn try_condense_object_sizes(
         syncing_state.object_size_log.num_chunks,
         begin.elapsed().as_millis()
     );
+}
+
+// This works like Peekable::next_if(), which isn't available in the version of Rust that we use.
+fn peekable_next_if<I: Iterator>(
+    this: &mut std::iter::Peekable<I>,
+    func: impl FnOnce(&I::Item) -> bool,
+) -> Option<I::Item> {
+    match this.peek() {
+        Some(matched) if func(&matched) => this.next(),
+        _ => None,
+    }
 }
