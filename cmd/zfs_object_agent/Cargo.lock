@@ -717,6 +717,7 @@ dependencies = [
  "bytes",
  "futures",
  "futures-core",
+ "http",
  "lazy_static",
  "log",
  "lru",

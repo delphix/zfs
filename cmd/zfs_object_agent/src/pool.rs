@@ -143,10 +143,7 @@ impl PoolPhys {
     }
 
     async fn exists(object_access: &ObjectAccess, guid: PoolGUID) -> bool {
-        object_access.list_objects(&Self::key(guid), None).await[0]
-            .key_count
-            .unwrap()
-            > 0
+        object_access.exists(&Self::key(guid)).await
     }
 
     async fn get(object_access: &ObjectAccess, guid: PoolGUID) -> Result<Self> {

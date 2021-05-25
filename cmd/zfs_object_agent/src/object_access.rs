@@ -3,6 +3,7 @@ use async_stream::stream;
 use bytes::Bytes;
 use core::time::Duration;
 use futures::{Future, StreamExt};
+use http::StatusCode;
 use lazy_static::lazy_static;
 use log::*;
 use lru::LruCache;
@@ -261,6 +262,28 @@ impl ObjectAccess {
             }
         }
         results
+    }
+
+    pub async fn exists(&self, key: &str) -> bool {
+        let res = retry(&format!("head {}", prefixed(key)), || async {
+            let req = HeadObjectRequest {
+                bucket: self.bucket_str.clone(),
+                key: prefixed(key),
+                ..Default::default()
+            };
+            let res = self.client.head_object(req).await;
+            match res {
+                Err(RusotoError::Service(HeadObjectError::NoSuchKey(_))) => (false, res),
+                Err(RusotoError::Unknown(rusoto_core::request::BufferedHttpResponse {
+                    status: StatusCode::NOT_FOUND,
+                    body: _,
+                    headers: _,
+                })) => (false, res),
+                _ => (true, res),
+            }
+        })
+        .await;
+        res.err() == None
     }
 
     async fn put_object_impl(&self, key: &str, data: Vec<u8>) {
