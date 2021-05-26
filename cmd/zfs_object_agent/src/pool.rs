@@ -1396,7 +1396,7 @@ async fn reclaim_frees_object(
                         .map(|(_, data)| data.len() as u32)
                         .sum::<u32>()
                 );
-                assert_le!(obj_phys.blocks_size, new_obj_size);
+                assert_ge!(obj_phys.blocks_size, new_obj_size);
                 obj_phys.blocks_size = new_obj_size;
 
                 assert_le!(obj_phys.min_block, min_block);

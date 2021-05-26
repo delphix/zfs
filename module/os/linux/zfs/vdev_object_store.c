@@ -485,7 +485,7 @@ agent_begin_txg(vdev_object_store_t *vos, uint64_t txg)
 	 * might be in recovery.
 	 */
 	mutex_enter(&vos->vos_sock_lock);
-	zfs_object_store_wait(vos, VOS_SOCK_OPEN);
+	zfs_object_store_wait(vos, VOS_SOCK_READY);
 
 	nvlist_t *nv = fnvlist_alloc();
 	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_BEGIN_TXG);
@@ -501,11 +501,6 @@ static void
 agent_resume_txg(vdev_object_store_t *vos, uint64_t txg)
 {
 	ASSERT(MUTEX_HELD(&vos->vos_sock_lock));
-	/*
-	 * We need to ensure that we only issue a request when the
-	 * socket is ready. Otherwise, we block here since the agent
-	 * might be in recovery.
-	 */
 	zfs_object_store_wait(vos, VOS_SOCK_OPEN);
 
 	nvlist_t *nv = fnvlist_alloc();
@@ -521,11 +516,6 @@ static void
 agent_resume_complete(vdev_object_store_t *vos)
 {
 	ASSERT(MUTEX_HELD(&vos->vos_sock_lock));
-	/*
-	 * We need to ensure that we only issue a request when the
-	 * socket is ready. Otherwise, we block here since the agent
-	 * might be in recovery.
-	 */
 	zfs_object_store_wait(vos, VOS_SOCK_OPEN);
 
 	nvlist_t *nv = fnvlist_alloc();
