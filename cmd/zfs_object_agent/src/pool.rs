@@ -1309,12 +1309,16 @@ async fn reclaim_frees_object(
 
     let stream = FuturesUnordered::new();
     let mut to_delete = Vec::new();
-    let mut first = true;
+    let mut first = None;
     for (obj, new_obj_size, frees) in objs {
-        if !first {
-            to_delete.push(obj);
+        // All but the first object need to be deleted.
+        match first {
+            None => first = Some(obj),
+            Some(first_obj) => {
+                assert_gt!(obj, first_obj);
+                to_delete.push(obj);
+            }
         }
-        first = false;
 
         let min_block = state.block_to_obj.read().unwrap().obj_to_min_block(obj);
         let next_block = state.block_to_obj.read().unwrap().obj_to_next_block(obj);
@@ -1325,21 +1329,6 @@ async fn reclaim_frees_object(
                     DataObjectPhys::get(&my_shared_state.object_access, my_shared_state.guid, obj)
                         .await
                         .unwrap();
-                // XXX This is not true, because the object could have been
-                // rewritten as part of a previous reclaim that we crashed in
-                // the middle of.  In this case the actual size may be larger or
-                // smaller than the ObjectSizeLog Entry, because this object may
-                // have been compacted on its own (shrinking it), or
-                // consolidated with subsequent objects (it could grow or
-                // shrink).
-                /*
-                assert_ge!(
-                    obj_size,
-                    obj_phys.blocks_size,
-                    "{} ObjectSizeLogEntry should be at least as large as actual size",
-                    obj,
-                );
-                */
                 for pfle in frees {
                     // If we crashed in the middle of this operation last time, the
                     // block may already have been removed (and the object
@@ -1385,24 +1374,38 @@ async fn reclaim_frees_object(
                         .sum::<u32>()
                 );
 
-                obj_phys
-                    .blocks
-                    .retain(|block, _| block >= &min_block && block < &next_block);
-                assert_eq!(
-                    new_obj_size,
+                if obj_phys.min_block != min_block || obj_phys.next_block != next_block {
+                    debug!("reclaim: {:?} expected range BlockID[{},{}), found BlockID[{},{}), trimming uncommitted consolidation",
+                        obj, min_block, next_block, obj_phys.min_block, obj_phys.next_block);
                     obj_phys
                         .blocks
-                        .iter()
-                        .map(|(_, data)| data.len() as u32)
-                        .sum::<u32>()
-                );
-                assert_ge!(obj_phys.blocks_size, new_obj_size);
-                obj_phys.blocks_size = new_obj_size;
+                        .retain(|block, _| block >= &min_block && block < &next_block);
+                    assert_eq!(
+                        new_obj_size,
+                        obj_phys
+                            .blocks
+                            .iter()
+                            .map(|(_, data)| data.len() as u32)
+                            .sum::<u32>()
+                    );
+                    assert_ge!(obj_phys.blocks_size, new_obj_size);
+                    obj_phys.blocks_size = new_obj_size;
 
-                assert_le!(obj_phys.min_block, min_block);
-                obj_phys.min_block = min_block;
-                assert_ge!(obj_phys.next_block, next_block);
-                obj_phys.next_block = next_block;
+                    assert_le!(obj_phys.min_block, min_block);
+                    obj_phys.min_block = min_block;
+                    assert_ge!(obj_phys.next_block, next_block);
+                    obj_phys.next_block = next_block;
+                } else {
+                    assert_eq!(
+                        new_obj_size,
+                        obj_phys
+                            .blocks
+                            .iter()
+                            .map(|(_, data)| data.len() as u32)
+                            .sum::<u32>()
+                    );
+                    assert_eq!(obj_phys.blocks_size, new_obj_size);
+                }
 
                 obj_phys
             }
@@ -1458,6 +1461,8 @@ async fn reclaim_frees_object(
         .unwrap();
 
     assert_eq!(new_obj.object, first_obj);
+    // XXX would be nice to skip this if we didn't actually make any change
+    // (because we already did it all before crashing)
     new_obj.put(&shared_state.object_access).await;
 
     (new_obj.object, new_obj.blocks_size)
