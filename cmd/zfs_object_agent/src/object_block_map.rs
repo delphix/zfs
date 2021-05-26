@@ -74,8 +74,16 @@ impl ObjectBlockMap {
             .obj
     }
 
-    pub fn obj_to_block(&self, obj: ObjectID) -> BlockID {
+    pub fn obj_to_min_block(&self, obj: ObjectID) -> BlockID {
         self.map.get(&obj).unwrap().block
+    }
+
+    pub fn obj_to_next_block(&self, obj: ObjectID) -> BlockID {
+        self.map
+            .range((Excluded(obj), Unbounded))
+            .next()
+            .unwrap()
+            .block
     }
 
     pub fn last_obj(&self) -> ObjectID {

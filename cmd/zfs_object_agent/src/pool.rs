@@ -1295,10 +1295,11 @@ async fn get_frees_per_obj(
 }
 
 async fn reclaim_frees_object(
-    shared_state: Arc<PoolSharedState>,
+    state: Arc<PoolState>,
     objs: Vec<(ObjectID, u32, Vec<PendingFreesLogEntry>)>,
 ) -> (ObjectID, u32) {
     let first_obj = objs[0].0;
+    let shared_state = state.readonly_state.clone();
     debug!(
         "reclaim: consolidating {} objects into {:?} to free {} blocks",
         objs.len(),
@@ -1309,12 +1310,14 @@ async fn reclaim_frees_object(
     let stream = FuturesUnordered::new();
     let mut to_delete = Vec::new();
     let mut first = true;
-    for (obj, _, frees) in objs {
+    for (obj, new_obj_size, frees) in objs {
         if !first {
             to_delete.push(obj);
         }
         first = false;
 
+        let min_block = state.block_to_obj.read().unwrap().obj_to_min_block(obj);
+        let next_block = state.block_to_obj.read().unwrap().obj_to_next_block(obj);
         let my_shared_state = shared_state.clone();
         stream.push(async move {
             async move {
@@ -1338,7 +1341,6 @@ async fn reclaim_frees_object(
                 );
                 */
                 for pfle in frees {
-                    let removed = obj_phys.blocks.remove(&pfle.block);
                     // If we crashed in the middle of this operation last time, the
                     // block may already have been removed (and the object
                     // rewritten), however the stats were not yet updated (since
@@ -1346,11 +1348,62 @@ async fn reclaim_frees_object(
                     // to the PendingFreesLog).  In this case we ignore the fact
                     // that it isn't present, but count this block as removed for
                     // stats purposes.
-                    if let Some(v) = removed {
+                    if let Some(v) = obj_phys.blocks.remove(&pfle.block) {
                         assert_eq!(v.len() as u32, pfle.size);
                         obj_phys.blocks_size -= v.len() as u32;
                     }
                 }
+
+                // The object could have been rewritten as part of a previous
+                // reclaim that we crashed in the middle of.  In that case, the
+                // object may have additional blocks which we do not expect
+                // (past next_block).  However, the expected size (new_obj_size)
+                // must match the size of the blocks within the expected range
+                // (up to next_block).  Additionally, any blocks outside the
+                // expected range are also represented in their expected
+                // objects.  So, we can correctly remove them from this object,
+                // undoing the previous, uncommitted consolidation.  Therefore,
+                // if the expected size is zero, we can remove this object
+                // without reading it because it doesn't have any required
+                // blocks.  Instead we fabricate an empty DataObjectPhys with
+                // the same metadata as what we expect.
+
+                // XXX assertion not really necessary since we make the
+                // equivalent assertion after removing the extraneous blocks
+                assert_eq!(
+                    new_obj_size,
+                    obj_phys
+                        .blocks
+                        .iter()
+                        .filter_map(|(block, data)| {
+                            if block >= &min_block && block < &next_block {
+                                Some(data.len() as u32)
+                            } else {
+                                None
+                            }
+                        })
+                        .sum::<u32>()
+                );
+
+                obj_phys
+                    .blocks
+                    .retain(|block, _| block >= &min_block && block < &next_block);
+                assert_eq!(
+                    new_obj_size,
+                    obj_phys
+                        .blocks
+                        .iter()
+                        .map(|(_, data)| data.len() as u32)
+                        .sum::<u32>()
+                );
+                assert_le!(obj_phys.blocks_size, new_obj_size);
+                obj_phys.blocks_size = new_obj_size;
+
+                assert_le!(obj_phys.min_block, min_block);
+                obj_phys.min_block = min_block;
+                assert_ge!(obj_phys.next_block, next_block);
+                obj_phys.next_block = next_block;
+
                 obj_phys
             }
         });
@@ -1445,8 +1498,6 @@ fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState
 
     let state = state.clone();
     tokio::spawn(async move {
-        let shared_state = &state.readonly_state;
-
         // load pending frees
         let mut frees_per_obj = get_frees_per_obj(&state, pending_frees_log_stream).await;
 
@@ -1510,7 +1561,7 @@ fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState
                 let frees = frees_per_obj.remove(later_obj).unwrap_or_default();
                 freed_blocks_count += frees.len() as u64;
                 freed_blocks_bytes += later_bytes_freed as u64;
-                objs_to_consolidate.push((*later_obj, *later_size, frees));
+                objs_to_consolidate.push((*later_obj, later_new_size, frees));
             }
             // XXX look for earlier objects too?
 
@@ -1534,13 +1585,12 @@ fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState
             // in which case we wouldn't need to read it.  Would have to
             // keep a count of blocks per object in RAM?
             let sem2 = outstanding.clone();
-            let ss2 = shared_state.clone();
+            let state2 = state.clone();
             join_handles.push(tokio::spawn(async move {
                 // limits the amount of outstanding get/put requests (roughly).
                 // XXX would be nice to do this based on number of objs to consolidate
-                let p = sem2.acquire().await;
-                assert!(p.is_ok());
-                reclaim_frees_object(ss2, objs_to_consolidate).await
+                let _permit = sem2.acquire().await.unwrap();
+                reclaim_frees_object(state2, objs_to_consolidate).await
             }));
             if freed_blocks_count > required_frees {
                 break;
