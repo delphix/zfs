@@ -282,7 +282,7 @@ pub struct Pool {
 //#[derive(Debug)]
 pub struct PoolState {
     syncing_state: tokio::sync::Mutex<PoolSyncingState>,
-    object_block_map: std::sync::RwLock<ObjectBlockMap>,
+    object_block_map: ObjectBlockMap,
     pub shared_state: Arc<PoolSharedState>,
 }
 
@@ -463,7 +463,7 @@ impl Pool {
                     objects_to_delete: Vec::new(),
                     pending_flushes: BTreeSet::new(),
                 }),
-                object_block_map: std::sync::RwLock::new(ObjectBlockMap::new()),
+                object_block_map: ObjectBlockMap::new(),
             }),
         };
 
@@ -475,24 +475,24 @@ impl Pool {
 
         // load block -> object mapping
         let begin = Instant::now();
-        let objects_rwlock = &pool.state.object_block_map;
         let mut num_alloc_entries: u64 = 0;
         let mut num_free_entries: u64 = 0;
         syncing_state
             .storage_object_log
             .iterate()
             .for_each(|ent| {
-                let mut objects = objects_rwlock.write().unwrap();
                 match ent {
                     StorageObjectLogEntry::Alloc {
                         object,
                         min_block: first_possible_block,
                     } => {
-                        objects.insert(object, first_possible_block);
+                        pool.state
+                            .object_block_map
+                            .insert(object, first_possible_block);
                         num_alloc_entries += 1;
                     }
                     StorageObjectLogEntry::Free { object } => {
-                        objects.remove(object);
+                        pool.state.object_block_map.remove(object);
                         num_free_entries += 1;
                     }
                 }
@@ -508,10 +508,10 @@ impl Pool {
             begin.elapsed().as_millis()
         );
 
-        objects_rwlock.read().unwrap().verify();
+        pool.state.object_block_map.verify();
 
         assert_eq!(
-            objects_rwlock.read().unwrap().len() as u64,
+            pool.state.object_block_map.len() as u64,
             syncing_state.stats.objects_count
         );
 
@@ -560,7 +560,7 @@ impl Pool {
                         objects_to_delete: Vec::new(),
                         pending_flushes: BTreeSet::new(),
                     }),
-                    object_block_map: std::sync::RwLock::new(ObjectBlockMap::new()),
+                    object_block_map: ObjectBlockMap::new(),
                 }),
             };
             let syncing_state = pool.state.syncing_state.try_lock().unwrap();
@@ -609,7 +609,7 @@ impl Pool {
         txg: TXG,
     ) -> BTreeMap<ObjectID, DataObjectPhys> {
         let begin = Instant::now();
-        let last_obj = state.object_block_map.read().unwrap().last_object();
+        let last_obj = state.object_block_map.last_object();
         let list_stream = FuturesUnordered::new();
         for prefix in DataObjectPhys::prefixes(shared_state.guid) {
             let shared_state = shared_state.clone();
@@ -690,7 +690,7 @@ impl Pool {
                     assert!(!syncing_state.pending_object.is_pending());
                     syncing_state.pending_object = PendingObjectState::new_pending(
                         self.state.shared_state.guid,
-                        state.object_block_map.read().unwrap().last_object().next(),
+                        state.object_block_map.last_object().next(),
                         syncing_state.pending_object.next_block(),
                         txg,
                     );
@@ -759,7 +759,7 @@ impl Pool {
         assert!(!syncing_state.pending_object.is_pending());
         syncing_state.pending_object = PendingObjectState::new_pending(
             self.state.shared_state.guid,
-            state.object_block_map.read().unwrap().last_object().next(),
+            state.object_block_map.last_object().next(),
             syncing_state.pending_object.next_block(),
             txg,
         );
@@ -787,12 +787,7 @@ impl Pool {
         assert!(!syncing_state.pending_object.is_pending());
         syncing_state.pending_object = PendingObjectState::new_pending(
             self.state.shared_state.guid,
-            self.state
-                .object_block_map
-                .read()
-                .unwrap()
-                .last_object()
-                .next(),
+            self.state.object_block_map.last_object().next(),
             syncing_state.pending_object.next_block(),
             txg,
         );
@@ -940,18 +935,11 @@ impl Pool {
         assert_eq!(phys.guid, state.shared_state.guid);
         assert_eq!(phys.min_txg, txg);
         assert_eq!(phys.max_txg, txg);
-        assert_ge!(
-            object,
-            state.object_block_map.read().unwrap().last_object().next()
-        );
+        assert_ge!(object, state.object_block_map.last_object().next());
         syncing_state.stats.objects_count += 1;
         syncing_state.stats.blocks_bytes += phys.blocks_size as u64;
         syncing_state.stats.blocks_count += phys.blocks.len() as u64;
-        state
-            .object_block_map
-            .write()
-            .unwrap()
-            .insert(object, phys.min_block);
+        state.object_block_map.insert(object, phys.min_block);
         syncing_state.storage_object_log.append(
             txg,
             StorageObjectLogEntry::Alloc {
@@ -1023,7 +1011,7 @@ impl Pool {
         id: BlockID,
         data: Vec<u8>,
     ) -> oneshot::Receiver<()> {
-        let object = state.object_block_map.read().unwrap().block_to_object(id);
+        let object = state.object_block_map.block_to_object(id);
         let shared_state = state.shared_state.clone();
         let txg = syncing_state.syncing_txg.unwrap();
         let (sender, receiver) = oneshot::channel();
@@ -1128,12 +1116,7 @@ impl Pool {
     }
 
     pub async fn read_block(&self, block: BlockID) -> Vec<u8> {
-        let object = self
-            .state
-            .object_block_map
-            .read()
-            .unwrap()
-            .block_to_object(block);
+        let object = self.state.object_block_map.block_to_object(block);
         let shared_state = self.state.shared_state.clone();
 
         debug!("reading {:?} for {:?}", object, block);
@@ -1196,7 +1179,7 @@ fn log_deleted_objects(
         syncing_state
             .storage_object_log
             .append(txg, StorageObjectLogEntry::Free { object });
-        state.object_block_map.write().unwrap().remove(object);
+        state.object_block_map.remove(object);
         syncing_state
             .object_size_log
             .append(txg, ObjectSizeLogEntry::Freed { object });
@@ -1299,11 +1282,7 @@ async fn get_frees_per_obj(
     let begin = Instant::now();
     pending_frees_log_stream
         .for_each(|ent| {
-            let obj = state
-                .object_block_map
-                .read()
-                .unwrap()
-                .block_to_object(ent.block);
+            let obj = state.object_block_map.block_to_object(ent.block);
             // XXX change to debug-only assert?
             assert!(!frees_per_obj.entry(obj).or_default().contains(&ent));
             frees_per_obj.entry(obj).or_default().push(ent);
@@ -1345,16 +1324,8 @@ async fn reclaim_frees_object(
             }
         }
 
-        let min_block = state
-            .object_block_map
-            .read()
-            .unwrap()
-            .object_to_min_block(object);
-        let next_block = state
-            .object_block_map
-            .read()
-            .unwrap()
-            .object_to_next_block(object);
+        let min_block = state.object_block_map.object_to_min_block(object);
+        let next_block = state.object_block_map.object_to_next_block(object);
         let my_shared_state = shared_state.clone();
         stream.push(async move {
             async move {
@@ -1678,7 +1649,7 @@ fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState
 
 async fn try_condense_object_log(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState) {
     // XXX change this to be based on bytes, once those stats are working?
-    let len = state.object_block_map.read().unwrap().len();
+    let len = state.object_block_map.len();
     if syncing_state.storage_object_log.num_chunks
         < (LOG_CONDENSE_MIN_CHUNKS
             + LOG_CONDENSE_MULTIPLE * (len + ENTRIES_PER_OBJECT) / ENTRIES_PER_OBJECT)
@@ -1698,16 +1669,15 @@ async fn try_condense_object_log(state: Arc<PoolState>, syncing_state: &mut Pool
     let begin = Instant::now();
     syncing_state.storage_object_log.clear(txg).await;
     {
-        let block_to_object = state.object_block_map.read().unwrap();
-        for ent in block_to_object.iter() {
+        state.object_block_map.for_each(|ent| {
             syncing_state.storage_object_log.append(
                 txg,
                 StorageObjectLogEntry::Alloc {
                     object: ent.object,
                     min_block: ent.block,
                 },
-            );
-        }
+            )
+        });
     }
     // Note: the caller (end_txg_cb()) is about to call flush(), but doing it
     // here ensures that the time to PUT these objects is accounted for in the
