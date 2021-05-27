@@ -824,7 +824,17 @@ impl Pool {
             }
         }
 
-        // XXX await these 3 at the same time?
+        // We need to get the raw struct ref, rather than the MutexGuard, so
+        // that the borrow checker will realize that we're getting simultaneous
+        // mutable references to different members of the struct, and allow it.
+        let syncing_state_struct: &mut PoolSyncingState = &mut syncing_state;
+        future::join3(
+            syncing_state_struct.storage_object_log.flush(txg),
+            syncing_state_struct.object_size_log.flush(txg),
+            syncing_state_struct.pending_frees_log.flush(txg),
+        )
+        .await;
+
         syncing_state.storage_object_log.flush(txg).await;
         syncing_state.object_size_log.flush(txg).await;
         syncing_state.pending_frees_log.flush(txg).await;
