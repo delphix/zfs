@@ -841,7 +841,7 @@ vdev_object_store_socket_open(vdev_t *vd)
 	    vos->vos_sock == INVALID_SOCKET) {
 
 		mutex_enter(&vos->vos_lock);
-		VERIFY3P(vos->vos_sock, ==, NULL);
+		VERIFY3P(vos->vos_sock, ==, INVALID_SOCKET);
 
 		int error = zfs_object_store_open(vos, vd->vdev_path,
 		    vdev_object_store_open_mode(
