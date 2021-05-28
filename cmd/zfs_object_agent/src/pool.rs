@@ -928,6 +928,8 @@ impl Pool {
             if flush_block < next_block {
                 do_flush = true;
                 syncing_state.pending_flushes.remove(&flush_block);
+            } else {
+                break;
             }
         }
         if do_flush {
