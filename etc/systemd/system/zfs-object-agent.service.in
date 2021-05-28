@@ -5,7 +5,7 @@ Before=zfs-import-cache.service
 
 [Service]
 Environment="RUST_BACKTRACE=1"
-ExecStart=/sbin/zfs_object_agent
+ExecStart=/sbin/zfs_object_agent -v
 Restart=on-abort
 
 [Install]
