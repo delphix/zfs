@@ -15,3 +15,4 @@ rusoto_core = "0.46.0"
 rusoto_s3 = "0.46.0"
 rust-s3 = "0.27.0-rc1"
 tokio = { version = "1.4", features = ["full"] }
+chrono = "0.4.19"

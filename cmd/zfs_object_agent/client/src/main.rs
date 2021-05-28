@@ -1,3 +1,5 @@
+use chrono::prelude::*;
+use chrono::DateTime;
 use client::Client;
 use futures::future::*;
 use libzoa::base_types::*;
@@ -6,10 +8,9 @@ use nvpair::*;
 use rand::prelude::*;
 use rusoto_core::ByteStream;
 use rusoto_s3::*;
-use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::Region;
-use std::collections::BTreeSet;
+use s3::{bucket::Bucket, serde_types::ListBucketResult};
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -17,6 +18,7 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::io::Read;
 use std::time::{Duration, Instant};
+use std::{collections::BTreeSet, i64};
 use tokio::io::AsyncReadExt;
 mod client;
 
@@ -252,19 +254,81 @@ async fn do_free() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn do_delete(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
-    let begin = Instant::now();
-    let results = bucket.list(object_access::prefixed(""), None).await?;
-    println!(
-        "listed {} objects in {}ms",
-        results.len(),
-        begin.elapsed().as_millis()
-    );
+fn get_int_param(args: &Vec<String>, offset: usize, default: i64) -> i64 {
+    let mut val: i64 = default;
+    if args.len() > offset {
+        val = args[offset].parse::<i64>().unwrap();
+    }
+
+    val
+}
+
+fn has_expired(last_modified: &str, min_age_days: i64) -> bool {
+    let mod_time = DateTime::parse_from_rfc3339(last_modified).unwrap();
+    let num_days = mod_time.signed_duration_since(Local::now()).num_days();
+
+    min_age_days == 0 || (-1 * num_days) > min_age_days
+}
+
+fn print_list(list_results: ListBucketResult, min_age_days: i64) {
+    for res in list_results.contents {
+        if has_expired(res.last_modified.as_str(), min_age_days) {
+            let mod_time = DateTime::parse_from_rfc3339(res.last_modified.as_str()).unwrap();
+            println!("{:30}  {}", mod_time.to_string(), res.key);
+        }
+    }
+}
+
+async fn list_and_process(
+    bucket: &Bucket,
+    min_age_days: i64,
+    process: fn(ListBucketResult, i64),
+) -> Result<(), Box<dyn Error>> {
+    let mut continuation_token = None;
+    loop {
+        let (list_results, _) = bucket
+            .list_page(
+                object_access::prefixed(""),
+                None,
+                continuation_token,
+                None,
+                None,
+            )
+            .await?;
+        continuation_token = list_results.next_continuation_token.clone();
+
+        process(list_results, min_age_days);
+
+        if continuation_token.is_none() {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+async fn do_list(bucket: &Bucket, args: &Vec<String>) -> Result<(), Box<dyn Error>> {
+    let min_age_days: i64 = get_int_param(args, 2, 0);
+    list_and_process(bucket, min_age_days, print_list)
+        .await
+        .unwrap();
+
+    Ok(())
+}
+
+async fn delete_list(
+    bucket: &Bucket,
+    list_results: ListBucketResult,
+    min_age_days: i64,
+) -> (i64, i64) {
     let mut futures = Vec::new();
-    let begin = Instant::now();
-    for list_results in results {
-        for res in list_results.contents {
+    let mut deleted: i64 = 0;
+    let mut skipped: i64 = 0;
+
+    for res in list_results.contents {
+        if has_expired(res.last_modified.as_str(), min_age_days) {
             println!("deleting object {}...", res.key);
+            deleted = deleted + 1;
             let begin = Instant::now();
             let fut = async move {
                 bucket.delete_object(&res.key).await.unwrap();
@@ -275,26 +339,56 @@ async fn do_delete(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
                 );
             };
             futures.push(fut);
+        } else {
+            skipped = skipped + 1;
         }
     }
     join_all(futures).await;
-    println!("deleted all objects in {}ms", begin.elapsed().as_millis());
-    /*
+
+    (deleted, skipped)
+}
+
+async fn do_delete_impl(bucket: &Bucket, min_age_days: i64) -> Result<(), Box<dyn Error>> {
+    let begin = Instant::now();
+
+    let mut total_deleted: i64 = 0;
+    let mut total_skipped: i64 = 0;
+    let mut continuation_token = None;
     loop {
-        let (res, idx, remaining_futures) = select_all(futures).await;
-        futures = remaining_futures;
+        let (list_results, _) = bucket
+            .list_page(
+                object_access::prefixed(""),
+                None,
+                continuation_token,
+                None,
+                None,
+            )
+            .await?;
+        continuation_token = list_results.next_continuation_token.clone();
+
+        let (deleted, skipped) = delete_list(bucket, list_results, min_age_days).await;
+        total_deleted = total_deleted + deleted;
+        total_skipped = total_skipped + skipped;
+
+        if continuation_token.is_none() {
+            break;
+        }
     }
-    */
+
+    println!(
+        "deleted {}, skipped {} objects in {}ms; .",
+        total_deleted,
+        total_skipped,
+        begin.elapsed().as_millis()
+    );
+
     Ok(())
 }
 
-async fn do_list(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
-    let results = bucket.list(object_access::prefixed(""), None).await?;
-    for list_results in results {
-        for res in list_results.contents {
-            println!("found object {}", res.key);
-        }
-    }
+async fn do_delete(bucket: &Bucket, args: &Vec<String>) -> Result<(), Box<dyn Error>> {
+    let min_age_days: i64 = get_int_param(args, 2, 0);
+    do_delete_impl(&bucket, min_age_days).await.unwrap();
+
     Ok(())
 }
 
@@ -348,8 +442,8 @@ async fn main() {
     match &args[1][..] {
         "s3" => do_s3(&bucket).await.unwrap(),
         "s3_rusoto" => do_s3_rusoto().await.unwrap(),
-        "list" => do_list(&bucket).await.unwrap(),
-        "delete" => do_delete(&bucket).await.unwrap(),
+        "list" => do_list(&bucket, &args).await.unwrap(),
+        "delete" => do_delete(&bucket, &args).await.unwrap(),
         "create" => do_create().await.unwrap(),
         "write" => do_write().await.unwrap(),
         "read" => do_read().await.unwrap(),
