@@ -384,7 +384,7 @@ agent_io_block_alloc(zio_t *zio)
 	fnvlist_add_uint64(nv, AGENT_BLKID, blockid);
 	zfs_dbgmsg("agent_io_block_alloc(guid=%llu blkid=%llu len=%llu) %s",
 	    spa_guid(zio->io_spa), blockid, zio->io_size,
-	    zio->io_type == ZIO_TYPE_WRITE ? "WRITE" : "READ" );
+	    zio->io_type == ZIO_TYPE_WRITE ? "WRITE" : "READ");
 	return (nv);
 }
 
