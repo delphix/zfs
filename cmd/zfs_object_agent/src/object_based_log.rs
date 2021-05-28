@@ -83,7 +83,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLogChunk<T> {
 
 //#[derive(Debug)]
 pub struct ObjectBasedLog<T: ObjectBasedLogEntry> {
-    pool: Arc<PoolSharedState>,
+    shared_state: Arc<PoolSharedState>,
     name: String,
     generation: u64,
     num_flushed_chunks: u64,
@@ -99,9 +99,9 @@ pub struct ObjectBasedLogRemainder {
 }
 
 impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
-    pub fn create(pool: Arc<PoolSharedState>, name: &str) -> ObjectBasedLog<T> {
+    pub fn create(shared_state: Arc<PoolSharedState>, name: &str) -> ObjectBasedLog<T> {
         ObjectBasedLog {
-            pool,
+            shared_state,
             name: name.to_string(),
             generation: 0,
             num_flushed_chunks: 0,
@@ -114,12 +114,12 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
     }
 
     pub fn open_by_phys(
-        pool: Arc<PoolSharedState>,
+        shared_state: Arc<PoolSharedState>,
         name: &str,
         phys: &ObjectBasedLogPhys,
     ) -> ObjectBasedLog<T> {
         ObjectBasedLog {
-            pool,
+            shared_state,
             name: name.to_string(),
             generation: phys.generation,
             num_flushed_chunks: phys.num_chunks,
@@ -194,7 +194,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         assert!(self.recovered);
 
         let chunk = ObjectBasedLogChunk {
-            guid: self.pool.guid,
+            guid: self.shared_state.guid,
             txg,
             generation: self.generation,
             chunk: self.num_chunks,
@@ -206,10 +206,10 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
 
         // XXX cloning name, would be nice if we could find a way to
         // reference them from the spawned task (use Arc)
-        let pool = self.pool.clone();
+        let shared_state = self.shared_state.clone();
         let name = self.name.clone();
         let handle = tokio::spawn(async move {
-            chunk.put(&pool.object_access, &name).await;
+            chunk.put(&shared_state.object_access, &name).await;
         });
         self.pending_flushes.push(handle);
 
@@ -239,7 +239,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         let mut stream = FuturesOrdered::new();
         for chunk in 0..self.num_chunks {
             let fut = ObjectBasedLogChunk::get(
-                &self.pool.object_access,
+                &self.shared_state.object_access,
                 &self.name,
                 self.generation,
                 chunk,
@@ -288,11 +288,11 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
             None => 0,
         };
         for chunk in first_chunk..self.num_flushed_chunks {
-            let pool = self.pool.clone();
+            let shared_state = self.shared_state.clone();
             let n = self.name.clone();
             stream.push(async move {
                 async move {
-                    ObjectBasedLogChunk::get(&pool.object_access, &n, generation, chunk)
+                    ObjectBasedLogChunk::get(&shared_state.object_access, &n, generation, chunk)
                         .await
                         .unwrap()
                 }
