@@ -349,9 +349,7 @@ impl Server {
     fn flush_writes(&mut self) {
         let pool = self.pool.as_ref().unwrap().clone();
         let max_blockid = self.max_blockid;
-        tokio::spawn(async move {
-            pool.initiate_flush(max_blockid);
-        });
+        pool.initiate_flush(max_blockid);
     }
 
     // sends response
@@ -421,9 +419,7 @@ impl Server {
     /// initiate free.  No response.  Does not block.  Completes when the current txg is ended.
     fn free_block(&mut self, block: BlockID, size: u32) {
         let pool = self.pool.as_ref().unwrap().clone();
-        tokio::spawn(async move {
-            pool.free_block(block, size);
-        });
+        pool.free_block(block, size);
     }
 
     /// initiate read, sends response when completed.  Does not block.
