@@ -139,12 +139,12 @@ impl Server {
                         server.begin_txg(txg);
                     }
                     "resume txg" => {
-                        debug!("got request: {:?}", nvl);
+                        info!("got request: {:?}", nvl);
                         let txg = TXG(nvl.lookup_uint64("TXG").unwrap());
                         server.resume_txg(txg);
                     }
                     "resume complete" => {
-                        debug!("got request: {:?}", nvl);
+                        info!("got request: {:?}", nvl);
                         server.resume_complete().await;
                     }
                     "flush writes" => {
