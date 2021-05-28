@@ -350,7 +350,7 @@ impl Server {
         let pool = self.pool.as_ref().unwrap().clone();
         let max_blockid = self.max_blockid;
         tokio::spawn(async move {
-            pool.initiate_flush(max_blockid).await;
+            pool.initiate_flush(max_blockid);
         });
     }
 
@@ -366,7 +366,7 @@ impl Server {
         tokio::spawn(async move {
             let mut response = NvList::new_unique_names();
             for n in props_vec {
-                let value = pool.get_prop(n.as_ref()).await;
+                let value = pool.get_prop(n.as_ref());
                 response.insert(n, &value).unwrap();
             }
             debug!("sending response: {:?}", response);
@@ -400,8 +400,10 @@ impl Server {
         let mut count = now.lock().unwrap();
         *count += 1;
         drop(count);
+        // Need to write_block() before spawning, so that the Pool knows what's been written before resume_complete()
+        let fut = pool.write_block(block, data);
         tokio::spawn(async move {
-            pool.write_block(block, data).await;
+            fut.await;
             // Note: {braces} needed so that lock is dropped before the .await
             {
                 let mut count = now.lock().unwrap();
@@ -420,7 +422,7 @@ impl Server {
     fn free_block(&mut self, block: BlockID, size: u32) {
         let pool = self.pool.as_ref().unwrap().clone();
         tokio::spawn(async move {
-            pool.free_block(block, size).await;
+            pool.free_block(block, size);
         });
     }
 

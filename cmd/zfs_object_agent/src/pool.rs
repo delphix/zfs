@@ -1,6 +1,7 @@
+use crate::base_types::*;
+use crate::object_access::ObjectAccess;
 use crate::object_based_log::*;
 use crate::object_block_map::ObjectBlockMap;
-use crate::{base_types::*, object_access::ObjectAccess};
 use anyhow::{Context, Result};
 use core::future::Future;
 use futures::future;
@@ -10,6 +11,7 @@ use more_asserts::*;
 use nvpair::NvList;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
+use std::cmp::{max, min};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::mem;
@@ -17,14 +19,10 @@ use std::ops::Bound::*;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
-use std::{
-    cmp::{max, min},
-    time::Duration,
-};
 use stream_reduce::Reduce;
-use tokio::{sync::*, time::sleep};
+use tokio::sync::oneshot;
 
-// XXX need a real tunables infrastructure
+// XXX need a real tunables infrastructure.  Probably should use toml.
 // start freeing when the pending frees are this % of the entire pool
 const FREE_HIGHWATER_PCT: f64 = 10.0;
 // stop freeing when the pending frees are this % of the entire pool
@@ -281,7 +279,7 @@ pub struct Pool {
 
 //#[derive(Debug)]
 pub struct PoolState {
-    syncing_state: tokio::sync::Mutex<PoolSyncingState>,
+    syncing_state: std::sync::Mutex<Option<PoolSyncingState>>,
     object_block_map: ObjectBlockMap,
     pub shared_state: Arc<PoolSharedState>,
 }
@@ -397,6 +395,18 @@ impl PoolSyncingState {
     }
 }
 
+impl PoolState {
+    // XXX change this to return a Result.  If the syncing_state is None, return
+    // an error which means that we're in the middle of end_txg.
+    fn with_syncing_state<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut PoolSyncingState) -> R,
+    {
+        let mut guard = self.syncing_state.lock().unwrap();
+        f(guard.as_mut().unwrap())
+    }
+}
+
 impl Pool {
     pub async fn exists(object_access: &ObjectAccess, guid: PoolGUID) -> bool {
         PoolPhys::exists(object_access, guid).await
@@ -437,7 +447,7 @@ impl Pool {
         let pool = Pool {
             state: Arc::new(PoolState {
                 shared_state: shared_state.clone(),
-                syncing_state: tokio::sync::Mutex::new(PoolSyncingState {
+                syncing_state: std::sync::Mutex::new(Some(PoolSyncingState {
                     last_txg: phys.txg,
                     syncing_txg: None,
                     storage_object_log: ObjectBasedLog::open_by_phys(
@@ -462,12 +472,15 @@ impl Pool {
                     rewriting_objects: HashMap::new(),
                     objects_to_delete: Vec::new(),
                     pending_flushes: BTreeSet::new(),
-                }),
+                })),
                 object_block_map: ObjectBlockMap::new(),
             }),
         };
 
-        let mut syncing_state = pool.state.syncing_state.try_lock().unwrap();
+        let mut syncing_state = {
+            let mut guard = pool.state.syncing_state.lock().unwrap();
+            guard.take().unwrap()
+        };
 
         syncing_state.storage_object_log.recover().await;
         syncing_state.object_size_log.recover().await;
@@ -516,10 +529,10 @@ impl Pool {
         );
 
         let next_block = syncing_state.next_block();
-        drop(syncing_state);
 
         //println!("opened {:#?}", pool);
 
+        *pool.state.syncing_state.lock().unwrap() = Some(syncing_state);
         (pool, Some(phys), next_block)
     }
 
@@ -537,7 +550,7 @@ impl Pool {
             let pool = Pool {
                 state: Arc::new(PoolState {
                     shared_state: shared_state.clone(),
-                    syncing_state: tokio::sync::Mutex::new(PoolSyncingState {
+                    syncing_state: std::sync::Mutex::new(Some(PoolSyncingState {
                         last_txg: TXG(0),
                         syncing_txg: None,
                         storage_object_log: ObjectBasedLog::create(
@@ -559,33 +572,30 @@ impl Pool {
                         rewriting_objects: HashMap::new(),
                         objects_to_delete: Vec::new(),
                         pending_flushes: BTreeSet::new(),
-                    }),
+                    })),
                     object_block_map: ObjectBlockMap::new(),
                 }),
             };
-            let syncing_state = pool.state.syncing_state.try_lock().unwrap();
-            let next_block = syncing_state.next_block();
-            drop(syncing_state);
+
+            let next_block = pool
+                .state
+                .with_syncing_state(|syncing_state| syncing_state.next_block());
             (pool, None, next_block)
         } else {
             Pool::open_from_txg(object_access, &phys, phys.last_txg).await
         }
     }
 
-    pub async fn get_prop(&self, name: &str) -> u64 {
-        /*
-         * XXX find another way to get stats that doesn't invlove getting the
-         * syncing state lock. The problem is that we need benig_txg() to get the
-         * lock without waiting, which is otherwise OK since there can't be
-         * writes, frees, or end_txg's going on while we try to start a txg.
-         */
-        let stats = self.state.syncing_state.lock().await.stats;
-        match name {
-            "zoa_allocated" => stats.pending_frees_bytes,
-            "zoa_freeing" => stats.pending_frees_bytes,
-            "zoa_objects" => stats.objects_count,
-            _ => panic!("invalid prop name: {}", name),
-        }
+    pub fn get_prop(&self, name: &str) -> u64 {
+        self.state.with_syncing_state(|syncing_state| {
+            let stats = syncing_state.stats;
+            match name {
+                "zoa_allocated" => stats.pending_frees_bytes,
+                "zoa_freeing" => stats.pending_frees_bytes,
+                "zoa_objects" => stats.objects_count,
+                _ => panic!("invalid prop name: {}", name),
+            }
+        })
     }
 
     pub fn resume_txg(&self, txg: TXG) {
@@ -593,14 +603,14 @@ impl Pool {
         // allowed to call begin_txg() while a txg is already open, so the lock
         // must not be held.
         // XXX change this to return an error to the client
-        let mut syncing_state = self.state.syncing_state.try_lock().unwrap();
+        self.state.with_syncing_state(|syncing_state| {
+            assert!(syncing_state.syncing_txg.is_none());
+            assert_gt!(txg.0, syncing_state.last_txg.0);
+            syncing_state.syncing_txg = Some(txg);
 
-        assert!(syncing_state.syncing_txg.is_none());
-        assert_gt!(txg.0, syncing_state.last_txg.0);
-        syncing_state.syncing_txg = Some(txg);
-
-        // Resuming state is indicated by pending_object = NotPending
-        assert!(!syncing_state.pending_object.is_pending());
+            // Resuming state is indicated by pending_object = NotPending
+            assert!(!syncing_state.pending_object.is_pending());
+        })
     }
 
     async fn get_recovered_objects(
@@ -659,143 +669,148 @@ impl Pool {
     pub async fn resume_complete(&self) {
         // XXX we need to wait for all writes to be added to
         // pending_unordered_writes, but there's no way to do that
-        sleep(Duration::from_secs(1)).await;
+        // XXX should no longer be needed since write_block() is called
+        // synchronously from the main Server task, so all writes have already been added to pending_unordered_writes
+        //sleep(Duration::from_secs(1)).await;
 
         let state = &self.state;
-        let mut syncing_state = state.syncing_state.lock().await;
+        let txg = self.state.with_syncing_state(|syncing_state| {
+            // verify that we're in resuming state
+            assert!(!syncing_state.pending_object.is_pending());
+            syncing_state.syncing_txg.unwrap()
+        });
         let shared_state = &state.shared_state;
-        let txg = syncing_state.syncing_txg.unwrap();
-
-        // verify that we're in resuming state
-        assert!(!syncing_state.pending_object.is_pending());
 
         let recovered_objects = Self::get_recovered_objects(state, shared_state, txg).await;
 
-        let ordered_writes: BTreeSet<BlockID> = syncing_state
-            .pending_unordered_writes
-            .keys()
-            .map(|x| *x)
-            .collect();
+        self.state.with_syncing_state(|syncing_state| {
+            let ordered_writes: BTreeSet<BlockID> = syncing_state
+                .pending_unordered_writes
+                .keys()
+                .map(|x| *x)
+                .collect();
 
-        let mut recovered_objects_iter = recovered_objects.into_iter().peekable();
-        let mut ordered_writes_iter = ordered_writes.into_iter().peekable();
+            let mut recovered_objects_iter = recovered_objects.into_iter().peekable();
+            let mut ordered_writes_iter = ordered_writes.into_iter().peekable();
 
-        while let Some((_, next_recovered_object)) = recovered_objects_iter.peek() {
-            match ordered_writes_iter.peek() {
-                Some(next_ordered_write)
-                    if next_ordered_write < &next_recovered_object.min_block =>
-                {
-                    // writes are next, and there are objects after this
-
-                    assert!(!syncing_state.pending_object.is_pending());
-                    syncing_state.pending_object = PendingObjectState::new_pending(
-                        self.state.shared_state.guid,
-                        state.object_block_map.last_object().next(),
-                        syncing_state.pending_object.next_block(),
-                        txg,
-                    );
-
-                    // XXX Unless there is already an object at object.next(), we
-                    // should limit the object size as normal.
-                    // XXX we need to limit the unordered writes to be only those before the next object
-                    Self::write_unordered_to_pending_object(state, &mut syncing_state, None);
-
-                    let (phys, _) = syncing_state.pending_object.as_mut_pending();
-                    debug!(
-                        "resume: writes are next; creating {:?}, min={:?} next={:?}",
-                        phys.object, phys.min_block, phys.next_block
-                    );
-
-                    Self::initiate_flush_object_impl(state, &mut syncing_state);
-                    let next_block = syncing_state.pending_object.next_block();
-                    syncing_state.pending_object = PendingObjectState::NotPending(next_block);
-
-                    // skip over writes that were moved to pending_object and written out
-                    while let Some(_) =
-                        peekable_next_if(&mut ordered_writes_iter, |b| b < &next_block)
+            while let Some((_, next_recovered_object)) = recovered_objects_iter.peek() {
+                match ordered_writes_iter.peek() {
+                    Some(next_ordered_write)
+                        if next_ordered_write < &next_recovered_object.min_block =>
                     {
-                    }
-                }
-                _ => {
-                    // already-written object is next
+                        // writes are next, and there are objects after this
 
-                    let (_, recovered_obj) = recovered_objects_iter.next().unwrap();
-                    debug!(
-                        "resume: next is {:?}, min={:?} next={:?}",
-                        recovered_obj.object, recovered_obj.min_block, recovered_obj.next_block
-                    );
-
-                    Self::account_new_object(state, &mut syncing_state, &recovered_obj);
-
-                    // The kernel may not have known that this was already
-                    // written (e.g. we didn't quite get to sending the "write
-                    // done" response), so it sent us the write again.  In this
-                    // case we will not create a object, since the blocks are
-                    // already persistent, so we need to notify the waiter now.
-                    while let Some(obsolete_write) =
-                        peekable_next_if(&mut ordered_writes_iter, |b| {
-                            b < &recovered_obj.next_block
-                        })
-                    {
-                        trace!(
-                            "resume: {:?} is obsoleted by existing {:?}",
-                            obsolete_write,
-                            recovered_obj.object,
+                        assert!(!syncing_state.pending_object.is_pending());
+                        syncing_state.pending_object = PendingObjectState::new_pending(
+                            self.state.shared_state.guid,
+                            state.object_block_map.last_object().next(),
+                            syncing_state.pending_object.next_block(),
+                            txg,
                         );
-                        let (_, sender) = syncing_state
-                            .pending_unordered_writes
-                            .remove(&obsolete_write)
-                            .unwrap();
-                        sender.send(()).unwrap();
+
+                        // XXX Unless there is already an object at object.next(), we
+                        // should limit the object size as normal.
+                        // XXX we need to limit the unordered writes to be only those before the next object
+                        Self::write_unordered_to_pending_object(state, syncing_state, None);
+
+                        let (phys, _) = syncing_state.pending_object.as_mut_pending();
+                        debug!(
+                            "resume: writes are next; creating {:?}, min={:?} next={:?}",
+                            phys.object, phys.min_block, phys.next_block
+                        );
+
+                        Self::initiate_flush_object_impl(state, syncing_state);
+                        let next_block = syncing_state.pending_object.next_block();
+                        syncing_state.pending_object = PendingObjectState::NotPending(next_block);
+
+                        // skip over writes that were moved to pending_object and written out
+                        while let Some(_) =
+                            peekable_next_if(&mut ordered_writes_iter, |b| b < &next_block)
+                        {
+                        }
                     }
-                    assert!(!syncing_state.pending_object.is_pending());
-                    syncing_state.pending_object =
-                        PendingObjectState::NotPending(recovered_obj.next_block);
+                    _ => {
+                        // already-written object is next
+
+                        let (_, recovered_obj) = recovered_objects_iter.next().unwrap();
+                        debug!(
+                            "resume: next is {:?}, min={:?} next={:?}",
+                            recovered_obj.object, recovered_obj.min_block, recovered_obj.next_block
+                        );
+
+                        Self::account_new_object(state, syncing_state, &recovered_obj);
+
+                        // The kernel may not have known that this was already
+                        // written (e.g. we didn't quite get to sending the "write
+                        // done" response), so it sent us the write again.  In this
+                        // case we will not create a object, since the blocks are
+                        // already persistent, so we need to notify the waiter now.
+                        while let Some(obsolete_write) =
+                            peekable_next_if(&mut ordered_writes_iter, |b| {
+                                b < &recovered_obj.next_block
+                            })
+                        {
+                            trace!(
+                                "resume: {:?} is obsoleted by existing {:?}",
+                                obsolete_write,
+                                recovered_obj.object,
+                            );
+                            let (_, sender) = syncing_state
+                                .pending_unordered_writes
+                                .remove(&obsolete_write)
+                                .unwrap();
+                            sender.send(()).unwrap();
+                        }
+                        assert!(!syncing_state.pending_object.is_pending());
+                        syncing_state.pending_object =
+                            PendingObjectState::NotPending(recovered_obj.next_block);
+                    }
                 }
             }
-        }
 
-        // no recovered objects left; move ordered portion of writes to pending_object
-        assert!(!syncing_state.pending_object.is_pending());
-        syncing_state.pending_object = PendingObjectState::new_pending(
-            self.state.shared_state.guid,
-            state.object_block_map.last_object().next(),
-            syncing_state.pending_object.next_block(),
-            txg,
-        );
+            // no recovered objects left; move ordered portion of writes to pending_object
+            assert!(!syncing_state.pending_object.is_pending());
+            syncing_state.pending_object = PendingObjectState::new_pending(
+                self.state.shared_state.guid,
+                state.object_block_map.last_object().next(),
+                syncing_state.pending_object.next_block(),
+                txg,
+            );
 
-        debug!("resume: moving last writes to pending_object");
-        Self::write_unordered_to_pending_object(
-            state,
-            &mut syncing_state,
-            Some(MAX_BYTES_PER_OBJECT),
-        );
-        info!("resume: completed");
+            debug!("resume: moving last writes to pending_object");
+            Self::write_unordered_to_pending_object(
+                state,
+                syncing_state,
+                Some(MAX_BYTES_PER_OBJECT),
+            );
+            info!("resume: completed");
+        })
     }
 
     pub fn begin_txg(&self, txg: TXG) {
-        // The syncing_state is only held while a txg is open (begun).  It's not
-        // allowed to call begin_txg() while a txg is already open, so the lock
-        // must not be held.
-        // XXX change this to return an error to the client
-        let mut syncing_state = self.state.syncing_state.try_lock().unwrap();
+        self.state.with_syncing_state(|syncing_state| {
+            // XXX change this to return an error to the client
+            assert!(syncing_state.syncing_txg.is_none());
+            assert_gt!(txg, syncing_state.last_txg);
+            syncing_state.syncing_txg = Some(txg);
 
-        assert!(syncing_state.syncing_txg.is_none());
-        assert_gt!(txg, syncing_state.last_txg);
-        syncing_state.syncing_txg = Some(txg);
-
-        assert!(!syncing_state.pending_object.is_pending());
-        syncing_state.pending_object = PendingObjectState::new_pending(
-            self.state.shared_state.guid,
-            self.state.object_block_map.last_object().next(),
-            syncing_state.pending_object.next_block(),
-            txg,
-        );
+            assert!(!syncing_state.pending_object.is_pending());
+            syncing_state.pending_object = PendingObjectState::new_pending(
+                self.state.shared_state.guid,
+                self.state.object_block_map.last_object().next(),
+                syncing_state.pending_object.next_block(),
+                txg,
+            );
+        })
     }
 
     pub async fn end_txg(&self, uberblock: Vec<u8>, config: Vec<u8>) {
         let state = &self.state;
-        let mut syncing_state = state.syncing_state.lock().await;
+
+        let mut syncing_state = {
+            let mut guard = state.syncing_state.lock().unwrap();
+            guard.take().unwrap()
+        };
 
         // should have already been flushed; no pending writes
         assert!(syncing_state.pending_unordered_writes.is_empty());
@@ -824,14 +839,10 @@ impl Pool {
             }
         }
 
-        // We need to get the raw struct ref, rather than the MutexGuard, so
-        // that the borrow checker will realize that we're getting simultaneous
-        // mutable references to different members of the struct, and allow it.
-        let syncing_state_struct: &mut PoolSyncingState = &mut syncing_state;
         future::join3(
-            syncing_state_struct.storage_object_log.flush(txg),
-            syncing_state_struct.object_size_log.flush(txg),
-            syncing_state_struct.pending_frees_log.flush(txg),
+            syncing_state.storage_object_log.flush(txg),
+            syncing_state.object_size_log.flush(txg),
+            syncing_state.pending_frees_log.flush(txg),
         )
         .await;
 
@@ -866,7 +877,11 @@ impl Pool {
         // Now that the metadata state has been atomically moved forward, we
         // can delete objects that are no longer needed
         // Note: we don't care about waiting for the frees to complete.
-        // XXX need some mechanism to clean up these objects if we crash
+        // XXX need some mechanism to clean up these objects if we crash Maybe
+        // we can look at the object log and look at the last txg's FREE
+        // records.  We would need to make sure the frees complete before the
+        // next txg.  We would need to make sure that those FREE records were
+        // not consolidated away.
         // Note: we intentionally issue the delete calls serially because
         // AWS doesn't like getting a lot of them at the same time (it
         // returns HTTP 503 "Please reduce your request rate.")
@@ -899,6 +914,10 @@ impl Pool {
         // update txg
         syncing_state.last_txg = txg;
         syncing_state.syncing_txg = None;
+
+        // put syncing_state back in the Option
+        assert!(state.syncing_state.lock().unwrap().is_none());
+        *state.syncing_state.lock().unwrap() = Some(syncing_state);
     }
 
     fn check_pending_flushes(state: &PoolState, syncing_state: &mut PoolSyncingState) {
@@ -921,18 +940,19 @@ impl Pool {
     // soon.
     // Basically, as soon as we have this blockID and all the previous ones,
     // start writing that pending object immediately.
-    pub async fn initiate_flush(&self, block: BlockID) {
-        let mut syncing_state = self.state.syncing_state.lock().await;
-        // XXX because called when server times out waiting for request
-        if syncing_state.syncing_txg.is_none() {
-            return;
-        }
-        if !syncing_state.pending_object.is_pending() {
-            return;
-        }
+    pub fn initiate_flush(&self, block: BlockID) {
+        self.state.with_syncing_state(|syncing_state| {
+            // XXX because called when server times out waiting for request
+            if syncing_state.syncing_txg.is_none() {
+                return;
+            }
+            if !syncing_state.pending_object.is_pending() {
+                return;
+            }
 
-        syncing_state.pending_flushes.insert(block);
-        Self::check_pending_flushes(&self.state, &mut syncing_state);
+            syncing_state.pending_flushes.insert(block);
+            Self::check_pending_flushes(&self.state, syncing_state);
+        })
     }
 
     fn account_new_object(
@@ -1094,10 +1114,8 @@ impl Pool {
         Self::check_pending_flushes(state, syncing_state);
     }
 
-    pub async fn write_block(&self, block: BlockID, data: Vec<u8>) {
-        // ensure that the syncing_state lock is dropped before we wait on the receiver.
-        {
-            let mut syncing_state = self.state.syncing_state.lock().await;
+    pub fn write_block(&self, block: BlockID, data: Vec<u8>) -> impl Future<Output = ()> {
+        let receiver = self.state.with_syncing_state(|syncing_state| {
             // XXX change to return error
             assert!(syncing_state.syncing_txg.is_some());
 
@@ -1105,7 +1123,7 @@ impl Pool {
                 // XXX the design is for this to not happen. Writes must be received
                 // in blockID-order. However, for now we allow overwrites during
                 // sync to convergence via this slow path.
-                Self::do_overwrite_impl(&self.state, &mut syncing_state, block, data)
+                Self::do_overwrite_impl(&self.state, syncing_state, block, data)
             } else {
                 let (sender, receiver) = oneshot::channel();
                 trace!("inserting {:?} to unordered pending writes", block);
@@ -1115,14 +1133,15 @@ impl Pool {
 
                 Self::write_unordered_to_pending_object(
                     &self.state,
-                    &mut syncing_state,
+                    syncing_state,
                     Some(MAX_BYTES_PER_OBJECT),
                 );
                 receiver
             }
+        });
+        async move {
+            receiver.await.unwrap();
         }
-        .await
-        .unwrap();
     }
 
     pub async fn read_block(&self, block: BlockID) -> Vec<u8> {
@@ -1146,13 +1165,14 @@ impl Pool {
         phys.blocks.get(&block).unwrap().to_owned().into_vec()
     }
 
-    pub async fn free_block(&self, block: BlockID, size: u32) {
+    pub fn free_block(&self, block: BlockID, size: u32) {
         // the syncing_state is only held from the thread that owns the Pool
         // (i.e. this thread) and from end_txg(). It's not allowed to call this
         // function while in the middle of an end_txg(), so the lock must not be
         // held. XXX change this to return an error to the client
-        let mut syncing_state = self.state.syncing_state.lock().await;
-        syncing_state.log_free(PendingFreesLogEntry { block, size });
+        self.state.with_syncing_state(|syncing_state| {
+            syncing_state.log_free(PendingFreesLogEntry { block, size });
+        })
     }
 }
 
@@ -1206,11 +1226,13 @@ fn log_deleted_objects(
     );
 }
 
-async fn build_new_frees(
+async fn build_new_frees<'a, I>(
     syncing_state: &mut PoolSyncingState,
-    remaining_frees: Vec<PendingFreesLogEntry>,
+    remaining_frees: I,
     remainder: ObjectBasedLogRemainder,
-) {
+) where
+    I: IntoIterator<Item = &'a PendingFreesLogEntry>,
+{
     let txg = syncing_state.syncing_txg.unwrap();
     let begin = Instant::now();
 
@@ -1225,8 +1247,7 @@ async fn build_new_frees(
     syncing_state.stats.pending_frees_count = 0;
     syncing_state.stats.pending_frees_bytes = 0;
     for ent in remaining_frees {
-        // XXX could we build this in open context and then just add the new entries from syncing context?
-        syncing_state.log_free(ent);
+        syncing_state.log_free(*ent);
     }
     stream
         .for_each(|ent| {
@@ -1371,23 +1392,6 @@ async fn reclaim_frees_object(
                 // have any required blocks.  Instead we fabricate an empty
                 // DataObjectPhys with the same metadata as what we expect.
 
-                // XXX assertion not really necessary since we make the
-                // equivalent assertion after removing the extraneous blocks
-                assert_eq!(
-                    new_object_size,
-                    phys
-                        .blocks
-                        .iter()
-                        .filter_map(|(block, data)| {
-                            if block >= &min_block && block < &next_block {
-                                Some(data.len() as u32)
-                            } else {
-                                None
-                            }
-                        })
-                        .sum::<u32>()
-                );
-
                 if phys.min_block != min_block || phys.next_block != next_block {
                     debug!("reclaim: {:?} expected range BlockID[{},{}), found BlockID[{},{}), trimming uncommitted consolidation",
                         object, min_block, next_block, phys.min_block, phys.next_block);
@@ -1521,7 +1525,8 @@ fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState
         let mut frees_per_object = get_frees_per_obj(&state, pending_frees_log_stream).await;
 
         // sort objects by number of free blocks
-        // XXX should be based on free space (bytes)?
+        // XXX should be based on free space (bytes)?  And perhaps objects that
+        // will be entirely freed should always be processed?
         let mut objects_by_frees: BTreeSet<(usize, ObjectID)> = BTreeSet::new();
         for (obj, hs) in frees_per_object.iter() {
             // MAX-len because we want to sort by which has the most to
@@ -1538,7 +1543,6 @@ fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState
         let mut join_handles = Vec::new();
         let mut freed_blocks_count: u64 = 0;
         let mut freed_blocks_bytes: u64 = 0;
-        let mut remaining_frees: Vec<PendingFreesLogEntry> = Vec::new();
         let mut rewritten_object_sizes: Vec<(ObjectID, u32)> = Vec::new();
         let mut deleted_objects: Vec<ObjectID> = Vec::new();
         let mut writing: HashSet<ObjectID> = HashSet::new();
@@ -1600,9 +1604,6 @@ fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState
             // we calculate the size based on the object contents, and
             // return it from the spawned task.
 
-            // XXX would be nice to know if we are freeing the entire object
-            // in which case we wouldn't need to read it.  Would have to
-            // keep a count of blocks per object in RAM?
             let sem2 = outstanding.clone();
             let state2 = state.clone();
             join_handles.push(tokio::spawn(async move {
@@ -1615,12 +1616,6 @@ fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState
                 break;
             }
         }
-        for (_, mut frees) in frees_per_object.drain() {
-            // XXX copying around the blocks, although maybe this is not huge???
-            // XXX could simply give the whole frees_per_obj and have syncing context iterate
-            remaining_frees.append(&mut frees);
-        }
-
         let num_handles = join_handles.len();
         for join_handle in join_handles {
             let (object, size) = join_handle.await.unwrap();
@@ -1641,6 +1636,7 @@ fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState
                 syncing_state.stats.blocks_count -= freed_blocks_count;
                 syncing_state.stats.blocks_bytes -= freed_blocks_bytes;
 
+                let remaining_frees = frees_per_object.values().flatten();
                 build_new_frees(syncing_state, remaining_frees, frees_remainder).await;
                 log_deleted_objects(state, syncing_state, deleted_objects);
                 try_condense_object_sizes(syncing_state, object_sizes, sizes_remainder).await;

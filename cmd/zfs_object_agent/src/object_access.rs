@@ -58,7 +58,6 @@ where
     let result = loop {
         match f().await {
             (true, Err(e)) => {
-                // XXX why can't we use {} with `e`?  lifetime error???
                 debug!(
                     "{} returned: {:?}; retrying in {}ms",
                     msg,
@@ -316,12 +315,12 @@ impl ObjectAccess {
 
     async fn put_object_impl(&self, key: &str, data: Vec<u8>) {
         let len = data.len();
-        let a = Arc::new(Bytes::from(data));
+        let bytes = Bytes::from(data);
         retry(
             &format!("put {} ({} bytes)", prefixed(key), len),
             || async {
-                let my_b = (*a).clone();
-                let stream = ByteStream::new_with_size(stream! { yield Ok(my_b)}, len);
+                let my_bytes = bytes.clone();
+                let stream = ByteStream::new_with_size(stream! { yield Ok(my_bytes)}, len);
 
                 let req = PutObjectRequest {
                     bucket: self.bucket_str.clone(),
@@ -344,7 +343,9 @@ impl ObjectAccess {
             if c.cache.contains(&mykey) {
                 debug!("found {} in cache when putting - invalidating", key);
                 // XXX unfortuate to be copying; this happens every time when
-                // freeing (we get/modify/put the object)
+                // freeing (we get/modify/put the object).  Maybe when freeing,
+                // the get() should not add to the cache since it's probably
+                // just polluting.
                 c.cache.put(mykey, Arc::new(data.clone()));
             }
         }
