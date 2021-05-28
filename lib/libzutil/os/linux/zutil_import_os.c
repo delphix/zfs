@@ -403,6 +403,21 @@ struct sockaddr_un zfs_user_socket = {
 	AF_UNIX, "/run/zfs_user_socket"
 };
 
+static int
+read_all(int fd, void *buf, size_t len)
+{
+	size_t read_total = 0;
+	while (read_total < len) {
+		size_t rc = read(fd, buf + read_total, len - read_total);
+		if (rc > 0) {
+			read_total += rc;
+		} else if (rc < 0) {
+			return (rc);
+		}
+	}
+	return (read_total);
+}
+
 void
 zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
     pthread_mutex_t *lock, avl_tree_t *cache)
@@ -475,19 +490,18 @@ zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
 
 	uint64_t resp_size;
 	size_t size;
-	rv = read(sock, &resp_size, sizeof (resp_size));
+	rv = read_all(sock, &resp_size, sizeof (resp_size));
 	if (rv < 0) {
 		free(credentials);
 		close(sock);
 		return;
 	}
-	// XXX We need to handle partial reads here.
 	VERIFY3U(rv, ==, sizeof (resp_size));
 
 	size = le64toh(resp_size);
 	buf = malloc(size);
 
-	rv = read(sock, buf, size);
+	rv = read_all(sock, buf, size);
 	close(sock);
 	if (rv < 0) {
 		free(credentials);
