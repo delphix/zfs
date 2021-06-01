@@ -354,13 +354,13 @@ impl ObjectAccess {
     }
 
     pub async fn delete_object(&self, key: &str) {
-        self.delete_objects(vec![key.to_string()]).await;
+        self.delete_objects(&[key.to_string()]).await;
     }
 
     // return if retry needed
     // XXX unfortunate that this level of retry can't be handled by retry()
     // XXX ideally we would only retry the failed deletions, not all of them
-    async fn delete_objects_impl(&self, keys: &Vec<String>) -> bool {
+    async fn delete_objects_impl(&self, keys: &[String]) -> bool {
         let msg = format!(
             "delete {} objects including {}",
             keys.len(),
@@ -402,7 +402,7 @@ impl ObjectAccess {
     // prefixed already, to avoid creating new ObjectIdentifiers
     // Note: AWS supports up to 1000 keys per delete_objects request.
     // XXX should we split them up here?
-    pub async fn delete_objects(&self, keys: Vec<String>) {
-        while self.delete_objects_impl(&keys).await {}
+    pub async fn delete_objects(&self, keys: &[String]) {
+        while self.delete_objects_impl(keys).await {}
     }
 }

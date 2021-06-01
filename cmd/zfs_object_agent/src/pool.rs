@@ -895,10 +895,10 @@ impl Pool {
                 shared_state
                     .object_access
                     .delete_objects(
-                        objects
+                        &objects
                             .iter()
                             .map(|o| DataObjectPhys::key(shared_state.guid, *o))
-                            .collect(),
+                            .collect::<Vec<_>>(),
                     )
                     .await;
             }
