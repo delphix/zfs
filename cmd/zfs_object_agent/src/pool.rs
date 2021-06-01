@@ -667,12 +667,6 @@ impl Pool {
     }
 
     pub async fn resume_complete(&self) {
-        // XXX we need to wait for all writes to be added to
-        // pending_unordered_writes, but there's no way to do that
-        // XXX should no longer be needed since write_block() is called
-        // synchronously from the main Server task, so all writes have already been added to pending_unordered_writes
-        //sleep(Duration::from_secs(1)).await;
-
         let state = &self.state;
         let txg = self.state.with_syncing_state(|syncing_state| {
             // verify that we're in resuming state
