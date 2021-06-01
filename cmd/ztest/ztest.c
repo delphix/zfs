@@ -2919,8 +2919,12 @@ ztest_spa_create_destroy(ztest_ds_t *zd, uint64_t id)
 	spa_t *spa;
 	nvlist_t *nvroot;
 
-	if (zo->zo_mmp_test)
+	if (zo->zo_mmp_test || ztest_opts.zo_obj_store) {
+		if (ztest_opts.zo_verbose >= 3) {
+			(void) printf("Skipping ztest_spa_create_destroy.\n");
+		}
 		return;
+	}
 
 	/*
 	 * Attempt to create using a bad file.
@@ -2981,8 +2985,12 @@ ztest_mmp_enable_disable(ztest_ds_t *zd, uint64_t id)
 	ztest_shared_opts_t *zo = &ztest_opts;
 	spa_t *spa = ztest_spa;
 
-	if (zo->zo_mmp_test)
+	if (zo->zo_mmp_test || ztest_opts.zo_obj_store) {
+		if (ztest_opts.zo_verbose >= 3) {
+			(void) printf("Skipping ztest_mmp_enable_disable.\n");
+		}
 		return;
+	}
 
 	/*
 	 * Since enabling MMP involves setting a property, it could not be done
@@ -3194,8 +3202,12 @@ ztest_vdev_add_remove(ztest_ds_t *zd, uint64_t id)
 	nvlist_t *nvroot;
 	int error;
 
-	if (ztest_opts.zo_mmp_test)
+	if (ztest_opts.zo_mmp_test || ztest_opts.zo_obj_store) {
+		if (ztest_opts.zo_verbose >= 3) {
+			(void) printf("Skipping ztest_vdev_add_remove.\n");
+		}
 		return;
+	}
 
 	mutex_enter(&ztest_vdev_lock);
 	leaves = MAX(zs->zs_mirrors + zs->zs_splits, 1) *
@@ -3285,6 +3297,12 @@ ztest_vdev_class_add(ztest_ds_t *zd, uint64_t id)
 	    VDEV_ALLOC_BIAS_SPECIAL : VDEV_ALLOC_BIAS_DEDUP;
 	int error;
 
+	if (ztest_opts.zo_obj_store) {
+		if (ztest_opts.zo_verbose >= 3) {
+			(void) printf("Skipping ztest_vdev_class_add.\n");
+		}
+		return;
+	}
 	/*
 	 * By default add a special vdev 50% of the time
 	 */
@@ -3367,8 +3385,12 @@ ztest_vdev_aux_add_remove(ztest_ds_t *zd, uint64_t id)
 	uint64_t guid = 0;
 	int error, ignore_err = 0;
 
-	if (ztest_opts.zo_mmp_test)
+	if (ztest_opts.zo_mmp_test || ztest_opts.zo_obj_store) {
+		if (ztest_opts.zo_verbose >= 3) {
+			(void) printf("Skipping ztest_vdev_aux_add_remove.\n");
+		}
 		return;
+	}
 
 	path = umem_alloc(MAXPATHLEN, UMEM_NOFAIL);
 
@@ -3583,8 +3605,12 @@ ztest_vdev_attach_detach(ztest_ds_t *zd, uint64_t id)
 	int oldvd_is_log;
 	int error, expected_error;
 
-	if (ztest_opts.zo_mmp_test)
+	if (ztest_opts.zo_mmp_test || ztest_opts.zo_obj_store) {
+		if (ztest_opts.zo_verbose >= 3) {
+			(void) printf("Skipping ztest_vdev_attach_detach.\n");
+		}
 		return;
+	}
 
 	oldpath = umem_alloc(MAXPATHLEN, UMEM_NOFAIL);
 	newpath = umem_alloc(MAXPATHLEN, UMEM_NOFAIL);
@@ -3810,6 +3836,13 @@ ztest_device_removal(ztest_ds_t *zd, uint64_t id)
 	vdev_t *vd;
 	uint64_t guid;
 	int error;
+
+	if (ztest_opts.zo_obj_store) {
+		if (ztest_opts.zo_verbose >= 3) {
+			(void) printf("Skipping ztest_device_removal.\n");
+		}
+		return;
+	}
 
 	mutex_enter(&ztest_vdev_lock);
 
@@ -6320,15 +6353,21 @@ ztest_reguid(ztest_ds_t *zd, uint64_t id)
 	spa_t *spa = ztest_spa;
 	uint64_t orig, load;
 	int error;
+	ztest_shared_t *zs = ztest_shared;
 
-	if (ztest_opts.zo_mmp_test)
+	if (ztest_opts.zo_mmp_test || ztest_opts.zo_obj_store) {
+		if (ztest_opts.zo_verbose >= 3) {
+			(void) printf("Skipping ztest_vdev_add_remove.\n");
+		}
 		return;
+	}
 
 	orig = spa_guid(spa);
 	load = spa_load_guid(spa);
 
 	(void) pthread_rwlock_wrlock(&ztest_name_lock);
 	error = spa_change_guid(spa);
+	zs->zs_guid = spa_guid(spa);
 	(void) pthread_rwlock_unlock(&ztest_name_lock);
 
 	if (error != 0)
@@ -6625,6 +6664,13 @@ ztest_initialize(ztest_ds_t *zd, uint64_t id)
 	spa_t *spa = ztest_spa;
 	int error = 0;
 
+	if (ztest_opts.zo_obj_store) {
+		if (ztest_opts.zo_verbose >= 3) {
+			(void) printf("Skipping ztest_initialize.\n");
+		}
+		return;
+	}
+
 	mutex_enter(&ztest_vdev_lock);
 
 	spa_config_enter(spa, SCL_VDEV, FTAG, RW_READER);
@@ -6696,6 +6742,13 @@ ztest_trim(ztest_ds_t *zd, uint64_t id)
 {
 	spa_t *spa = ztest_spa;
 	int error = 0;
+
+	if (ztest_opts.zo_obj_store) {
+		if (ztest_opts.zo_verbose >= 3) {
+			(void) printf("Skipping ztest_trim.\n");
+		}
+		return;
+	}
 
 	mutex_enter(&ztest_vdev_lock);
 
@@ -6770,7 +6823,7 @@ ztest_trim(ztest_ds_t *zd, uint64_t id)
  * Verify pool integrity by running zdb.
  */
 static void
-ztest_run_zdb(char *pool)
+ztest_run_zdb(char *pool, uint64_t guid)
 {
 	int status;
 	char *bin;
@@ -6792,23 +6845,25 @@ ztest_run_zdb(char *pool)
 	free(set_gvars_args);
 
 	if (ztest_opts.zo_obj_store) {
-		snprintf(loc, len, "-a %s -g %s -B %s -f %s ",
+		ASSERT3P(guid, !=, 0);
+		snprintf(loc, len, "-a %s -g %s -B %s -f %s %llu",
 		    ztest_opts.zo_obj_store_endpoint,
 		    ztest_opts.zo_obj_store_region,
 		    ztest_opts.zo_obj_store_bucket,
-		    ztest_opts.zo_obj_store_creds_file);
+		    ztest_opts.zo_obj_store_creds_file,
+		    (u_longlong_t)guid);
 	} else {
-		snprintf(loc, len, "-p %s ", ztest_opts.zo_dir);
+		snprintf(loc, len, "-p %s %s", ztest_opts.zo_dir, pool);
 	}
 
 	size_t would = snprintf(zdb, len,
-	    "%s -bcc%s%s -G -d -Y -e -y %s %s %s",
+	    "%s -bcc%s%s%s -d -Y -e -y %s %s",
 	    bin,
 	    ztest_opts.zo_verbose >= 3 ? "s" : "",
 	    ztest_opts.zo_verbose >= 4 ? "v" : "",
+	    ztest_opts.zo_dump_dbgmsg ? "G" : "",
 	    set_gvars_args_joined,
-	    loc,
-	    pool);
+	    loc);
 	ASSERT3U(would, <, len);
 
 	free(set_gvars_args_joined);
@@ -6862,6 +6917,12 @@ ztest_spa_import_export(char *oldname, char *newname)
 	spa_t *spa;
 	int error;
 
+	if (ztest_opts.zo_obj_store) {
+		if (ztest_opts.zo_verbose >= 3) {
+			(void) printf("Skipping ztest_spa_import_export.\n");
+		}
+		return;
+	}
 	if (ztest_opts.zo_verbose >= 4) {
 		(void) printf("import/export: old = %s, new = %s\n",
 		    oldname, newname);
@@ -7038,6 +7099,10 @@ ztest_execute(int test, ztest_info_t *zi, uint64_t id)
 	ztest_shared_callstate_t *zc = ZTEST_GET_SHARED_CALLSTATE(test);
 	hrtime_t functime = gethrtime();
 	int i;
+
+	if (ztest_opts.zo_verbose >= 3) {
+		(void) printf("Executing %s\n", zi->zi_funcname);
+	}
 
 	for (i = 0; i < zi->zi_iters; i++)
 		zi->zi_func(zd, id);
@@ -7254,8 +7319,14 @@ ztest_freeze(void)
 	spa_t *spa;
 	int numloops = 0;
 
-	if (ztest_opts.zo_verbose >= 3)
+	if (ztest_opts.zo_obj_store) {
+		if (ztest_opts.zo_verbose >= 3) {
+			(void) printf("Skipping ztest_freeze.\n");
+		}
+		return;
+	} else if (ztest_opts.zo_verbose >= 3) {
 		(void) printf("testing spa_freeze()...\n");
+	}
 
 	kernel_init(SPA_MODE_READ | SPA_MODE_WRITE);
 	VERIFY0(spa_open(ztest_opts.zo_pool, &spa, FTAG));
@@ -7376,14 +7447,15 @@ ztest_import(ztest_shared_t *zs)
 	VERIFY0(spa_open(ztest_opts.zo_pool, &spa, FTAG));
 	zs->zs_metaslab_sz =
 	    1ULL << spa->spa_root_vdev->vdev_child[0]->vdev_ms_shift;
+	zs->zs_guid = spa_guid(spa);
 	spa_close(spa, FTAG);
 
 	kernel_fini();
 
 	if (!ztest_opts.zo_mmp_test) {
-		ztest_run_zdb(ztest_opts.zo_pool);
+		ztest_run_zdb(ztest_opts.zo_pool, zs->zs_guid);
 		ztest_freeze();
-		ztest_run_zdb(ztest_opts.zo_pool);
+		ztest_run_zdb(ztest_opts.zo_pool, zs->zs_guid);
 	}
 
 	(void) pthread_rwlock_destroy(&ztest_name_lock);
@@ -7445,6 +7517,7 @@ ztest_run(ztest_shared_t *zs)
 
 	metaslab_preload_limit = ztest_random(20) + 1;
 	ztest_spa = spa;
+	ASSERT3P(zs->zs_guid, ==, spa_guid(spa));
 
 	VERIFY0(vdev_raidz_impl_set("cycle"));
 
@@ -7454,7 +7527,6 @@ ztest_run(ztest_shared_t *zs)
 	dsl_pool_config_enter(dmu_objset_pool(os), FTAG);
 	dmu_objset_fast_stat(os, &dds);
 	dsl_pool_config_exit(dmu_objset_pool(os), FTAG);
-	zs->zs_guid = dds.dds_guid;
 	dmu_objset_disown(os, B_TRUE, FTAG);
 
 	/*
@@ -7725,14 +7797,14 @@ ztest_init(ztest_shared_t *zs)
 	VERIFY0(spa_open(ztest_opts.zo_pool, &spa, FTAG));
 	zs->zs_metaslab_sz =
 	    1ULL << spa->spa_root_vdev->vdev_child[0]->vdev_ms_shift;
+	zs->zs_guid = spa_guid(spa);
 	spa_close(spa, FTAG);
 
 	kernel_fini();
-
 	if (!ztest_opts.zo_mmp_test) {
-		ztest_run_zdb(ztest_opts.zo_pool);
+		ztest_run_zdb(ztest_opts.zo_pool, zs->zs_guid);
 		ztest_freeze();
-		ztest_run_zdb(ztest_opts.zo_pool);
+		ztest_run_zdb(ztest_opts.zo_pool, zs->zs_guid);
 	}
 
 	(void) pthread_rwlock_destroy(&ztest_name_lock);
@@ -8161,7 +8233,7 @@ main(int argc, char **argv)
 		}
 
 		if (!ztest_opts.zo_mmp_test)
-			ztest_run_zdb(ztest_opts.zo_pool);
+			ztest_run_zdb(ztest_opts.zo_pool, zs->zs_guid);
 	}
 
 	if (ztest_opts.zo_verbose >= 1) {
