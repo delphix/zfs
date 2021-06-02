@@ -992,6 +992,10 @@ process_options(int argc, char **argv)
 		}
 	}
 
+	if (zo->zo_obj_store) {
+		ztest_opts.zo_metaslab_force_ganging = SPA_MAXBLOCKSIZE + 1;
+	}
+
 	/* When raid choice is 'random' add a draid pool 50% of the time */
 	if (strcmp(raid_kind, "random") == 0 && zo->zo_obj_store == 0) {
 		(void) strlcpy(raid_kind, (ztest_random(2) == 0) ?
@@ -3038,8 +3042,12 @@ ztest_spa_upgrade(ztest_ds_t *zd, uint64_t id)
 	nvlist_t *nvroot, *props;
 	char *name;
 
-	if (ztest_opts.zo_mmp_test)
+	if (ztest_opts.zo_mmp_test || ztest_opts.zo_obj_store) {
+		if (ztest_opts.zo_verbose >= 3) {
+			(void) printf("Skipping ztest_spa_upgrade.\n");
+		}
 		return;
+	}
 
 	/* dRAID added after feature flags, skip upgrade test. */
 	if (strcmp(ztest_opts.zo_raid_type, VDEV_TYPE_DRAID) == 0)
