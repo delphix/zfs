@@ -225,7 +225,8 @@ impl ObjectAccess {
         prefix: &str,
         start_after: Option<String>,
     ) -> Vec<ListObjectsV2Output> {
-        self.list_objects_impl(prefix, start_after, None).await
+        self.list_objects_impl(prefix, start_after, Some("/".to_owned()))
+            .await
     }
 
     pub async fn list_objects_impl(

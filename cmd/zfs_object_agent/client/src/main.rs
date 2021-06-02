@@ -308,16 +308,16 @@ fn do_nvpair() {
 }
 
 fn has_expired(last_modified: &str, min_age: Duration) -> bool {
-    let mod_time = DateTime::parse_from_rfc3339(last_modified).unwrap();
+    let mod_time = DateTime::parse_from_rfc2822(last_modified).unwrap();
     let age = Local::now().signed_duration_since(mod_time);
 
     min_age == Duration::from_secs(0) || age > chrono::Duration::from_std(min_age).unwrap()
 }
 
 async fn print_super(object_access: &ObjectAccess, pool_key: &str, output: &HeadObjectOutput) {
-    println!(
-        "\n{:30} {}",
-        output.last_modified.as_ref().unwrap(),
+    print!(
+        "{:30} {:40}",
+        DateTime::parse_from_rfc2822(output.last_modified.as_ref().unwrap()).unwrap(),
         pool_key
     );
     let split: Vec<&str> = pool_key.rsplitn(3, '/').collect();
@@ -328,7 +328,11 @@ async fn print_super(object_access: &ObjectAccess, pool_key: &str, output: &Head
             Ok(pool_config) => {
                 let name = pool_config.lookup_string("name").unwrap();
                 let hostname = pool_config.lookup_string("hostname").unwrap();
-                println!("\tname:{:?} host:{:?}", name, hostname);
+                println!(
+                    "\t{:20} {}",
+                    name.to_str().unwrap(),
+                    hostname.to_str().unwrap()
+                );
             }
             Err(_e) => {
                 /*
@@ -336,26 +340,30 @@ async fn print_super(object_access: &ObjectAccess, pool_key: &str, output: &Head
                  * path to the "super" object.
                  */
                 if AWS_PREFIX.len() == 0 && !pool_key.starts_with("zfs/") {
-                    println!("\t(pool inside an alt AWS_PREFIX).");
+                    println!("\t(pool inside an alt AWS_PREFIX)");
                 } else {
-                    println!("\tunknown format.");
+                    println!("\t-unknown format-");
                 };
             }
         }
     }
 }
 
+fn strip_prefix(prefix: &str) -> &str {
+    if prefix.starts_with(AWS_PREFIX.as_str()) {
+        &prefix[AWS_PREFIX.len()..]
+    } else {
+        prefix
+    }
+}
+
 async fn find_old_pools(min_age: Duration) -> Vec<String> {
     let object_access = &OBJECT_ACCESS;
-
-    println!("Looking for pools...");
-
     let mut pool_keys = object_access.collect_prefixes("zfs/").await;
 
     let aws_prefix: &String = &AWS_PREFIX;
     if aws_prefix == "" {
         for prefix in object_access.collect_prefixes("").await {
-            println!("Looking for pools UNDER {}...", prefix);
             pool_keys.append(
                 &mut object_access
                     .collect_prefixes(&format!("{}zfs/", prefix))
@@ -367,7 +375,7 @@ async fn find_old_pools(min_age: Duration) -> Vec<String> {
     let mut vec = Vec::new();
     for pool_key in pool_keys {
         match object_access
-            .head_object(&format!("{}/super", pool_key))
+            .head_object(strip_prefix(&format!("{}super", pool_key)))
             .await
         {
             Some(output) => {
@@ -375,7 +383,10 @@ async fn find_old_pools(min_age: Duration) -> Vec<String> {
                 if has_expired(output.last_modified.as_ref().unwrap(), min_age) {
                     vec.push(pool_key);
                 } else {
-                    println!("Skipping pool as it is not {:?} old.", min_age);
+                    println!(
+                        "Skipping pool as it is not {} days old.",
+                        min_age.as_secs() / (60 * 60 * 24)
+                    );
                 }
             }
             None => {
@@ -391,8 +402,11 @@ async fn do_list_pools(list_all_objects: bool) -> Result<(), Box<dyn Error>> {
     for prefix in find_old_pools(Duration::from_secs(0)).await {
         // Lookup all objects in the pool.
         if list_all_objects {
-            for object in object_access.collect_all_objects(&prefix).await {
-                println!("{}", object);
+            for object in object_access
+                .collect_all_objects(strip_prefix(&prefix))
+                .await
+            {
+                println!("    {}", object);
             }
         }
     }
@@ -410,11 +424,18 @@ async fn do_destroy_old_pools(args: &Vec<String>) -> Result<(), Box<dyn Error>> 
 
     for prefix in find_old_pools(min_age).await {
         for chunk in object_access
-            .collect_all_objects(&prefix)
+            .collect_all_objects(strip_prefix(&prefix))
             .await
             .chunks(AWS_DELETION_BATCH_SIZE)
         {
-            object_access.delete_objects(chunk).await;
+            object_access
+                .delete_objects(
+                    &chunk
+                        .iter()
+                        .map(|o| strip_prefix(&o).to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .await;
         }
     }
     Ok(())
