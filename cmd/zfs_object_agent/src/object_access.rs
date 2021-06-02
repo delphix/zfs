@@ -220,11 +220,19 @@ impl ObjectAccess {
         };
         either.await
     }
-
     pub async fn list_objects(
         &self,
         prefix: &str,
         start_after: Option<String>,
+    ) -> Vec<ListObjectsV2Output> {
+        self.list_objects_impl(prefix, start_after, None).await
+    }
+
+    pub async fn list_objects_impl(
+        &self,
+        prefix: &str,
+        start_after: Option<String>,
+        delimiter: Option<String>,
     ) -> Vec<ListObjectsV2Output> {
         let full_prefix = prefixed(prefix);
         let full_start_after = match start_after {
@@ -240,7 +248,7 @@ impl ObjectAccess {
                     let req = ListObjectsV2Request {
                         bucket: self.bucket_str.clone(),
                         continuation_token: continuation_token.clone(),
-                        delimiter: Some("/".to_owned()),
+                        delimiter: delimiter.clone(),
                         fetch_owner: Some(false),
                         prefix: Some(full_prefix.clone()),
                         start_after: full_start_after.clone(),
@@ -291,7 +299,19 @@ impl ObjectAccess {
         vec
     }
 
-    pub async fn object_exists(&self, key: &str) -> bool {
+    pub async fn collect_all_objects(&self, prefix: &str) -> Vec<String> {
+        let mut vec = Vec::new();
+        for output in self.list_objects_impl(prefix, None, None).await {
+            for objects in output.contents {
+                for object in objects {
+                    vec.push(object.key.unwrap());
+                }
+            }
+        }
+        vec
+    }
+
+    pub async fn head_object(&self, key: &str) -> Option<HeadObjectOutput> {
         let res = retry(&format!("head {}", prefixed(key)), || async {
             let req = HeadObjectRequest {
                 bucket: self.bucket_str.clone(),
@@ -310,7 +330,11 @@ impl ObjectAccess {
             }
         })
         .await;
-        res.err() == None
+        res.ok()
+    }
+
+    pub async fn object_exists(&self, key: &str) -> bool {
+        self.head_object(key).await.is_some()
     }
 
     async fn put_object_impl(&self, key: &str, data: Vec<u8>) {

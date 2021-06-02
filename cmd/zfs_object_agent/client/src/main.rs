@@ -1,21 +1,18 @@
-//use crate::object_access::ObjectAccess;
-use async_recursion::async_recursion;
 use chrono::prelude::*;
 use chrono::DateTime;
 use client::Client;
-use futures::future::*;
 use lazy_static::lazy_static;
 use libzoa::base_types::*;
-use libzoa::object_access;
 use libzoa::object_access::ObjectAccess;
 use libzoa::pool::*;
 use nvpair::*;
 use rand::prelude::*;
 use rusoto_core::ByteStream;
 use rusoto_s3::*;
+use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::Region;
-use s3::{bucket::Bucket, serde_types::ListBucketResult};
+use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -23,7 +20,6 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::io::Read;
 use std::time::{Duration, Instant};
-use std::{collections::BTreeSet, i64};
 use tokio::io::AsyncReadExt;
 mod client;
 
@@ -48,6 +44,8 @@ lazy_static! {
         AWS_ACCESS_KEY_ID.clone(),
         AWS_SECRET_ACCESS_KEY.clone()
     );
+    static ref OBJECT_ACCESS: ObjectAccess =
+        ObjectAccess::new(ENDPOINT, REGION, BUCKET_NAME, &AWS_CREDENTIALS.clone());
 }
 
 async fn do_s3(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
@@ -276,146 +274,6 @@ async fn do_free() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn get_int_param(args: &Vec<String>, offset: usize, default: i64) -> i64 {
-    let mut val: i64 = default;
-    if args.len() > offset {
-        val = args[offset].parse::<i64>().unwrap();
-    }
-
-    val
-}
-
-fn has_expired(last_modified: &str, min_age_days: i64) -> bool {
-    let mod_time = DateTime::parse_from_rfc3339(last_modified).unwrap();
-    let num_days = mod_time.signed_duration_since(Local::now()).num_days();
-
-    min_age_days == 0 || (-1 * num_days) > min_age_days
-}
-
-fn print_list(list_results: ListBucketResult, min_age_days: i64) {
-    for res in list_results.contents {
-        if has_expired(res.last_modified.as_str(), min_age_days) {
-            let mod_time = DateTime::parse_from_rfc3339(res.last_modified.as_str()).unwrap();
-            println!("{:30}  {}", mod_time.to_string(), res.key);
-        }
-    }
-}
-
-async fn list_and_process(
-    bucket: &Bucket,
-    min_age_days: i64,
-    process: fn(ListBucketResult, i64),
-) -> Result<(), Box<dyn Error>> {
-    let mut continuation_token = None;
-    loop {
-        let (list_results, _) = bucket
-            .list_page(
-                object_access::prefixed(""),
-                None,
-                continuation_token,
-                None,
-                None,
-            )
-            .await?;
-        continuation_token = list_results.next_continuation_token.clone();
-
-        process(list_results, min_age_days);
-
-        if continuation_token.is_none() {
-            break;
-        }
-    }
-
-    Ok(())
-}
-
-async fn do_list(bucket: &Bucket, args: &Vec<String>) -> Result<(), Box<dyn Error>> {
-    let min_age_days: i64 = get_int_param(args, 2, 0);
-    list_and_process(bucket, min_age_days, print_list)
-        .await
-        .unwrap();
-
-    Ok(())
-}
-
-async fn delete_list(
-    bucket: &Bucket,
-    list_results: ListBucketResult,
-    min_age_days: i64,
-) -> (i64, i64) {
-    let mut futures = Vec::new();
-    let mut deleted: i64 = 0;
-    let mut skipped: i64 = 0;
-
-    for res in list_results.contents {
-        if has_expired(res.last_modified.as_str(), min_age_days) {
-            println!("deleting object {}...", res.key);
-            deleted = deleted + 1;
-            let begin = Instant::now();
-            let fut = async move {
-                bucket.delete_object(&res.key).await.unwrap();
-                println!(
-                    "finished deleting object {} in {}ms",
-                    res.key,
-                    begin.elapsed().as_millis()
-                );
-            };
-            futures.push(fut);
-        } else {
-            skipped = skipped + 1;
-        }
-    }
-    join_all(futures).await;
-
-    (deleted, skipped)
-}
-
-async fn do_delete_impl(bucket: &Bucket, min_age_days: i64) -> Result<(), Box<dyn Error>> {
-    let begin = Instant::now();
-
-    let mut total_deleted: i64 = 0;
-    let mut total_skipped: i64 = 0;
-    let mut continuation_token = None;
-    loop {
-        let (list_results, _) = bucket
-            .list_page(
-                object_access::prefixed(""),
-                None,
-                continuation_token,
-                None,
-                None,
-            )
-            .await?;
-        continuation_token = list_results.next_continuation_token.clone();
-
-        let (deleted, skipped) = delete_list(bucket, list_results, min_age_days).await;
-        total_deleted = total_deleted + deleted;
-        total_skipped = total_skipped + skipped;
-
-        if continuation_token.is_none() {
-            break;
-        }
-    }
-
-    println!(
-        "deleted {}, skipped {} objects in {}ms; .",
-        total_deleted,
-        total_skipped,
-        begin.elapsed().as_millis()
-    );
-
-    Ok(())
-}
-
-async fn do_delete(bucket: &Bucket, args: &Vec<String>) -> Result<(), Box<dyn Error>> {
-    let min_age_days: i64 = get_int_param(args, 2, -1);
-    assert!(min_age_days < 0, "Usage: zoa_test delete <number-of-days>");
-
-    do_delete_impl(&bucket, min_age_days).await.unwrap();
-
-    Ok(())
-}
-
 fn get_file_as_byte_vec(filename: &str) -> Vec<u8> {
     let mut f = File::open(filename).expect("no file found");
     let metadata = fs::metadata(filename).expect("unable to read metadata");
@@ -449,251 +307,117 @@ fn do_nvpair() {
     write_file_as_bytes("./zpool.cache.rust", &newbuf);
 }
 
-fn get_object_access() -> ObjectAccess {
-    ObjectAccess::new(ENDPOINT, REGION, BUCKET_NAME, &AWS_CREDENTIALS.clone())
+fn has_expired(last_modified: &str, min_age: Duration) -> bool {
+    let mod_time = DateTime::parse_from_rfc3339(last_modified).unwrap();
+    let age = Local::now().signed_duration_since(mod_time);
+
+    min_age == Duration::from_secs(0) || age > chrono::Duration::from_std(min_age).unwrap()
 }
 
-fn strip_prefix(prefix: &str) -> &str {
-    if prefix.starts_with(AWS_PREFIX.as_str()) {
-        &prefix[AWS_PREFIX.len()..]
-    } else {
-        prefix
-    }
-}
-struct ListObject {
-    key: String,
-    last_modified: String,
-}
-
-#[async_recursion]
-async fn list_objects(
-    object_access: &ObjectAccess,
-    prefix: &str,
-    recursive: bool,
-) -> Vec<ListObject> {
-    // Strip aws_prefix as object_access adds it back automatically.
-    let stripped_prefix = strip_prefix(prefix);
-    let mut vec: Vec<ListObject> = Vec::new();
-
-    for output in object_access.list_objects(&stripped_prefix, None).await {
-        for objects in output.contents {
-            for object in objects {
-                let o = ListObject {
-                    key: object.key.unwrap(),
-                    last_modified: object.last_modified.unwrap(),
+async fn print_super(object_access: &ObjectAccess, pool_key: &str, output: &HeadObjectOutput) {
+    println!(
+        "\n{:30} {}",
+        output.last_modified.as_ref().unwrap(),
+        pool_key
+    );
+    let split: Vec<&str> = pool_key.rsplitn(3, '/').collect();
+    let guid_str: &str = split[1];
+    if let Ok(guid64) = str::parse::<u64>(guid_str) {
+        let guid = PoolGUID(guid64);
+        match Pool::get_config(&object_access, guid).await {
+            Ok(pool_config) => {
+                let name = pool_config.lookup_string("name").unwrap();
+                let hostname = pool_config.lookup_string("hostname").unwrap();
+                println!("\tname:{:?} host:{:?}", name, hostname);
+            }
+            Err(_e) => {
+                /*
+                 * XXX Pool::get_config() only works for pools under the AWS_PREFIX because it assumes the
+                 * path to the "super" object.
+                 */
+                if AWS_PREFIX.len() == 0 && !pool_key.starts_with("zfs/") {
+                    println!("\t(pool inside an alt AWS_PREFIX).");
+                } else {
+                    println!("\tunknown format.");
                 };
-                vec.push(o);
-            }
-        }
-
-        if !recursive {
-            continue;
-        }
-
-        // Recursively call list_objects for each prefix in common_prefixes.
-        for object_prefixs in output.common_prefixes {
-            for object_prefix in object_prefixs {
-                let objects =
-                    list_objects(&object_access, &object_prefix.prefix.unwrap(), true).await;
-                for object in objects {
-                    let o = ListObject {
-                        key: object.key,
-                        last_modified: object.last_modified,
-                    };
-                    vec.push(o);
-                }
             }
         }
     }
-
-    vec
 }
 
-fn print_list_objects(objects: Vec<ListObject>) {
-    for object in objects {
-        let mod_time = DateTime::parse_from_rfc3339(&object.last_modified).unwrap();
-        println!("{:30}  {}", mod_time, object.key);
-    }
-}
-
-async fn get_prefixes(object_access: &ObjectAccess, prefix: &str) -> Vec<String> {
-    let mut vec: Vec<String> = Vec::new();
-
-    for prefix in object_access.collect_prefixes(strip_prefix(prefix)).await {
-        vec.push(prefix);
-    }
-
-    vec
-}
-
-fn get_super_object(objects: &Vec<ListObject>) -> String {
-    let mut super_object: String = "-".to_string();
-
-    for object in objects {
-        if object.key.ends_with("/super") {
-            super_object = object.key.clone();
-            break;
-        }
-    }
-
-    super_object
-}
-
-fn get_super_timestamp(objects: &Vec<ListObject>) -> String {
-    let mut mod_time: String = "-".to_string();
-
-    for object in objects {
-        if object.key.ends_with("/super") {
-            mod_time = object.last_modified.clone();
-            break;
-        }
-    }
-
-    mod_time
-}
-
-async fn decode_super(object_access: &ObjectAccess, super_object: &str, guid: PoolGUID) -> String {
-    let pool: String;
-    match Pool::get_config(&object_access, guid).await {
-        Ok(pool_config) => {
-            let name = pool_config.lookup_string("name").unwrap();
-            let hostname = pool_config.lookup_string("hostname").unwrap();
-            pool = format!("guid:{:?} name:{:?} host:{:?}", guid, name, hostname);
-        }
-        Err(_e) => {
-            /*
-             * XXX Pool::get_config() only works for pools under the AWS_PREFIX because it assumes the
-             * path to the "super" object.
-             */
-            pool = if AWS_PREFIX.len() == 0 && !super_object.starts_with("zfs/") {
-                format!("guid:{:?} (pool inside an alt AWS_PREFIX).", guid)
-            } else {
-                format!("guid:{:?} unknown format.", guid)
-            };
-        }
-    }
-
-    format!("{}\n\tsuper:{}", pool, super_object)
-}
-
-async fn get_pool_prefixes(object_access: &ObjectAccess) -> Vec<String> {
-    let mut vec: Vec<String> = Vec::new();
-    let prefix_list = get_prefixes(&object_access, "").await;
-    println!("prefix_list {:?}", prefix_list);
-
-    for prefix in prefix_list {
-        if prefix.eq("zfs/") || prefix.ends_with("/zfs/") {
-            vec.push(prefix);
-        } else if prefix.ne("/") {
-            vec.push(format!("{}{}", prefix, "zfs/"));
-        }
-    }
-
-    vec
-}
-
-enum PoolProcessOp {
-    ListSuperOnly,
-    ListAllObjects,
-    DeletePool,
-}
-
-impl PoolProcessOp {
-    fn is_delete(&self) -> bool {
-        match self {
-            PoolProcessOp::ListAllObjects => false,
-            PoolProcessOp::ListSuperOnly => false,
-            PoolProcessOp::DeletePool => true,
-        }
-    }
-
-    fn is_list_all_objects(&self) -> bool {
-        match self {
-            PoolProcessOp::ListAllObjects => true,
-            PoolProcessOp::ListSuperOnly => false,
-            _ => false,
-        }
-    }
-}
-
-/*
- * Common routine for deleting and listing pools and objects in a pool.
- * all_objects: if false only "super" objects are listed; else all objects are listed.
- * destroy: if true, instead of listing, the pool objects are destroyed.
- * min_age_days: minimum age for destroying a pool.
- */
-async fn find_and_process_pools(
-    op: PoolProcessOp,
-    min_age_days: i64,
-) -> Result<(), Box<dyn Error>> {
-    let object_access = get_object_access();
+async fn find_old_pools(min_age: Duration) -> Vec<String> {
+    let object_access = &OBJECT_ACCESS;
 
     println!("Looking for pools...");
-    for pool_prefix in get_pool_prefixes(&object_access).await {
-        println!("Looking for pools UNDER {}...", pool_prefix);
 
-        for prefix in get_prefixes(&object_access, &pool_prefix).await {
-            let split: Vec<&str> = prefix.rsplitn(3, '/').collect();
-            let guid_str: &str = split[1];
-            if let Ok(guid64) = str::parse::<u64>(guid_str) {
-                let guid = PoolGUID(guid64);
+    let mut pool_keys = object_access.collect_prefixes("zfs/").await;
 
-                // Get only super from the pool.
-                let objects = list_objects(&object_access, &prefix, false).await;
-                let timestamp = get_super_timestamp(&objects);
-                let super_object = get_super_object(&objects);
-                println!(
-                    "\n{:30} {}",
-                    timestamp,
-                    decode_super(&object_access, super_object.as_str(), guid).await,
-                );
-
-                if op.is_delete() {
-                    if !has_expired(timestamp.as_str(), min_age_days) {
-                        println!(
-                            "Skipping  pool deletion as it is not {} days old.",
-                            min_age_days
-                        );
-                        continue;
-                    }
-
-                    let all_objects = list_objects(&object_access, &prefix, true).await;
-                    let mut keys: Vec<String> = Vec::new();
-
-                    for object in all_objects {
-                        keys.push(strip_prefix(object.key.as_str()).to_string());
-                    }
-                    assert!(keys.len() > 0);
-                    println!("Deleting {} objects in the pool.", keys.len());
-
-                    /*
-                     * XXX: Is there a better way than orming an array of chunks and reconstrucing a vector for each
-                     * chunk?
-                     */
-                    for chunk in keys.chunks(AWS_DELETION_BATCH_SIZE) {
-                        object_access.delete_objects(chunk.to_vec()).await;
-                    }
-                } else if op.is_list_all_objects() {
-                    // Lookup all objects in the pool.
-                    let all_objects = list_objects(&object_access, &prefix, true).await;
-                    print_list_objects(all_objects);
-                }
-            }
+    let aws_prefix: &String = &AWS_PREFIX;
+    if aws_prefix == "" {
+        for prefix in object_access.collect_prefixes("").await {
+            println!("Looking for pools UNDER {}...", prefix);
+            pool_keys.append(
+                &mut object_access
+                    .collect_prefixes(&format!("{}zfs/", prefix))
+                    .await,
+            );
         }
     }
 
+    let mut vec = Vec::new();
+    for pool_key in pool_keys {
+        match object_access
+            .head_object(&format!("{}/super", pool_key))
+            .await
+        {
+            Some(output) => {
+                print_super(&object_access, &pool_key, &output).await;
+                if has_expired(output.last_modified.as_ref().unwrap(), min_age) {
+                    vec.push(pool_key);
+                } else {
+                    println!("Skipping pool as it is not {:?} old.", min_age);
+                }
+            }
+            None => {
+                println!("didn't find super object for {}", pool_key);
+            }
+        }
+    }
+    vec
+}
+
+async fn do_list_pools(list_all_objects: bool) -> Result<(), Box<dyn Error>> {
+    let object_access = &OBJECT_ACCESS;
+    for prefix in find_old_pools(Duration::from_secs(0)).await {
+        // Lookup all objects in the pool.
+        if list_all_objects {
+            for object in object_access.collect_all_objects(&prefix).await {
+                println!("{}", object);
+            }
+        }
+    }
     Ok(())
 }
 
-async fn list_pools(op: PoolProcessOp) -> Result<(), Box<dyn Error>> {
-    find_and_process_pools(op, 0).await
-}
+async fn do_destroy_old_pools(args: &Vec<String>) -> Result<(), Box<dyn Error>> {
+    let min_age = if args.len() > 2 {
+        Duration::from_secs(args[2].parse::<u64>().unwrap() * 60 * 60 * 24)
+    } else {
+        panic!("Usage: zoa_test destroy_old_pools <number-of-days>");
+    };
 
-async fn destroy_old_pools(args: &Vec<String>) -> Result<(), Box<dyn Error>> {
-    let min_age_days: i64 = get_int_param(args, 2, -1);
-    assert!(min_age_days >= 0, "Usage: zoa_test destroy_old_pools <number-of-days>");
+    let object_access = &OBJECT_ACCESS;
 
-    find_and_process_pools(PoolProcessOp::DeletePool, min_age_days).await
+    for prefix in find_old_pools(min_age).await {
+        for chunk in object_access
+            .collect_all_objects(&prefix)
+            .await
+            .chunks(AWS_DELETION_BATCH_SIZE)
+        {
+            object_access.delete_objects(chunk).await;
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -713,11 +437,9 @@ async fn main() {
     match &args[1][..] {
         "s3" => do_s3(&bucket).await.unwrap(),
         "s3_rusoto" => do_s3_rusoto().await.unwrap(),
-        "list" => do_list(&bucket, &args).await.unwrap(),
-        "delete" => do_delete(&bucket, &args).await.unwrap(),
-        "list_pools" => list_pools(PoolProcessOp::ListSuperOnly).await.unwrap(),
-        "list_pool_objects" => list_pools(PoolProcessOp::ListAllObjects).await.unwrap(),
-        "destroy_old_pools" => destroy_old_pools(&args).await.unwrap(),
+        "list_pools" => do_list_pools(false).await.unwrap(),
+        "list_pool_objects" => do_list_pools(true).await.unwrap(),
+        "destroy_old_pools" => do_destroy_old_pools(&args).await.unwrap(),
         "create" => do_create().await.unwrap(),
         "write" => do_write().await.unwrap(),
         "read" => do_read().await.unwrap(),
