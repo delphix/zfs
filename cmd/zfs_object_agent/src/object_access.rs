@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use async_std::future;
 use async_stream::stream;
 use bytes::Bytes;
 use core::time::Duration;
@@ -15,7 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::{collections::HashMap, fmt::Display};
 use std::{env, error::Error};
-use tokio::sync::watch;
+use tokio::{sync::watch, time::error::Elapsed};
 
 struct ObjectCache {
     // XXX cache key should include Bucket
@@ -53,8 +52,8 @@ enum OAError<E>
 where
     E: core::fmt::Debug + core::fmt::Display + std::error::Error,
 {
-    TimeoutError { e: future::TimeoutError },
-    RequestError { e: E },
+    TimeoutError(Elapsed),
+    RequestError(E),
 }
 
 impl<E> Display for OAError<E>
@@ -63,8 +62,8 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OAError::TimeoutError { e } => e.fmt(f),
-            OAError::RequestError { e } => std::fmt::Display::fmt(&e, f),
+            OAError::TimeoutError(e) => e.fmt(f),
+            OAError::RequestError(e) => std::fmt::Display::fmt(&e, f),
         }
     }
 }
@@ -103,24 +102,25 @@ where
     result
 }
 
-async fn retry<F, O, E>(msg: &str, d: Option<Duration>, f: impl Fn() -> F) -> Result<O, OAError<E>>
+async fn retry<F, O, E>(
+    msg: &str,
+    timeout_opt: Option<Duration>,
+    f: impl Fn() -> F,
+) -> Result<O, OAError<E>>
 where
     E: core::fmt::Debug + core::fmt::Display + std::error::Error,
     F: Future<Output = (bool, Result<O, E>)>,
 {
     debug!("{}: begin", msg);
     let begin = Instant::now();
-    let result = match d {
-        Some(timeout) => match future::timeout(timeout, retry_impl(msg, f)).await {
-            Err(e) => Err(OAError::TimeoutError { e: e }),
-            Ok(res2) => match res2 {
-                Ok(o) => Ok(o),
-                Err(e) => Err(OAError::RequestError { e: e }),
-            },
+    let result = match timeout_opt {
+        Some(timeout) => match tokio::time::timeout(timeout, retry_impl(msg, f)).await {
+            Err(e) => Err(OAError::TimeoutError(e)),
+            Ok(res2) => res2.map_err(|e| OAError::RequestError(e)),
         },
         None => retry_impl(msg, f)
             .await
-            .map_err(|e| OAError::RequestError { e: e }),
+            .map_err(|e| OAError::RequestError(e)),
     };
     let elapsed = begin.elapsed();
     debug!("{}: returned in {}ms", msg, elapsed.as_millis());
