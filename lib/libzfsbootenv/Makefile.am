@@ -31,7 +31,5 @@ endif
 
 libzfsbootenv_la_LDFLAGS += -version-info 1:0:0
 
-include $(top_srcdir)/config/CppCheck.am
-
 # Library ABI
 EXTRA_DIST = libzfsbootenv.abi libzfsbootenv.suppr
