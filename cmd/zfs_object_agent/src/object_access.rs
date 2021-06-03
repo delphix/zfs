@@ -50,7 +50,7 @@ pub fn prefixed(key: &str) -> String {
 
 #[derive(Debug)]
 #[allow(clippy::upper_case_acronyms)]
-enum OAError<E>
+pub enum OAError<E>
 where
     E: core::fmt::Debug + core::fmt::Display + std::error::Error,
 {
@@ -188,7 +188,7 @@ impl ObjectAccess {
         self.client
     }
 
-    async fn get_object_impl(&self, key: &str, timeout: Option<Duration>) -> Result<Vec<u8>> {
+    pub async fn get_object_impl(&self, key: &str, timeout: Option<Duration>) -> Result<Vec<u8>> {
         let msg = format!("get {}", prefixed(key));
         let output = retry(&msg, timeout, || async {
             let req = GetObjectRequest {
@@ -401,12 +401,17 @@ impl ObjectAccess {
         self.head_object(key).await.is_some()
     }
 
-    async fn put_object_impl(&self, key: &str, data: Vec<u8>) {
+    async fn put_object_impl(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+        timeout: Option<Duration>,
+    ) -> Result<PutObjectOutput, OAError<RusotoError<PutObjectError>>> {
         let len = data.len();
         let bytes = Bytes::from(data);
         retry(
             &format!("put {} ({} bytes)", prefixed(key), len),
-            None,
+            timeout,
             || async {
                 let my_bytes = bytes.clone();
                 let stream = ByteStream::new_with_size(stream! { yield Ok(my_bytes)}, len);
@@ -421,25 +426,37 @@ impl ObjectAccess {
             },
         )
         .await
-        .unwrap();
+    }
+
+    fn invalidate_cache(key: &str, data: &Vec<u8>) {
+        // invalidate cache.  don't hold lock across .await below
+        let mut c = CACHE.lock().unwrap();
+        let mykey = key.to_string();
+        if c.cache.contains(&mykey) {
+            debug!("found {} in cache when putting - invalidating", key);
+            // XXX unfortuate to be copying; this happens every time when
+            // freeing (we get/modify/put the object).  Maybe when freeing,
+            // the get() should not add to the cache since it's probably
+            // just polluting.
+            c.cache.put(mykey, Arc::new(data.clone()));
+        }
     }
 
     pub async fn put_object(&self, key: &str, data: Vec<u8>) {
-        {
-            // invalidate cache.  don't hold lock across .await below
-            let mut c = CACHE.lock().unwrap();
-            let mykey = key.to_string();
-            if c.cache.contains(&mykey) {
-                debug!("found {} in cache when putting - invalidating", key);
-                // XXX unfortuate to be copying; this happens every time when
-                // freeing (we get/modify/put the object).  Maybe when freeing,
-                // the get() should not add to the cache since it's probably
-                // just polluting.
-                c.cache.put(mykey, Arc::new(data.clone()));
-            }
-        }
+        Self::invalidate_cache(key, &data);
 
-        self.put_object_impl(key, data).await;
+        self.put_object_impl(key, data, None).await.unwrap();
+    }
+
+    pub async fn put_object_timed(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+        timeout: Option<Duration>,
+    ) -> Result<PutObjectOutput, OAError<RusotoError<PutObjectError>>> {
+        Self::invalidate_cache(key, &data);
+
+        self.put_object_impl(key, data, timeout).await
     }
 
     pub async fn delete_object(&self, key: &str) {

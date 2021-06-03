@@ -1,7 +1,9 @@
-use crate::base_types::*;
 use crate::object_access::ObjectAccess;
 use crate::pool::*;
 use crate::zettacache::ZettaCache;
+use crate::{base_types::*, object_access::OAError};
+use anyhow::Context;
+use lazy_static::lazy_static;
 use log::*;
 use nvpair::{NvData, NvEncoding, NvList, NvListRef};
 use rusoto_s3::S3;
@@ -9,11 +11,123 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::{cmp::max, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use serde::{Deserialize, Serialize};
+use std::{
+    cmp::max,
+    collections::HashMap,
+    ffi::CString,
+    fs::File,
+    io::{Read, Write},
+    net::{IpAddr, Ipv4Addr},
+    path::Path,
+    sync::Arc,
+    time::{Instant, SystemTime},
+};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixListener;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    time::sleep,
+};
+use uuid::Uuid;
+
+const LEASE_DURATION: Duration = Duration::from_secs(10);
+const CLAIM_DURATION: Duration = Duration::from_secs(2);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+enum OwnResult {
+    SUCCESS,
+    FAILURE(HeartbeatImpl),
+    RETRY,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+struct PoolOwnerImpl {
+    id: PoolGUID,
+    owner: Uuid,
+}
+
+impl PoolOwnerImpl {
+    fn key(id: PoolGUID) -> String {
+        format!("zfs/{}/owner", id.to_string())
+    }
+
+    async fn get(object_access: &ObjectAccess, id: PoolGUID) -> anyhow::Result<Self> {
+        let key = Self::key(id);
+        let buf = object_access.get_object_impl(&key, None).await?;
+        let this: Self = serde_json::from_slice(&buf)
+            .context(format!("Failed to decode contents of {}", key))?;
+        debug!("got {:#?}", this);
+        assert_eq!(this.id, id);
+        Ok(this)
+    }
+
+    async fn put_timeout(
+        &self,
+        object_access: &ObjectAccess,
+        timeout: Option<Duration>,
+    ) -> Result<
+        rusoto_s3::PutObjectOutput,
+        OAError<rusoto_core::RusotoError<rusoto_s3::PutObjectError>>,
+    > {
+        debug!("putting {:#?}", self);
+        let buf = serde_json::to_vec(&self).unwrap();
+        object_access
+            .put_object_timed(&Self::key(self.id), buf, timeout)
+            .await
+    }
+
+    async fn delete(object_access: &ObjectAccess, id: PoolGUID) {
+        object_access.delete_object(&Self::key(id)).await;
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+struct HeartbeatImpl {
+    timestamp: SystemTime,
+    hostname: String,
+    addr: IpAddr,
+    lease_duration: Duration,
+    id: Uuid,
+}
+
+impl HeartbeatImpl {
+    fn key(id: Uuid) -> String {
+        format!("zfs/agents/{}", id.to_string())
+    }
+
+    async fn get(object_access: &ObjectAccess, id: Uuid) -> anyhow::Result<Self> {
+        let key = Self::key(id);
+        let buf = object_access.get_object_impl(&key, None).await?;
+        let this: Self = serde_json::from_slice(&buf)
+            .context(format!("Failed to decode contents of {}", key))?;
+        debug!("got {:#?}", this);
+        assert_eq!(this.id, id);
+        Ok(this)
+    }
+
+    async fn put_timeout(
+        &self,
+        object_access: &ObjectAccess,
+        timeout: Option<Duration>,
+    ) -> Result<
+        rusoto_s3::PutObjectOutput,
+        OAError<rusoto_core::RusotoError<rusoto_s3::PutObjectError>>,
+    > {
+        debug!("putting {:#?}", self);
+        let buf = serde_json::to_vec(&self).unwrap();
+        object_access
+            .put_object_timed(&Self::key(self.id), buf, timeout)
+            .await
+    }
+
+    async fn delete(object_access: &ObjectAccess, id: Uuid) {
+        object_access.delete_object(&Self::key(id)).await;
+    }
+}
 
 pub struct Server {
     input: OwnedReadHalf,
@@ -23,9 +137,86 @@ pub struct Server {
     num_outstanding_writes: Arc<AtomicUsize>,
     // XXX make Option?
     max_blockid: BlockId, // Maximum blockID that we've received a write for
+    readonly: bool,
 }
 
 impl Server {
+    fn suspend_all_pools(cause: &str) {
+        error!("Suspending pools due to {}", cause);
+        todo!("Clean pool suspending not implemented");
+    }
+
+    fn start_heartbeat(
+        heartbeat_container: &'static Arc<
+            std::sync::Mutex<HashMap<(CString, CString, CString), u64>>,
+        >,
+        nvl: &NvList,
+        id: Uuid,
+    ) -> (CString, CString, CString) {
+        let endpoint = nvl.lookup_string("endpoint").unwrap();
+        let region = nvl.lookup_string("region").unwrap();
+        let bucket = nvl.lookup_string("bucket").unwrap();
+        let key = (endpoint, region, bucket);
+        {
+            let mut heartbeats = heartbeat_container.lock().unwrap();
+
+            let value = heartbeats.get(&key);
+            let existing = value.is_some();
+            let i = *value.unwrap_or(&0);
+            heartbeats.insert(key.clone(), i + 1);
+            if existing {
+                debug!("{} existing references found", i);
+                return key;
+            }
+        }
+        let object_access = Self::get_object_access(nvl);
+        let key_copy = key.clone();
+        tokio::spawn(async move {
+            let mut last_heartbeat = HeartbeatImpl::get(&object_access, id)
+                .await
+                .map_or(SystemTime::UNIX_EPOCH, |x| x.timestamp);
+            info!("Starting heartbeat with id {}", id);
+            loop {
+                let count = {
+                    let heartbeats = heartbeat_container.lock().unwrap();
+                    *heartbeats.get(&key_copy).unwrap()
+                };
+                if count == 0 as u64 {
+                    info!("Stopping heartbeat with id {}", id);
+                    {
+                        let mut heartbeats = heartbeat_container.lock().unwrap();
+                        heartbeats.remove(&key_copy);
+                    }
+                    HeartbeatImpl::delete(&object_access, id).await;
+                    return;
+                }
+                let heartbeat = HeartbeatImpl {
+                    timestamp: SystemTime::now(),
+                    hostname: hostname::get().unwrap().into_string().unwrap(),
+                    addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), // test
+                    lease_duration: LEASE_DURATION,
+                    id,
+                };
+                let result = heartbeat
+                    .put_timeout(&object_access, Some(Duration::from_secs(2)))
+                    .await;
+                if last_heartbeat != SystemTime::UNIX_EPOCH
+                    && SystemTime::now()
+                        .duration_since(last_heartbeat)
+                        .map_or(false, |dur| dur > LEASE_DURATION)
+                {
+                    Self::suspend_all_pools("lease timeout");
+                    break;
+                }
+                if let Ok(_) = result {
+                    last_heartbeat = heartbeat.timestamp;
+                }
+                sleep(HEARTBEAT_INTERVAL).await;
+            }
+        });
+        key
+    }
+
     async fn get_next_request(pipe: &mut OwnedReadHalf) -> tokio::io::Result<NvList> {
         // XXX kernel sends this as host byte order
         let len64 = pipe.read_u64_le().await?;
@@ -53,6 +244,7 @@ impl Server {
             pool: None,
             num_outstanding_writes: Arc::new(AtomicUsize::new(0)),
             max_blockid: BlockId(0),
+            readonly: true,
         };
         tokio::spawn(async move {
             loop {
@@ -77,7 +269,12 @@ impl Server {
         });
     }
 
-    pub fn start(connection: UnixStream, cache: Option<ZettaCache>) {
+    pub fn start(
+        connection: UnixStream,
+        cache: Option<ZettaCache>,
+        id: Uuid,
+        mut heartbeats: &'static Arc<std::sync::Mutex<HashMap<(CString, CString, CString), u64>>>,
+    ) {
         let (r, w) = connection.into_split();
         let mut server = Server {
             input: r,
@@ -85,8 +282,10 @@ impl Server {
             pool: None,
             num_outstanding_writes: Arc::new(AtomicUsize::new(0)),
             max_blockid: BlockId(0),
+            readonly: true,
         };
         tokio::spawn(async move {
+            let mut heartbeat_key = None;
             loop {
                 let nvl = match tokio::time::timeout(
                     Duration::from_millis(100),
@@ -127,6 +326,8 @@ impl Server {
                         let guid = PoolGuid(nvl.lookup_uint64("GUID").unwrap());
                         let name = nvl.lookup_string("name").unwrap();
                         let object_access = Self::get_object_access(nvl.as_ref());
+                        heartbeat_key = Some(Self::start_heartbeat(heartbeats, &nvl, id));
+
                         server
                             .create_pool(&object_access, guid, name.to_str().unwrap())
                             .await;
@@ -136,8 +337,16 @@ impl Server {
                         info!("got request: {:?}", nvl);
                         let guid = PoolGuid(nvl.lookup_uint64("GUID").unwrap());
                         let object_access = Self::get_object_access(nvl.as_ref());
+                        let readonly = nvl.lookup("readonly").is_ok();
+                        heartbeat_key = Some(Self::start_heartbeat(&mut heartbeats, &nvl, id));
                         server
-                            .open_pool(&object_access, guid, cache.as_ref().cloned())
+                            .open_pool(
+                                &object_access,
+                                guid,
+                                id,
+                                readonly,
+                                cache.as_ref().cloned()),
+                            )
                             .await;
                     }
                     "begin txg" => {
@@ -201,6 +410,16 @@ impl Server {
                         let id = nvl.lookup_uint64("request_id").unwrap();
                         let token = nvl.lookup_uint64("token").unwrap();
                         server.read_block(block, id, token);
+                    }
+                    "exit agent" => {
+                        info!("Receiving agent shutdown request");
+                        server.close_pool().await;
+                        if let Some(key) = heartbeat_key {
+                            let mut map = heartbeats.lock().unwrap();
+                            let val = map.get_mut(&key).unwrap();
+                            *val = *val - 1;
+                        }
+                        return;
                     }
                     other => {
                         panic!("bad type {:?} in request {:?}", other, nvl);
@@ -295,6 +514,108 @@ impl Server {
         Self::send_response(&self.output, resp).await;
     }
 
+    async fn claim_pool(
+        &self,
+        object_access: &ObjectAccess,
+        guid: PoolGUID,
+        id: Uuid,
+    ) -> OwnResult {
+        let start = Instant::now();
+        let owner_res = PoolOwnerImpl::get(object_access, guid).await;
+        let mut duration = Instant::now().duration_since(start);
+        if let Ok(owner) = owner_res {
+            info!("Owner found: {:?}", owner);
+            let heartbeat_res = HeartbeatImpl::get(object_access, owner.owner).await;
+            duration = Instant::now().duration_since(start);
+            if let Ok(heartbeat) = heartbeat_res {
+                info!("Heartbeat found: {:?}", heartbeat);
+                if owner.owner == id {
+                    info!("Self heartbeat found");
+                    return OwnResult::SUCCESS;
+                }
+                /*
+                 * We do this twice, because in the normal case we'll find an updated heartbeat within
+                 * a couple seconds. If the case where there are issues, we wait for the full duration.
+                 */
+                let short_duration = HEARTBEAT_INTERVAL.checked_mul(2).unwrap();
+                let long_duration = LEASE_DURATION
+                    .checked_mul(2)
+                    .unwrap()
+                    .checked_sub(short_duration)
+                    .unwrap();
+                sleep(short_duration).await;
+                let new_heartbeat_res = HeartbeatImpl::get(object_access, owner.owner).await;
+                if let Ok(new_heartbeat) = new_heartbeat_res {
+                    if heartbeat.timestamp != new_heartbeat.timestamp {
+                        return OwnResult::FAILURE(new_heartbeat);
+                    }
+                }
+                sleep(long_duration).await;
+                let new_heartbeat_res = HeartbeatImpl::get(object_access, owner.owner).await;
+                if let Ok(new_heartbeat) = new_heartbeat_res {
+                    if heartbeat.timestamp != new_heartbeat.timestamp {
+                        return OwnResult::FAILURE(new_heartbeat);
+                    }
+                }
+                let time = Instant::now();
+                let new_owner_res = PoolOwnerImpl::get(object_access, guid).await;
+                if let Ok(new_owner) = new_owner_res {
+                    if new_owner.owner != owner.owner {
+                        return OwnResult::FAILURE(
+                            HeartbeatImpl::get(object_access, new_owner.owner)
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                }
+                duration = Instant::now().duration_since(time);
+            }
+        }
+
+        if duration > CLAIM_DURATION {
+            return OwnResult::RETRY;
+        }
+
+        let owner = PoolOwnerImpl {
+            id: guid,
+            owner: id,
+        };
+
+        let put_result = owner
+            .put_timeout(
+                object_access,
+                Some(CLAIM_DURATION.checked_sub(duration).unwrap()),
+            )
+            .await;
+
+        if let Err(OAError::TimeoutError(_)) = put_result {
+            return OwnResult::RETRY;
+        }
+        sleep(CLAIM_DURATION.checked_mul(3).unwrap()).await;
+
+        let final_owner_res = PoolOwnerImpl::get(object_access, guid).await;
+        if let Ok(final_owner) = final_owner_res {
+            if final_owner.owner != id {
+                return OwnResult::FAILURE(
+                    HeartbeatImpl::get(object_access, final_owner.owner)
+                        .await
+                        .unwrap_or(HeartbeatImpl {
+                            timestamp: SystemTime::now(),
+                            hostname: "unknown".to_string(),
+                            addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                            lease_duration: LEASE_DURATION,
+                            id: final_owner.owner,
+                        }),
+                );
+            }
+        }
+        return OwnResult::SUCCESS;
+    }
+
+    async fn unclaim_pool(&self, object_access: &ObjectAccess, guid: PoolGUID) {
+        PoolOwnerImpl::delete(object_access, guid).await;
+    }
+
     async fn create_pool(&mut self, object_access: &ObjectAccess, guid: PoolGuid, name: &str) {
         Pool::create(object_access, name, guid).await;
         let mut nvl = NvList::new_unique_names();
@@ -309,10 +630,32 @@ impl Server {
         &mut self,
         object_access: &ObjectAccess,
         guid: PoolGuid,
+        id: Uuid,
+        readonly: bool,
         cache: Option<ZettaCache>,
     ) {
         let (pool, phys_opt, next_block) = Pool::open(object_access, guid, cache).await;
+        while readonly == false {
+            match self.claim_pool(object_access, guid, id).await {
+                OwnResult::SUCCESS => {
+                    break;
+                }
+                OwnResult::FAILURE(heartbeat) => {
+                    let mut nvl = NvList::new_unique_names();
+                    nvl.insert("Type", "pool open failed").unwrap();
+                    nvl.insert("cause", "MMP").unwrap();
+                    nvl.insert("hostname", heartbeat.hostname.as_str()).unwrap();
+                    debug!("sending response: {:?}", nvl);
+                    Self::send_response(&self.output, nvl).await;
+                    return;
+                }
+                OwnResult::RETRY => {
+                    continue;
+                }
+            }
+        }
         self.pool = Some(Arc::new(pool));
+        self.readonly = readonly;
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "pool open done").unwrap();
         nvl.insert("GUID", &guid.0).unwrap();
@@ -427,6 +770,15 @@ impl Server {
             Self::send_response(&output, nvl).await;
         });
     }
+
+    async fn close_pool(&mut self) {
+        if self.pool.is_none() || self.readonly {
+            return;
+        }
+        let pool_shared_state = &self.pool.as_ref().unwrap().state.shared_state;
+        self.unclaim_pool(&pool_shared_state.object_access, pool_shared_state.guid)
+            .await;
+    }
 }
 
 fn create_listener(path: String) -> UnixListener {
@@ -435,9 +787,30 @@ fn create_listener(path: String) -> UnixListener {
     UnixListener::bind(&path).unwrap()
 }
 
+lazy_static! {
+    static ref HEARTBEAT: Arc<std::sync::Mutex<HashMap<(CString, CString, CString), u64>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+}
+
 pub async fn do_server(socket_dir: &str, cache_path: Option<&str>) {
     let ksocket_name = format!("{}/zfs_kernel_socket", socket_dir);
     let usocket_name = format!("{}/zfs_user_socket", socket_dir);
+    let id_path_str = format!("{}/zfs_agent_id", socket_dir);
+    let id_path = Path::new(&id_path_str);
+
+    let id = match File::open(id_path) {
+        Ok(mut f) => {
+            let mut bytes = [0; 16];
+            assert!(f.read(&mut bytes).unwrap() == 16);
+            Uuid::from_bytes(bytes)
+        }
+        Err(_) => {
+            let mut file = File::create(id_path).unwrap();
+            let uuid = Uuid::new_v4();
+            file.write_all(uuid.as_bytes()).unwrap();
+            uuid
+        }
+    };
 
     let klistener = create_listener(ksocket_name.clone());
     let ulistener = create_listener(usocket_name.clone());
@@ -465,7 +838,12 @@ pub async fn do_server(socket_dir: &str, cache_path: Option<&str>) {
             match klistener.accept().await {
                 Ok((socket, _)) => {
                     info!("accepted connection on {}", ksocket_name);
-                    self::Server::start(socket, cache.as_ref().cloned());
+                    self::Server::start(
+                        socket,
+                        cache.as_ref().cloned(),
+                        id,
+                        &HEARTBEAT,
+                    );
                 }
                 Err(e) => {
                     warn!("accept() on {} failed: {}", ksocket_name, e);
