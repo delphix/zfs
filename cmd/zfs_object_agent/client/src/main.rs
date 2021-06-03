@@ -307,19 +307,17 @@ fn do_nvpair() {
     write_file_as_bytes("./zpool.cache.rust", &newbuf);
 }
 
-fn has_expired(last_modified: &str, min_age: Duration) -> bool {
-    let mod_time = DateTime::parse_from_rfc2822(last_modified).unwrap();
-    let age = Local::now().signed_duration_since(mod_time);
-
+fn has_expired(mod_time: &DateTime<FixedOffset>, min_age: Duration) -> bool {
+    let age = Local::now().signed_duration_since(*mod_time);
     min_age == Duration::from_secs(0) || age > chrono::Duration::from_std(min_age).unwrap()
 }
 
-async fn print_super(object_access: &ObjectAccess, pool_key: &str, output: &HeadObjectOutput) {
-    print!(
-        "{:30} {:40}",
-        DateTime::parse_from_rfc2822(output.last_modified.as_ref().unwrap()).unwrap(),
-        pool_key
-    );
+async fn print_super(
+    object_access: &ObjectAccess,
+    pool_key: &str,
+    mod_time: &DateTime<FixedOffset>,
+) {
+    print!("{:30} {:40}", mod_time, pool_key);
     let split: Vec<&str> = pool_key.rsplitn(3, '/').collect();
     let guid_str: &str = split[1];
     if let Ok(guid64) = str::parse::<u64>(guid_str) {
@@ -379,9 +377,11 @@ async fn find_old_pools(min_age: Duration) -> Vec<String> {
             .await
         {
             Some(output) => {
-                print_super(&object_access, &pool_key, &output).await;
-                if has_expired(output.last_modified.as_ref().unwrap(), min_age) {
-                    vec.push(pool_key);
+                let mod_time =
+                    DateTime::parse_from_rfc2822(output.last_modified.as_ref().unwrap()).unwrap();
+                print_super(&object_access, &pool_key, &mod_time).await;
+                if has_expired(&mod_time, min_age) {
+                    vec.push(strip_prefix(&pool_key).to_string());
                 } else {
                     println!(
                         "Skipping pool as it is not {} days old.",
@@ -399,13 +399,10 @@ async fn find_old_pools(min_age: Duration) -> Vec<String> {
 
 async fn do_list_pools(list_all_objects: bool) -> Result<(), Box<dyn Error>> {
     let object_access = &OBJECT_ACCESS;
-    for prefix in find_old_pools(Duration::from_secs(0)).await {
+    for pool_keys in find_old_pools(Duration::from_secs(0)).await {
         // Lookup all objects in the pool.
         if list_all_objects {
-            for object in object_access
-                .collect_all_objects(strip_prefix(&prefix))
-                .await
-            {
+            for object in object_access.collect_all_objects(&pool_keys).await {
                 println!("    {}", object);
             }
         }
@@ -422,9 +419,9 @@ async fn do_destroy_old_pools(args: &Vec<String>) -> Result<(), Box<dyn Error>> 
 
     let object_access = &OBJECT_ACCESS;
 
-    for prefix in find_old_pools(min_age).await {
+    for pool_keys in find_old_pools(min_age).await {
         for chunk in object_access
-            .collect_all_objects(strip_prefix(&prefix))
+            .collect_all_objects(&pool_keys)
             .await
             .chunks(AWS_DELETION_BATCH_SIZE)
         {
