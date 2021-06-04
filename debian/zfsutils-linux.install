@@ -34,6 +34,7 @@ sbin/zpool
 sbin/zfs
 sbin/zfs_object_agent
 sbin/zoa_test
+cmd/zfs_object_agent/libzoa.so lib/
 usr/bin/zvol_wait
 usr/bin/zoa_chaos_monkey
 usr/sbin/arc_summary

@@ -1,10 +1,10 @@
-use libzoa::base_types::*;
 use nvpair::NvEncoding;
 use nvpair::NvList;
 use nvpair::NvListRef;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::task::JoinHandle;
+use zoa_common::base_types::*;
 
 pub struct Client {
     input: Option<OwnedReadHalf>,

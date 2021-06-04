@@ -78,10 +78,12 @@
 #include <sys/btree.h>
 #include <zfs_comutil.h>
 #include <sys/zstd/zstd.h>
-
 #include <libnvpair.h>
 #include <libzutil.h>
-
+#include <object_agent.h>
+#ifdef HAVE_LIBZOA
+#include <libzoa.h>
+#endif
 #include "zdb.h"
 
 #define	ZDB_COMPRESS_NAME(idx) ((idx) < ZIO_COMPRESS_FUNCTIONS ?	\
@@ -773,29 +775,30 @@ static void
 usage(void)
 {
 	(void) fprintf(stderr,
-	    "Usage:\t%s [-AbcdDFGhikLMPsvXy] [-e [-V] [-p <path> ...]] "
+	    "Usage:\t%1$s [-AbcdDFGhikLMPsvXy] [-e [-V] [-p <path> ...]] "
 	    "[-I <inflight I/Os>]\n"
 	    "\t\t[-o <var>=<value>]... [-t <txg>] [-U <cache>] [-x <dumpdir>]\n"
 	    "\t\t[<poolname>[/<dataset | objset id>] [<object | range> ...]]\n"
-	    "\t%s [-AdiPv] [-e [-V] [-p <path> ...]] [-U <cache>]\n"
+	    "\t%1$s [-AdiPv] [-e [-V] [-p <path> ...]] [-U <cache>]\n"
 	    "\t\t[<poolname>[/<dataset | objset id>] [<object | range> ...]\n"
-	    "\t%s [-AdiPv] [-e [-V] -a <endpoint> -g <region> -B <bucket> "
+#ifdef HAVE_LIBZOA
+	    "\t%1$s [-AdiPv] [-e [-V] -a <endpoint> -g <region> -B <bucket> "
 	    "-f <creds>]\n"
+#endif
 	    "\t\t[<poolname>[/<dataset | objset id>] [<object | range> ...]\n"
-	    "\t%s [-v] <bookmark>\n"
-	    "\t%s -C [-A] [-U <cache>]\n"
-	    "\t%s -l [-Aqu] <device>\n"
-	    "\t%s -m [-AFLPX] [-e [-V] [-p <path> ...]] [-t <txg>] "
+	    "\t%1$s [-v] <bookmark>\n"
+	    "\t%1$s -C [-A] [-U <cache>]\n"
+	    "\t%1$s -l [-Aqu] <device>\n"
+	    "\t%1$s -m [-AFLPX] [-e [-V] [-p <path> ...]] [-t <txg>] "
 	    "[-U <cache>]\n\t\t<poolname> [<vdev> [<metaslab> ...]]\n"
-	    "\t%s -O <dataset> <path>\n"
-	    "\t%s -r <dataset> <path> <destination>\n"
-	    "\t%s -R [-A] [-e [-V] [-p <path> ...]] [-U <cache>]\n"
+	    "\t%1$s -O <dataset> <path>\n"
+	    "\t%1$s -r <dataset> <path> <destination>\n"
+	    "\t%1$s -R [-A] [-e [-V] [-p <path> ...]] [-U <cache>]\n"
 	    "\t\t<poolname> <vdev>:<offset>:<size>[:<flags>]\n"
-	    "\t%s -E [-A] word0:word1:...:word15\n"
-	    "\t%s -S [-AP] [-e [-V] [-p <path> ...]] [-U <cache>] "
+	    "\t%1$s -E [-A] word0:word1:...:word15\n"
+	    "\t%1$s -S [-AP] [-e [-V] [-p <path> ...]] [-U <cache>] "
 	    "<poolname>\n\n",
-	    cmdname, cmdname, cmdname, cmdname, cmdname, cmdname, cmdname,
-	    cmdname, cmdname, cmdname, cmdname, cmdname);
+	    cmdname);
 
 	(void) fprintf(stderr, "    Dataset name must include at least one "
 	    "separator character '/' or '@'\n");
@@ -860,12 +863,14 @@ usage(void)
 	    "variable to an unsigned 32-bit integer\n");
 	(void) fprintf(stderr, "        -p <path> -- use one or more with "
 	    "-e to specify path to vdev dir\n");
+#ifdef HAVE_LIBZOA
 	(void) fprintf(stderr, "        -a <endpoint> -- use with "
 	    "-e to specify object-store endpoint\n");
 	(void) fprintf(stderr, "        -g <region> object-store region\n");
 	(void) fprintf(stderr, "        -B <bucket> object-store bucket\n");
 	(void) fprintf(stderr, "        -g <creds> object-store credential "
 	    "uri\n");
+#endif
 	(void) fprintf(stderr, "        -P print numbers in parseable form\n");
 	(void) fprintf(stderr, "        -q don't print label contents\n");
 	(void) fprintf(stderr, "        -t <txg> -- highest txg to use when "
@@ -8415,6 +8420,20 @@ get_objstore_credentials(void *hdl, char *credloc, char **creds)
 	return (0);
 }
 
+static void
+zoa_thread(void *arg)
+{
+#ifdef HAVE_LIBZOA
+	char ztest_sock_dir[] = "/tmp/ztest.sock.XXXXXX";
+	char *dir = mkdtemp(ztest_sock_dir);
+	ASSERT3S(dir, !=, NULL);
+	set_object_agent_sock_dir(ztest_sock_dir);
+	libzoa_init(ztest_sock_dir, "/tmp/zoa.log");
+#else
+	fatal(0, "libzoa support missing.");
+#endif
+}
+
 int
 main(int argc, char **argv)
 {
@@ -8550,6 +8569,7 @@ main(int argc, char **argv)
 				usage();
 			}
 			break;
+#ifdef HAVE_LIBZOA
 		case 'a':
 			endpoint = optarg;
 			objstore = 1;
@@ -8566,6 +8586,7 @@ main(int argc, char **argv)
 			region = optarg;
 			objstore = 1;
 			break;
+#endif
 		case 'v':
 			verbose++;
 			break;
@@ -8609,6 +8630,11 @@ main(int argc, char **argv)
 				objset_id = -1;
 			}
 		}
+	}
+
+	if (objstore) {
+		thread_create(NULL, 0, zoa_thread, NULL, 0, NULL,
+		    TS_RUN | TS_JOINABLE, defclsyspri);
 	}
 
 #if defined(_LP64)

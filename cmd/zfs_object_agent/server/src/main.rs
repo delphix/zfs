@@ -1,44 +1,6 @@
 use clap::Arg;
 use log::*;
-
-fn setup_logging(verbosity: u64, file_name: Option<&str>) {
-    let mut base_config = fern::Dispatch::new();
-
-    base_config = match verbosity {
-        0 => base_config.level(LevelFilter::Warn),
-        1 => base_config
-            .level(LevelFilter::Info)
-            .level_for("rusoto_core::request", LevelFilter::Info)
-            .level_for("want", LevelFilter::Debug),
-        2 => base_config
-            .level(LevelFilter::Debug)
-            .level_for("rusoto_core::request", LevelFilter::Info)
-            .level_for("want", LevelFilter::Debug),
-        3 => base_config
-            .level(LevelFilter::Trace)
-            .level_for("rusoto_core::request", LevelFilter::Info)
-            .level_for("want", LevelFilter::Debug),
-        _ => base_config.level(LevelFilter::Trace),
-    };
-
-    let mut config = fern::Dispatch::new().format(|out, message, record| {
-        let target = record.target();
-        let stripped_target = target.strip_prefix("libzoa").unwrap_or(target);
-        out.finish(format_args!(
-            "[{}][{}][{}] {}",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-            stripped_target,
-            record.level(),
-            message
-        ))
-    });
-    config = match file_name {
-        None => config.chain(std::io::stdout()),
-        Some(file_name) => config.chain(fern::log_file(file_name).unwrap()),
-    };
-
-    base_config.chain(config).apply().unwrap();
-}
+use zoa_common::init;
 
 fn main() {
     let matches = clap::App::new("ZFS Object Agent")
@@ -78,11 +40,11 @@ fn main() {
 
     let socket_dir = matches.value_of("socket-dir").unwrap();
 
-    setup_logging(
+    init::setup_logging(
         matches.occurrences_of("verbosity"),
         matches.value_of("output-file"),
     );
-    let x = matches.value_of("cache-file");
+    let cache_path = matches.value_of("cache-file");
 
     error!(
         "Starting ZFS Object Agent.  Local timezone is {}",
@@ -112,12 +74,5 @@ fn main() {
     // trace!() can be used indiscriminately.
     trace!("logging level TRACE enabled");
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_name("zoa")
-        .build()
-        .unwrap()
-        .block_on(async move {
-            libzoa::server::do_server(socket_dir, x).await;
-        });
+    init::start(socket_dir, cache_path);
 }
