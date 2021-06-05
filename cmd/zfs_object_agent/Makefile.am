@@ -1,5 +1,7 @@
 sbin_PROGRAMS = zfs_object_agent zoa_test
 
+bin_SCRIPTS = scripts/zoa_chaos_monkey
+
 zfs_object_agent_SOURCES = $(wildcard server/src/*.rs src/*.rs)
 
 zoa_test_SOURCES = $(wildcard client/src/*.rs src/*.rs)

@@ -7,6 +7,7 @@ lib/systemd/system/zfs.target
 lib/systemd/system/zfs-import.service
 lib/systemd/system/zfs-import.target
 lib/systemd/system/zfs-object-agent.service
+lib/systemd/system/zoa-chaos-monkey.service
 lib/systemd/system/zfs-volume-wait.service
 lib/systemd/system/zfs-volumes.target
 lib/systemd/system-preset/
@@ -34,6 +35,7 @@ sbin/zfs
 sbin/zfs_object_agent
 sbin/zoa_test
 usr/bin/zvol_wait
+usr/bin/zoa_chaos_monkey
 usr/sbin/arc_summary
 usr/sbin/arcstat
 usr/sbin/dbufstat
