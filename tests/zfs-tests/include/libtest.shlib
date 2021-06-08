@@ -280,11 +280,7 @@ function default_setup_noexit
 	log_note begin default_setup_noexit
 
 	if is_global_zone; then
-		if poolexists $TESTPOOL ; then
-			destroy_pool $TESTPOOL
-		fi
-		[[ -d /$TESTPOOL ]] && rm -rf /$TESTPOOL
-		log_must zpool create -f $TESTPOOL $disklist
+	    create_pool $TESTPOOL $disklist
 	else
 		reexport_pool
 	fi
@@ -661,10 +657,12 @@ function default_cleanup_noexit
 	[[ -d $TESTDIR ]] && \
 		log_must rm -rf $TESTDIR
 
-	disk1=${DISKS%% *}
-	if is_mpath_device $disk1; then
-		delete_partitions
-	fi
+	if [[ -z $ZTS_OBJECT_STORE ]]; then
+        disk1=${DISKS%% *}
+        if is_mpath_device $disk1; then
+            delete_partitions
+        fi
+    fi
 
 	rm -f $TEST_BASE_DIR/{err,out}
 }
@@ -1749,8 +1747,6 @@ function create_pool #pool devs_list
 {
 	typeset pool=${1%%/*}
 
-	shift
-
 	if [[ -z $pool ]]; then
 		log_note "Missing pool name."
 		return 1
@@ -1758,12 +1754,24 @@ function create_pool #pool devs_list
 
 	if poolexists $pool ; then
 		destroy_pool $pool
+		[[ -d /$pool ]] && rm -rf /$pool
 	fi
 
-	if is_global_zone ; then
-		[[ -d /$pool ]] && rm -rf /$pool
-		log_must zpool create -f $pool $@
+	if ! is_global_zone ; then
+		return 0
 	fi
+
+	if [[ -z $ZTS_OBJECT_STORE ]]; then
+		shift
+		log_must zpool create -f $pool $@
+	else
+		log_must zpool create \
+		    -o object-endpoint=$ZTS_OBJECT_ENDPOINT \
+		    -o object-region=$ZTS_REGION \
+		    -o object-credentials-location=file://$ZTS_CREDENTIALS_FILE \
+		    $pool s3 $ZTS_BUCKET_NAME
+	fi
+
 
 	return 0
 }

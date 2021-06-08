@@ -1,0 +1,41 @@
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# http://www.illumos.org/license/CDDL.
+#
+# This run file contains all of the common functional tests.  When
+# adding a new test consider also adding it to the sanity.run file
+# if the new test runs to completion in only a few seconds.
+#
+# Approximate run time: 4-5 hours
+#
+
+[DEFAULT]
+pre = setup
+quiet = False
+pre_user = root
+user = root
+timeout = 600
+post_user = root
+post = cleanup
+failsafe_user = root
+failsafe = callbacks/zfs_failsafe
+outputdir = /var/tmp/test_results
+tags = ['functional']
+
+[tests/functional/acl/off]
+tests = ['posixmode']
+tags = ['functional', 'acl']
+
+[tests/functional/acl/posix:Linux]
+tests = ['posix_001_pos', 'posix_002_pos', 'posix_003_pos', 'posix_004_pos']
+tags = ['functional', 'acl', 'posix']
+
+[tests/functional/acl/posix-sa:Linux]
+tests = ['posix_001_pos', 'posix_002_pos', 'posix_003_pos', 'posix_004_pos']
+tags = ['functional', 'acl', 'posix-sa']
