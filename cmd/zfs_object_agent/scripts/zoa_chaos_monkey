@@ -18,7 +18,7 @@ fatal() {
 }
 
 MAX="${MAX_KILL_DELAY:-300}"
-MIN="${MIN_KILL_DELAY:-30}"
+MIN="${MIN_KILL_DELAY:-0}"
 
 echo "Max kill delay: $MAX"
 echo "Min kill delay: $MIN"
