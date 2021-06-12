@@ -1,6 +1,7 @@
 use crate::base_types::*;
 use crate::object_access::ObjectAccess;
 use crate::pool::*;
+use crate::zettacache::ZettaCache;
 use log::*;
 use nvpair::{NvData, NvEncoding, NvList};
 use rusoto_s3::S3;
@@ -72,7 +73,7 @@ impl Server {
         });
     }
 
-    pub fn start(connection: UnixStream) {
+    pub fn start(connection: UnixStream, cache: Option<ZettaCache>) {
         let (r, w) = connection.into_split();
         let mut server = Server {
             input: r,
@@ -131,7 +132,13 @@ impl Server {
                         info!("got request: {:?}", nvl);
                         let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
                         let object_access = Self::get_object_access(nvl.as_ref());
-                        server.open_pool(&object_access, guid).await;
+                        server
+                            .open_pool(
+                                &object_access,
+                                guid,
+                                cache.as_ref().and_then(|arc| Some(arc.clone())),
+                            )
+                            .await;
                     }
                     "begin txg" => {
                         debug!("got request: {:?}", nvl);
@@ -308,8 +315,13 @@ impl Server {
     }
 
     /// initiate pool opening.  Responds when pool is open
-    async fn open_pool(&mut self, object_access: &ObjectAccess, guid: PoolGUID) {
-        let (pool, phys_opt, next_block) = Pool::open(object_access, guid).await;
+    async fn open_pool(
+        &mut self,
+        object_access: &ObjectAccess,
+        guid: PoolGUID,
+        cache: Option<ZettaCache>,
+    ) {
+        let (pool, phys_opt, next_block) = Pool::open(object_access, guid, cache).await;
         self.pool = Some(Arc::new(pool));
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "pool open done").unwrap();
@@ -450,7 +462,7 @@ fn create_listener(path: String) -> UnixListener {
     UnixListener::bind(&path).unwrap()
 }
 
-pub async fn do_server(socket_dir: &str) {
+pub async fn do_server(socket_dir: &str, cache_path: Option<&str>) {
     let ksocket_name = format!("{}/zfs_kernel_socket", socket_dir);
     let usocket_name = format!("{}/zfs_user_socket", socket_dir);
 
@@ -471,12 +483,16 @@ pub async fn do_server(socket_dir: &str) {
         }
     });
 
+    let cache = match cache_path {
+        Some(path) => Some(ZettaCache::open(path).await),
+        None => None,
+    };
     let kjh = tokio::spawn(async move {
         loop {
             match klistener.accept().await {
                 Ok((socket, _)) => {
                     info!("accepted connection on {}", ksocket_name);
-                    self::Server::start(socket);
+                    self::Server::start(socket, cache.as_ref().and_then(|x| Some(x.clone())));
                 }
                 Err(e) => {
                     warn!("accept() on {} failed: {}", ksocket_name, e);

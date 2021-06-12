@@ -2,6 +2,7 @@ use crate::base_types::*;
 use crate::object_access::ObjectAccess;
 use crate::object_based_log::*;
 use crate::object_block_map::ObjectBlockMap;
+use crate::zettacache::ZettaCache;
 use anyhow::{Context, Result};
 use core::future::Future;
 use futures::future;
@@ -281,6 +282,7 @@ pub struct Pool {
 pub struct PoolState {
     syncing_state: std::sync::Mutex<Option<PoolSyncingState>>,
     object_block_map: ObjectBlockMap,
+    zettacache: Option<ZettaCache>,
     pub shared_state: Arc<PoolSharedState>,
 }
 
@@ -434,6 +436,7 @@ impl Pool {
         object_access: &ObjectAccess,
         pool_phys: &PoolPhys,
         txg: TXG,
+        cache: Option<ZettaCache>,
     ) -> (Pool, Option<UberblockPhys>, BlockID) {
         let phys = UberblockPhys::get(object_access, pool_phys.guid, txg)
             .await
@@ -473,6 +476,7 @@ impl Pool {
                     objects_to_delete: Vec::new(),
                     pending_flushes: BTreeSet::new(),
                 })),
+                zettacache: cache,
                 object_block_map: ObjectBlockMap::new(),
             }),
         };
@@ -539,6 +543,7 @@ impl Pool {
     pub async fn open(
         object_access: &ObjectAccess,
         guid: PoolGUID,
+        cache: Option<ZettaCache>,
     ) -> (Pool, Option<UberblockPhys>, BlockID) {
         let phys = PoolPhys::get(object_access, guid).await.unwrap();
         if phys.last_txg.0 == 0 {
@@ -573,6 +578,7 @@ impl Pool {
                         objects_to_delete: Vec::new(),
                         pending_flushes: BTreeSet::new(),
                     })),
+                    zettacache: cache,
                     object_block_map: ObjectBlockMap::new(),
                 }),
             };
@@ -582,7 +588,7 @@ impl Pool {
                 .with_syncing_state(|syncing_state| syncing_state.next_block());
             (pool, None, next_block)
         } else {
-            Pool::open_from_txg(object_access, &phys, phys.last_txg).await
+            Pool::open_from_txg(object_access, &phys, phys.last_txg, cache).await
         }
     }
 
@@ -1141,6 +1147,13 @@ impl Pool {
     }
 
     pub async fn read_block(&self, block: BlockID) -> Vec<u8> {
+        // check in ZettaCache
+        if let Some(cache) = &self.state.zettacache {
+            if let Some(v) = cache.get(self.state.shared_state.guid, block).await {
+                return v;
+            }
+        }
+
         let object = self.state.object_block_map.block_to_object(block);
         let shared_state = self.state.shared_state.clone();
 
@@ -1158,7 +1171,17 @@ impl Pool {
             error!("{:#?}", phys);
         }
         // XXX to_owned() copies the data; would be nice to return a reference
-        phys.blocks.get(&block).unwrap().to_owned().into_vec()
+        let v = phys.blocks.get(&block).unwrap().to_owned().into_vec();
+
+        // add to ZettaCache
+        if let Some(cache) = &self.state.zettacache {
+            // XXX clone() copies the data; would be nice to pass a reference
+            cache
+                .put(self.state.shared_state.guid, block, v.clone())
+                .await;
+        }
+
+        v
     }
 
     pub fn free_block(&self, block: BlockID, size: u32) {

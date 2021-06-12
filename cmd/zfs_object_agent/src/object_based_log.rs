@@ -180,10 +180,10 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         }
     }
 
-    pub fn append(&mut self, txg: TXG, value: T) {
+    pub fn append(&mut self, txg: TXG, entry: T) {
         assert!(self.recovered);
         // XXX assert that txg is the same as the txg for the other pending entries?
-        self.pending_entries.push(value);
+        self.pending_entries.push(entry);
         // XXX should be based on chunk size (bytes)?  Or maybe should just be unlimited.
         if self.pending_entries.len() > 100_000 {
             self.initiate_flush(txg);

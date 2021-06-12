@@ -66,6 +66,14 @@ fn main() {
                 .help("File to log output to")
                 .takes_value(true),
         )
+        .arg(
+            Arg::with_name("cache-file")
+                .short("c")
+                .long("cache-file")
+                .value_name("FILE")
+                .help("File/device to use for ZettaCache")
+                .takes_value(true),
+        )
         .get_matches();
 
     let socket_dir = matches.value_of("socket-dir").unwrap();
@@ -74,6 +82,7 @@ fn main() {
         matches.occurrences_of("verbosity"),
         matches.value_of("output-file"),
     );
+    let x = matches.value_of("cache-file");
 
     error!(
         "Starting ZFS Object Agent.  Local timezone is {}",
@@ -109,6 +118,6 @@ fn main() {
         .build()
         .unwrap()
         .block_on(async move {
-            libzoa::server::do_server(socket_dir).await;
+            libzoa::server::do_server(socket_dir, x).await;
         });
 }
