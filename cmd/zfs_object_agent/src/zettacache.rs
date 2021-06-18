@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
+use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 
 const SUPERBLOCK_SIZE: usize = 4 * 1024;
 //const SUPERBLOCK_MAGIC: u64 = 0x2e11acac4e;
@@ -112,19 +114,19 @@ struct IndexKey {
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
 struct IndexValue {
-    atime: u64,
     location: DiskLocation,
     // XXX remove this and figure out based on which slab it's in?  However,
     // currently we need to return the right buffer size to the kernel, and it
     // isn't passing us the expected read size.  So we need to change some
     // interfaces to make that work right.
     size: usize,
+    atime: u64,
 }
 
 struct PendingChangeWithValue {
     value: IndexValue,
     atime_dirty: bool,
-    #[allow(dead_code)] // XXX location_dirty is not yet used
+    #[allow(dead_code)]
     location_dirty: bool,
 }
 
@@ -135,6 +137,10 @@ enum PendingChange {
 
 #[derive(Clone)]
 pub struct ZettaCache {
+    // XXX locking to serialize access to the cache will not perform well.  At a
+    // minimum we should not be holding the locks while waiting for disk access,
+    // but we may need to have concurrent access to lookups or other CPU-only
+    // tasks as well.
     state: Arc<tokio::sync::Mutex<ZettaCacheState>>,
 }
 
@@ -168,10 +174,20 @@ struct ZettaCacheState {
     super_phys: ZettaSuperBlockPhys,
     last_valid_data_offset: u64, // XXX move to a BlockAllocator struct
     pending_changes: BTreeMap<IndexKey, PendingChange>,
+    // XXX Given that we have to lock the entire State to do anything, we might
+    // get away with this being a Rc?  And the ExtentAllocator doesn't really
+    // need the lock inside it.  But hopefully we split up the big State lock
+    // and then this is useful.  Same goes for block_access.
     extent_allocator: Arc<ExtentAllocator>,
     index: BlockBasedLog<IndexEntry>,
     chunk_summary: BlockBasedLog<ChunkSummaryEntry>,
     operation_log: BlockBasedLog<OperationLogEntry>,
+    // When i/o completes, the value will be sent, and the entry can be removed
+    // from the tree.  These are needed to prevent the ExtentAllocator from
+    // overwriting them while i/o is in flight, and to ensure that writes
+    // complete before we complete the next checkpoint.
+    outstanding_reads: BTreeMap<IndexValue, Arc<Semaphore>>,
+    outstanding_writes: BTreeMap<IndexValue, Arc<Semaphore>>,
 }
 
 impl ZettaCache {
@@ -220,7 +236,7 @@ impl ZettaCache {
         let size = block_access.size();
 
         // if superblock not present, create new cache
-        // XXX need a real mechanism for creating/managing the cache
+        // XXX need a real mechanism for creating/managing the cache devices
         let phys = match ZettaSuperBlockPhys::read(&block_access).await {
             Ok(phys) => phys,
             Err(_) => {
@@ -247,64 +263,35 @@ impl ZettaCache {
         );
         let extent_allocator = Arc::new(ExtentAllocator::open(&checkpoint.extent_allocator));
 
-        let mut state = ZettaCacheState {
+        let operation_log = BlockBasedLog::open(
+            block_access.clone(),
+            extent_allocator.clone(),
+            checkpoint.operation_log,
+        );
+
+        let pending_changes = Self::load_operation_log(&operation_log).await;
+
+        let state = ZettaCacheState {
             block_access: block_access.clone(),
             size,
-            pending_changes: BTreeMap::new(),
+            pending_changes,
             index: BlockBasedLog::open(
                 block_access.clone(),
                 extent_allocator.clone(),
-                &checkpoint.index,
+                checkpoint.index,
             ),
             chunk_summary: BlockBasedLog::open(
                 block_access.clone(),
                 extent_allocator.clone(),
-                &checkpoint.chunk_summary,
+                checkpoint.chunk_summary,
             ),
-            operation_log: BlockBasedLog::open(
-                block_access.clone(),
-                extent_allocator.clone(),
-                &checkpoint.operation_log,
-            ),
+            operation_log,
             extent_allocator,
             last_valid_data_offset: checkpoint.last_valid_data_offset,
             super_phys: phys,
+            outstanding_reads: BTreeMap::new(),
+            outstanding_writes: BTreeMap::new(),
         };
-
-        // load operation_log from disk into the in-memory pending_changes
-        let begin = Instant::now();
-        let mut num_insert_entries: u64 = 0;
-        let mut num_remove_entries: u64 = 0;
-        state
-            .operation_log
-            .iter()
-            .for_each(|entry| {
-                match entry {
-                    OperationLogEntry::Insert((key, value)) => {
-                        state.pending_changes.insert(
-                            key,
-                            PendingChange::WithValue(PendingChangeWithValue {
-                                value,
-                                atime_dirty: false,
-                                location_dirty: false,
-                            }),
-                        );
-                        num_insert_entries += 1;
-                    }
-                    OperationLogEntry::Remove(key) => {
-                        state.pending_changes.insert(key, PendingChange::Removal());
-                        num_remove_entries += 1;
-                    }
-                };
-                future::ready(())
-            })
-            .await;
-        info!(
-            "loaded operation_log from {} allocs and {} frees in {}ms",
-            num_insert_entries,
-            num_remove_entries,
-            begin.elapsed().as_millis()
-        );
 
         let this = ZettaCache {
             state: Arc::new(tokio::sync::Mutex::new(state)),
@@ -322,14 +309,59 @@ impl ZettaCache {
         this
     }
 
+    async fn load_operation_log(
+        operation_log: &BlockBasedLog<OperationLogEntry>,
+    ) -> BTreeMap<IndexKey, PendingChange> {
+        let begin = Instant::now();
+        let mut num_insert_entries: u64 = 0;
+        let mut num_remove_entries: u64 = 0;
+        let mut pending_changes = BTreeMap::new();
+        operation_log
+            .iter()
+            .for_each(|entry| {
+                match entry {
+                    OperationLogEntry::Insert((key, value)) => {
+                        pending_changes.insert(
+                            key,
+                            PendingChange::WithValue(PendingChangeWithValue {
+                                value,
+                                atime_dirty: false,
+                                location_dirty: false,
+                            }),
+                        );
+                        num_insert_entries += 1;
+                    }
+                    OperationLogEntry::Remove(key) => {
+                        pending_changes.insert(key, PendingChange::Removal());
+                        num_remove_entries += 1;
+                    }
+                };
+                future::ready(())
+            })
+            .await;
+        info!(
+            "loaded operation_log from {} allocs and {} frees in {}ms",
+            num_insert_entries,
+            num_remove_entries,
+            begin.elapsed().as_millis()
+        );
+        pending_changes
+    }
+
     pub async fn get(&self, guid: PoolGUID, block: BlockID) -> Option<Vec<u8>> {
-        let mut state = self.state.lock().await;
-        state.get(guid, block).await
+        let opt_jh = {
+            let mut state = self.state.lock().await;
+            state.get(guid, block)
+        };
+        match opt_jh {
+            Some(receiver) => Some(receiver.await.unwrap()),
+            None => None,
+        }
     }
 
     pub async fn put(&self, guid: PoolGUID, block: BlockID, buf: Vec<u8>) {
         let mut state = self.state.lock().await;
-        state.put(guid, block, buf).await
+        state.put(guid, block, buf);
     }
 }
 
@@ -337,13 +369,14 @@ impl ZettaCacheState {
     /// Retrieve from cache, if available.  We assume that we won't often have
     /// concurrent requests for the same block, so in that case we may read it
     /// multiple times.
-    async fn get(&mut self, guid: PoolGUID, block: BlockID) -> Option<Vec<u8>> {
+    fn get(&mut self, guid: PoolGUID, block: BlockID) -> Option<JoinHandle<Vec<u8>>> {
         let key = IndexKey { guid, block };
         let mut value = match self.pending_changes.get(&key) {
             Some(PendingChange::WithValue(x)) => x.value,
             Some(PendingChange::Removal()) => return None,
             None => {
                 // XXX Check on-disk index, yield new value to insert to pending
+                // XXX will require that we make sure the index chunk can't go away while we are reading it
                 return None;
             }
         };
@@ -362,8 +395,6 @@ impl ZettaCacheState {
         }
 
         trace!("cache hit: reading {:?} from {:?}", key, value);
-        let vec = self.block_access.read_raw(value.location, value.size).await;
-
         value.atime = self.current_atime();
 
         self.pending_changes
@@ -388,13 +419,32 @@ impl ZettaCacheState {
                 location_dirty: false,
             }));
 
-        Some(vec)
+        // If there's a write to this location in progress, we will need to wait for it to complete before reading.
+        // Since we won't be able to remove the entry from outstanding_writes after we wait, we just get the semaphore.
+        let write_sem_opt = self
+            .outstanding_writes
+            .get_mut(&value)
+            .map(|arc| arc.clone());
+
+        let sem = Arc::new(Semaphore::new(0));
+        let sem2 = sem.clone();
+        self.outstanding_reads.insert(value, sem);
+        let block_access = self.block_access.clone();
+        Some(tokio::spawn(async move {
+            if let Some(write_sem) = write_sem_opt {
+                trace!("{:?} at {:?}: waiting for outstanding write", key, value);
+                let _permit = write_sem.acquire().await.unwrap();
+            }
+
+            let vec = block_access.read_raw(value.location, value.size).await;
+            sem2.add_permits(1);
+            vec
+        }))
     }
 
     /// Insert this block to the cache, if space and performance parameters
     /// allow.  It may be a recent cache miss, or a recently-written block.
-    async fn put(&mut self, guid: PoolGUID, block: BlockID, buf: Vec<u8>) {
-        // XXX ideally this function would not be async and would not block, just kick off the writes
+    fn put(&mut self, guid: PoolGUID, block: BlockID, buf: Vec<u8>) {
         let buf_size = buf.len();
         let aligned_size = self.block_access.round_up_to_sector(buf.len());
 
@@ -415,9 +465,6 @@ impl ZettaCacheState {
         }
         let location = location_opt.unwrap();
 
-        // XXX we don't really want to wait for the write to complete here
-        self.block_access.write_raw(location, aligned_buf).await;
-
         // XXX if this is past the last block of the main index, we can write it
         // there (and location_dirty:false) instead of logging it
 
@@ -429,9 +476,9 @@ impl ZettaCacheState {
         };
 
         self.pending_changes.insert(
-            key.clone(),
+            key,
             PendingChange::WithValue(PendingChangeWithValue {
-                value: value.clone(),
+                value,
                 atime_dirty: true,
                 location_dirty: true,
             }),
@@ -439,6 +486,20 @@ impl ZettaCacheState {
 
         self.operation_log
             .append(OperationLogEntry::Insert((key, value)));
+
+        let sem = Arc::new(Semaphore::new(0));
+        let sem2 = sem.clone();
+        //let (s, r) = oneshot::channel();
+        let block_access = self.block_access.clone();
+        tokio::spawn(async move {
+            block_access.write_raw(location, aligned_buf).await;
+            sem2.add_permits(1);
+            //s.send(()).unwrap();
+        });
+        // note: we don't need to insert before initiating the write, because we
+        // have exclusive access to the State, so nobody can see the
+        // outstanding_writes until we are done
+        self.outstanding_writes.insert(value, sem);
     }
 
     // XXX change to return a newtype?
@@ -472,6 +533,31 @@ impl ZettaCacheState {
         );
 
         let begin = Instant::now();
+
+        // Wait for all outstanding reads, so that if the ExtentAllocator needs
+        // to overwrite some blocks, there aren't any outstanding i/os to that
+        // region.
+        // XXX It would be better to only do wait for the reads that are in the
+        // region that we're overwriting.  But it will be tricky to do the
+        // waiting down in the ExtentAllocator.  If we get that working, we'll
+        // still need to clean up the outstanding_reads entries that have
+        // completed, at some point.  Even as-is, letting them accumulate for a
+        // whole checkpoint might not be great.  We might want a "cleaner" to
+        // run every second and remove completed entries.  Or have the read task
+        // lock the outstanding_reads and remove itself (which might perform
+        // worse due to contention on the global lock).
+        for (_value, sem) in &mut self.outstanding_reads {
+            let _permit = sem.acquire().await.unwrap();
+        }
+        self.outstanding_reads.clear();
+
+        // Wait for all outstanding writes, for the same reason as reads, and
+        // also so that if we crash, the blocks referenced by the
+        // index/operation_log will actually have the correct contents.
+        for (_value, sem) in &mut self.outstanding_writes {
+            let _permit = sem.acquire().await.unwrap();
+        }
+        self.outstanding_writes.clear();
 
         future::join3(
             self.index.flush(),
@@ -513,6 +599,8 @@ impl ZettaCacheState {
             // single checkpoint to wrap around (part of it at the end and
             // then part at the beginning of the space).
         }
+        debug!("writing to {:?}: {:#?}", checkpoint_location, checkpoint);
+
         self.super_phys.last_checkpoint = Extent {
             location: checkpoint_location,
             size: raw.len(),

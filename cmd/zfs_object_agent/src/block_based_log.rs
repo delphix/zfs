@@ -22,7 +22,7 @@ const DEFAULT_EXTENT_SIZE: usize = 128 * 1024 * 1024;
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct BlockBasedLogPhys {
     // XXX on-disk format could just be array of extents; offset can be derived
-    // from size of previous extents We do need the btree in RAM though so that
+    // from size of previous extents. We do need the btree in RAM though so that
     // we can do random reads on the Index (unless the ChunkSummary points
     // directly to the on-disk location)
     extents: BTreeMap<LogOffset, Extent>, // offset -> disk_location, size
@@ -50,7 +50,7 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
     pub fn open(
         block_access: Arc<BlockAccess>,
         extent_allocator: Arc<ExtentAllocator>,
-        phys: &BlockBasedLogPhys,
+        phys: BlockBasedLogPhys,
     ) -> BlockBasedLog<T> {
         for (_offset, extent) in phys.extents.iter() {
             extent_allocator.claim(extent);
@@ -58,7 +58,7 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
         BlockBasedLog {
             block_access,
             extent_allocator,
-            phys: phys.clone(),
+            phys,
             pending_entries: Vec::new(),
         }
     }
