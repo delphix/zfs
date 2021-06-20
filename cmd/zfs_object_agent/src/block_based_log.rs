@@ -93,7 +93,7 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
         let raw_size = raw_chunk.len();
         if raw_size > extent.size {
             // free the unused tail of this extent
-            self.extent_allocator.free(extent);
+            self.extent_allocator.free(&extent);
             let capacity = match self.phys.extents.iter_mut().next_back() {
                 Some((last_offset, last_extent)) => {
                     last_extent.size -= extent.size;
@@ -114,6 +114,14 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
             .await;
         self.phys.next_chunk = self.phys.next_chunk.next();
         self.phys.next_chunk_offset.0 += raw_size as u64;
+    }
+
+    pub fn clear(&mut self) {
+        self.pending_entries.clear();
+        for extent in self.phys.extents.values() {
+            self.extent_allocator.free(extent);
+        }
+        self.phys = BlockBasedLogPhys::default();
     }
 
     // XXX not sure how I feel about using Extent to represent something that

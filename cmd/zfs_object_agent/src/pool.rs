@@ -846,10 +846,6 @@ impl Pool {
         )
         .await;
 
-        syncing_state.storage_object_log.flush(txg).await;
-        syncing_state.object_size_log.flush(txg).await;
-        syncing_state.pending_frees_log.flush(txg).await;
-
         // write uberblock
         let u = UberblockPhys {
             guid: state.shared_state.guid,
@@ -1149,7 +1145,7 @@ impl Pool {
     pub async fn read_block(&self, block: BlockID) -> Vec<u8> {
         // check in ZettaCache
         if let Some(cache) = &self.state.zettacache {
-            if let Some(v) = cache.get(self.state.shared_state.guid, block).await {
+            if let Some(v) = cache.lookup(self.state.shared_state.guid, block).await {
                 return v;
             }
         }
@@ -1177,7 +1173,7 @@ impl Pool {
         if let Some(cache) = &self.state.zettacache {
             // XXX clone() copies the data; would be nice to pass a reference
             cache
-                .put(self.state.shared_state.guid, block, v.clone())
+                .insert(self.state.shared_state.guid, block, v.clone())
                 .await;
         }
 

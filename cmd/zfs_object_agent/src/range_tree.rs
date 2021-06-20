@@ -1,6 +1,7 @@
 use more_asserts::*;
 use std::collections::BTreeMap;
 
+#[derive(Default)]
 pub struct RangeTree {
     tree: BTreeMap<u64, u64>, // start -> size
 }
@@ -91,5 +92,9 @@ impl RangeTree {
     /// Returns Iter<start, size>
     pub fn iter(&self) -> std::collections::btree_map::Iter<u64, u64> {
         self.tree.iter()
+    }
+
+    pub fn clear(&mut self) {
+        self.tree.clear();
     }
 }

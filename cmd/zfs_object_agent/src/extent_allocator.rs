@@ -1,3 +1,5 @@
+use std::mem;
+
 use crate::range_tree::*;
 use crate::zettacache::DiskLocation;
 use crate::zettacache::Extent;
@@ -12,12 +14,15 @@ pub struct ExtentAllocatorPhys {
 }
 
 pub struct ExtentAllocator {
+    // XXX there's no real point of having a mutex here since this is only
+    // accessed under the big zettacache lock
     state: std::sync::Mutex<ExtentAllocatorState>,
 }
 
 struct ExtentAllocatorState {
     phys: ExtentAllocatorPhys,
-    metadata_allocatable: RangeTree,
+    allocatable: RangeTree,
+    freeing: RangeTree, // not yet available for reallocation until this checkpoint completes
 }
 
 /// Note: no on-disk representation.  Allocated extents must be .claim()ed
@@ -32,7 +37,8 @@ impl ExtentAllocator {
         ExtentAllocator {
             state: std::sync::Mutex::new(ExtentAllocatorState {
                 phys: *phys,
-                metadata_allocatable,
+                allocatable: metadata_allocatable,
+                freeing: RangeTree::new(),
             }),
         }
     }
@@ -41,11 +47,20 @@ impl ExtentAllocator {
         self.state.lock().unwrap().phys.clone()
     }
 
+    pub fn checkpoint_done(&self) {
+        let mut state = self.state.lock().unwrap();
+
+        // Space freed during this checkpoint is now available for reallocation.
+        for (start, size) in mem::take(&mut state.freeing).iter() {
+            state.allocatable.add(*start, *size);
+        }
+    }
+
     pub fn claim(&self, extent: &Extent) {
         self.state
             .lock()
             .unwrap()
-            .metadata_allocatable
+            .allocatable
             .remove(extent.location.offset, extent.size as u64);
     }
 
@@ -57,7 +72,7 @@ impl ExtentAllocator {
         // XXX keep size-sorted tree as well?
         let mut best_size = 0;
         let mut best_offset = 0;
-        for (offset, size) in state.metadata_allocatable.iter() {
+        for (offset, size) in state.allocatable.iter() {
             if *size > best_size {
                 best_size = *size;
                 best_offset = *offset;
@@ -79,7 +94,7 @@ impl ExtentAllocator {
             state.phys.last_valid_offset += max_size64;
         } else {
             // remove segment from allocatable
-            state.metadata_allocatable.remove(best_offset, best_size);
+            state.allocatable.remove(best_offset, best_size);
         }
 
         let this = Extent {
@@ -93,10 +108,10 @@ impl ExtentAllocator {
     }
 
     /// extent can be a subset of what was previously allocated
-    pub fn free(&self, extent: Extent) {
+    pub fn free(&self, extent: &Extent) {
         let mut state = self.state.lock().unwrap();
         state
-            .metadata_allocatable
+            .freeing
             .add(extent.location.offset, extent.size as u64);
     }
 }

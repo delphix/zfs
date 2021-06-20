@@ -11,6 +11,7 @@ use futures::stream::*;
 use log::*;
 use more_asserts::*;
 use serde::{Deserialize, Serialize};
+use std::collections::btree_map;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +25,7 @@ const SUPERBLOCK_SIZE: usize = 4 * 1024;
 const DEFAULT_CHECKPOINT_RING_BUFFER_SIZE: usize = 1 * 1024 * 1024;
 const DEFAULT_SLAB_SIZE: usize = 16 * 1024 * 1024;
 const DEFAULT_METADATA_SIZE: usize = 4 * 1024 * 1024;
+const MAX_PENDING_CHANGES: usize = 100_000; // XXX should be based on RAM usage, ~tens of millions at least
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ZettaSuperBlockPhys {
@@ -123,24 +125,17 @@ struct IndexValue {
     atime: u64,
 }
 
-struct PendingChangeWithValue {
-    value: IndexValue,
-    atime_dirty: bool,
-    #[allow(dead_code)]
-    location_dirty: bool,
-}
-
+#[derive(Debug)]
 enum PendingChange {
-    WithValue(PendingChangeWithValue),
-    Removal(),
+    Insert(IndexValue),
+    UpdateAtime(IndexValue),
+    Remove(),
+    RemoveThenInsert(IndexValue),
 }
 
 #[derive(Clone)]
 pub struct ZettaCache {
-    // XXX locking to serialize access to the cache will not perform well.  At a
-    // minimum we should not be holding the locks while waiting for disk access,
-    // but we may need to have concurrent access to lookups or other CPU-only
-    // tasks as well.
+    // XXX may need to break up this big lock.  At least we aren't holding it while doing i/o
     state: Arc<tokio::sync::Mutex<ZettaCacheState>>,
 }
 
@@ -321,18 +316,28 @@ impl ZettaCache {
             .for_each(|entry| {
                 match entry {
                     OperationLogEntry::Insert((key, value)) => {
-                        pending_changes.insert(
-                            key,
-                            PendingChange::WithValue(PendingChangeWithValue {
-                                value,
-                                atime_dirty: false,
-                                location_dirty: false,
-                            }),
-                        );
+                        match pending_changes.entry(key) {
+                            btree_map::Entry::Occupied(mut oe) => match oe.get() {
+                                PendingChange::Remove() => {
+                                    oe.insert(PendingChange::RemoveThenInsert(value));
+                                }
+                                _ => {
+                                    panic!(
+                                        "Inserting {:?} into already existing entry {:?} {:?}",
+                                        oe.get(),
+                                        key,
+                                        value
+                                    );
+                                }
+                            },
+                            btree_map::Entry::Vacant(ve) => {
+                                ve.insert(PendingChange::Insert(value));
+                            }
+                        }
                         num_insert_entries += 1;
                     }
                     OperationLogEntry::Remove(key) => {
-                        pending_changes.insert(key, PendingChange::Removal());
+                        pending_changes.insert(key, PendingChange::Remove());
                         num_remove_entries += 1;
                     }
                 };
@@ -340,18 +345,19 @@ impl ZettaCache {
             })
             .await;
         info!(
-            "loaded operation_log from {} allocs and {} frees in {}ms",
+            "loaded operation_log from {} inserts and {} removes into {} pending_changes in {}ms",
             num_insert_entries,
             num_remove_entries,
+            pending_changes.len(),
             begin.elapsed().as_millis()
         );
         pending_changes
     }
 
-    pub async fn get(&self, guid: PoolGUID, block: BlockID) -> Option<Vec<u8>> {
+    pub async fn lookup(&self, guid: PoolGUID, block: BlockID) -> Option<Vec<u8>> {
         let opt_jh = {
             let mut state = self.state.lock().await;
-            state.get(guid, block)
+            state.lookup(guid, block)
         };
         match opt_jh {
             Some(receiver) => Some(receiver.await.unwrap()),
@@ -359,9 +365,9 @@ impl ZettaCache {
         }
     }
 
-    pub async fn put(&self, guid: PoolGUID, block: BlockID, buf: Vec<u8>) {
+    pub async fn insert(&self, guid: PoolGUID, block: BlockID, buf: Vec<u8>) {
         let mut state = self.state.lock().await;
-        state.put(guid, block, buf);
+        state.insert(guid, block, buf);
     }
 }
 
@@ -369,11 +375,15 @@ impl ZettaCacheState {
     /// Retrieve from cache, if available.  We assume that we won't often have
     /// concurrent requests for the same block, so in that case we may read it
     /// multiple times.
-    fn get(&mut self, guid: PoolGUID, block: BlockID) -> Option<JoinHandle<Vec<u8>>> {
+    fn lookup(&mut self, guid: PoolGUID, block: BlockID) -> Option<JoinHandle<Vec<u8>>> {
         let key = IndexKey { guid, block };
-        let mut value = match self.pending_changes.get(&key) {
-            Some(PendingChange::WithValue(x)) => x.value,
-            Some(PendingChange::Removal()) => return None,
+        let atime = self.current_atime();
+        let pc = self.pending_changes.get_mut(&key);
+        let mut value = match pc {
+            Some(PendingChange::Insert(value_ref)) => *value_ref,
+            Some(PendingChange::RemoveThenInsert(value_ref)) => *value_ref,
+            Some(PendingChange::UpdateAtime(value_ref)) => *value_ref,
+            Some(PendingChange::Remove()) => return None,
             None => {
                 // XXX Check on-disk index, yield new value to insert to pending
                 // XXX will require that we make sure the index chunk can't go away while we are reading it
@@ -389,35 +399,65 @@ impl ZettaCacheState {
                 key,
                 value
             );
-            self.pending_changes.insert(key, PendingChange::Removal());
+            match pc {
+                Some(PendingChange::Insert(value_ref)) => {
+                    // The operation_log has an Insert for this key, and the key
+                    // is not in the Index.  We don't need a
+                    // PendingChange::Removal since there's nothing to remove
+                    // from the index.
+                    assert_eq!(*value_ref, value);
+                    self.pending_changes.remove(&key);
+                }
+                Some(PendingChange::RemoveThenInsert(value_ref)) => {
+                    // The operation_log has a Remove, and then an Insert for
+                    // this key, so the key is in the Index.  We need a
+                    // PendingChange::Remove so that the Index entry won't be
+                    // found.
+                    assert_eq!(*value_ref, value);
+                    self.pending_changes.insert(key, PendingChange::Remove());
+                }
+                Some(PendingChange::UpdateAtime(value_ref)) => {
+                    // It's just an atime update, so the operation_log doesn't
+                    // have an Insert for this key, but the key is in the
+                    // Index.
+                    assert_eq!(*value_ref, value);
+                    self.pending_changes.insert(key, PendingChange::Remove());
+                }
+                Some(PendingChange::Remove()) => {
+                    panic!("invalid state");
+                }
+                None => {
+                    // only in Index, not pending_changes
+                    self.pending_changes.insert(key, PendingChange::Remove());
+                }
+            }
             self.operation_log.append(OperationLogEntry::Remove(key));
             return None;
         }
 
         trace!("cache hit: reading {:?} from {:?}", key, value);
-        value.atime = self.current_atime();
+        value.atime = atime;
 
-        self.pending_changes
-            .entry(key)
-            .and_modify(|e| match e {
-                PendingChange::WithValue(with_value) => {
-                    assert_eq!(with_value.value.location, value.location);
-                    with_value.value = value;
-                    with_value.atime_dirty = true;
-                }
-                PendingChange::Removal() => {
-                    *e = PendingChange::WithValue(PendingChangeWithValue {
-                        value,
-                        atime_dirty: true,
-                        location_dirty: false,
-                    })
-                }
-            })
-            .or_insert(PendingChange::WithValue(PendingChangeWithValue {
-                value,
-                atime_dirty: true,
-                location_dirty: false,
-            }));
+        // Note: we're just updating the atime, which is not logged to the
+        // operation_log.  If we crash, recent atime updates will be lost.
+        // XXX on clean shutdown, log the atimes?
+        match pc {
+            Some(PendingChange::Insert(value_ref)) => {
+                *value_ref = value;
+            }
+            Some(PendingChange::RemoveThenInsert(value_ref)) => {
+                *value_ref = value;
+            }
+            Some(PendingChange::UpdateAtime(value_ref)) => {
+                *value_ref = value;
+            }
+            Some(PendingChange::Remove()) => panic!("invalid state"),
+            None => {
+                // only in Index, not pending_changes
+                self.pending_changes
+                    .insert(key, PendingChange::UpdateAtime(value));
+            }
+        }
 
         // If there's a write to this location in progress, we will need to wait for it to complete before reading.
         // Since we won't be able to remove the entry from outstanding_writes after we wait, we just get the semaphore.
@@ -444,7 +484,7 @@ impl ZettaCacheState {
 
     /// Insert this block to the cache, if space and performance parameters
     /// allow.  It may be a recent cache miss, or a recently-written block.
-    fn put(&mut self, guid: PoolGUID, block: BlockID, buf: Vec<u8>) {
+    fn insert(&mut self, guid: PoolGUID, block: BlockID, buf: Vec<u8>) {
         let buf_size = buf.len();
         let aligned_size = self.block_access.round_up_to_sector(buf.len());
 
@@ -475,26 +515,48 @@ impl ZettaCacheState {
             size: buf_size,
         };
 
-        self.pending_changes.insert(
-            key,
-            PendingChange::WithValue(PendingChangeWithValue {
-                value,
-                atime_dirty: true,
-                location_dirty: true,
-            }),
-        );
+        match self.pending_changes.entry(key) {
+            btree_map::Entry::Occupied(mut oe) => match oe.get() {
+                PendingChange::Remove() => {
+                    oe.insert(PendingChange::RemoveThenInsert(value));
+                }
+                _ => {
+                    // Already in cache; ignore this insertion request?  Or panic?
+                    todo!();
+                }
+            },
+            btree_map::Entry::Vacant(ve) => {
+                ve.insert(PendingChange::Insert(value));
+            }
+        }
+
+        /* XXX this seems more clear than the above, but it will typically access the btree twice
+        // XXX maybe make pending_changes its own struct and we can have a method to "upgrade to insert"
+        match self.pending_changes.get_mut(&key) {
+            Some(pc @ PendingChange::Remove()) => {
+                *pc = PendingChange::RemoveThenInsert(value);
+            }
+            Some(_) => {
+                // Already in cache; ignore this insertion request?  Or panic?
+                todo!();
+                }
+            }
+            None => {
+                self.pending_changes
+                    .insert(key, PendingChange::Insert(value));
+            }
+        }
+        */
 
         self.operation_log
             .append(OperationLogEntry::Insert((key, value)));
 
         let sem = Arc::new(Semaphore::new(0));
         let sem2 = sem.clone();
-        //let (s, r) = oneshot::channel();
         let block_access = self.block_access.clone();
         tokio::spawn(async move {
             block_access.write_raw(location, aligned_buf).await;
             sem2.add_permits(1);
-            //s.send(()).unwrap();
         });
         // note: we don't need to insert before initiating the write, because we
         // have exclusive access to the State, so nobody can see the
@@ -559,6 +621,10 @@ impl ZettaCacheState {
         }
         self.outstanding_writes.clear();
 
+        if self.pending_changes.len() > MAX_PENDING_CHANGES {
+            self.merge_pending_changes().await;
+        }
+
         future::join3(
             self.index.flush(),
             self.chunk_summary.flush(),
@@ -610,9 +676,151 @@ impl ZettaCacheState {
         self.super_phys.last_generation = self.super_phys.last_generation.next();
         self.super_phys.write(&self.block_access).await;
 
+        self.extent_allocator.checkpoint_done();
+
         debug!(
             "completed checkpoint {:?} in {}ms",
             self.super_phys.last_generation,
+            begin.elapsed().as_millis()
+        );
+    }
+
+    async fn merge_pending_changes(&mut self) {
+        let begin = Instant::now();
+        info!(
+            "writing new index to merge {} pending changes into index of {} entries",
+            self.pending_changes.len(),
+            "XXX",
+        );
+        // XXX when we are continually merging, over multiple checkpoints, we
+        // will probably want the BlockBasedLog to know about multiple
+        // generations, and therefore we'd keep the one BlockBasedLog but create
+        // a new generation (as we do with ObjectBasedLog).
+        let mut next_generation_index = BlockBasedLog::open(
+            self.block_access.clone(),
+            self.extent_allocator.clone(),
+            BlockBasedLogPhys::default(),
+        );
+        // XXX need to also create ChunkSummary, so that we can find individual chunks.
+        let mut pending_changes_iter = self.pending_changes.iter_mut().peekable();
+        self.index.flush().await;
+        self.index
+            .iter()
+            .for_each(|entry| {
+                // First, process any pending changes which are before this
+                // index entry, which must be all Inserts (Removes,
+                // RemoveThenInserts, and AtimeUpdates refer to existing Index
+                // entries).
+                trace!("next index entry: {:?}", entry);
+                while let Some((pc_key, PendingChange::Insert(pc_value))) =
+                    pending_changes_iter.peek()
+                {
+                    if **pc_key >= entry.key {
+                        break;
+                    }
+                    // Add this new entry to the index
+                    next_generation_index.append(IndexEntry {
+                        key: **pc_key,
+                        value: *pc_value,
+                    });
+                    pending_changes_iter.next();
+                }
+
+                let next_pc_opt = pending_changes_iter.peek();
+                match next_pc_opt {
+                    Some((pc_key, PendingChange::Remove())) => {
+                        if **pc_key == entry.key {
+                            // Don't write this entry to the new generation.
+                            // this pending change is consumed
+                            pending_changes_iter.next();
+                        } else {
+                            // There shouldn't be a pending removal of an entry that doesn't exist in the index.
+                            assert_gt!(**pc_key, entry.key);
+                            next_generation_index.append(entry);
+                        }
+                    }
+                    Some((pc_key, PendingChange::Insert(_pc_value))) => {
+                        // Insertions are processed above.  There can't be an
+                        // index entry with the same key.  If there were, it has
+                        // to be removed first, resulting in a
+                        // PendingChange::RemoveThenInsert.
+                        assert_gt!(**pc_key, entry.key);
+                        next_generation_index.append(entry);
+                    }
+                    Some((pc_key, PendingChange::RemoveThenInsert(pc_value))) => {
+                        if **pc_key == entry.key {
+                            // This key must have been removed (evicted) and then re-inserted.
+                            // Add the pending change to the next generation instead of the current index's entry
+                            assert_eq!(pc_value.size, entry.value.size);
+                            next_generation_index.append(IndexEntry {
+                                key: **pc_key,
+                                value: *pc_value,
+                            });
+
+                            // this pending change is consumed
+                            pending_changes_iter.next();
+                        } else {
+                            // We shouldn't have skipped any, because there has to be a corresponding Index entry
+                            assert_gt!(**pc_key, entry.key);
+                            next_generation_index.append(entry);
+                        }
+                    }
+                    Some((pc_key, PendingChange::UpdateAtime(pc_value))) => {
+                        if **pc_key == entry.key {
+                            // Add the pending entry to the next generation instead of the current index's entry
+                            assert_eq!(pc_value.location, entry.value.location);
+                            assert_eq!(pc_value.size, entry.value.size);
+                            next_generation_index.append(IndexEntry {
+                                key: **pc_key,
+                                value: *pc_value,
+                            });
+
+                            // this pending change is consumed
+                            pending_changes_iter.next();
+                        } else {
+                            // We shouldn't have skipped any, because there has to be a corresponding Index entry
+                            assert_gt!(**pc_key, entry.key);
+                            next_generation_index.append(entry);
+                        }
+                    }
+                    None => {
+                        // no more pending changes
+                        next_generation_index.append(entry);
+                    }
+                }
+                future::ready(())
+            })
+            .await;
+        while let Some((pc_key, PendingChange::Insert(pc_value))) = pending_changes_iter.peek() {
+            // Add this new entry to the index
+            trace!(
+                "remaining pending change, appending to new index: {:?} {:?}",
+                pc_key,
+                pc_value
+            );
+            next_generation_index.append(IndexEntry {
+                key: **pc_key,
+                value: *pc_value,
+            });
+            // Consume pending change.  We don't do that in the `while let`
+            // because we want to leave any unmatched items in the iterator so
+            // that we can print them out when failing below.
+            pending_changes_iter.next();
+        }
+        // Other pending changes refer to existing index entries and therefore should have been processed above
+        assert!(
+            pending_changes_iter.peek().is_none(),
+            "next={:?}",
+            pending_changes_iter.peek().unwrap()
+        );
+
+        self.pending_changes.clear();
+        self.index.clear();
+        self.index = next_generation_index;
+
+        info!(
+            "wrote new index with {} entries in {}ms",
+            "XXX",
             begin.elapsed().as_millis()
         );
     }
