@@ -1,6 +1,4 @@
-use crate::base_types::BlockID;
-use crate::base_types::OnDisk;
-use crate::base_types::PoolGUID;
+use crate::base_types::*;
 use crate::block_access::*;
 use crate::block_based_log::*;
 use crate::extent_allocator::ExtentAllocator;
@@ -41,7 +39,10 @@ impl ZettaSuperBlockPhys {
     // XXX when we have multiple disks, will this be stored on a specific one?  Or copied on all of them?
     async fn read(block_access: &BlockAccess) -> Result<ZettaSuperBlockPhys> {
         let raw = block_access
-            .read_raw(DiskLocation { offset: 0 }, SUPERBLOCK_SIZE)
+            .read_raw(Extent {
+                location: DiskLocation { offset: 0 },
+                size: SUPERBLOCK_SIZE,
+            })
             .await;
         let (this, _): (Self, usize) = block_access.json_chunk_from_raw(&raw)?;
         debug!("got {:#?}", this);
@@ -57,27 +58,6 @@ impl ZettaSuperBlockPhys {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
-pub struct DiskLocation {
-    // note: will need to add disk ID to support multiple disks
-    pub offset: u64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
-pub struct Extent {
-    pub location: DiskLocation,
-    // XXX for space efficiency and clarity, make this u32? since it's stored on disk?
-    pub size: usize, // note: since we read it into contiguous memory, it can't be more than usize
-}
-
-#[derive(Serialize, Deserialize, Default, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
-pub struct GenerationID(u64);
-impl GenerationID {
-    pub fn next(&self) -> GenerationID {
-        GenerationID(self.0 + 1)
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug)]
 struct ZettaCheckpointPhys {
     generation: GenerationID,
@@ -89,12 +69,8 @@ struct ZettaCheckpointPhys {
 }
 
 impl ZettaCheckpointPhys {
-    async fn read(
-        block_access: &BlockAccess,
-        location: DiskLocation,
-        size: usize,
-    ) -> ZettaCheckpointPhys {
-        let raw = block_access.read_raw(location, size).await;
+    async fn read(block_access: &BlockAccess, extent: Extent) -> ZettaCheckpointPhys {
+        let raw = block_access.read_raw(extent).await;
         let (this, _): (Self, usize) = block_access.json_chunk_from_raw(&raw).unwrap();
         debug!("got {:#?}", this);
         this
@@ -174,8 +150,10 @@ struct ZettaCacheState {
     // need the lock inside it.  But hopefully we split up the big State lock
     // and then this is useful.  Same goes for block_access.
     extent_allocator: Arc<ExtentAllocator>,
+    // XXX move this to its own file/struct with methods to flush, etc?
     index: BlockBasedLog<IndexEntry>,
     chunk_summary: BlockBasedLog<ChunkSummaryEntry>,
+    // XXX move this to its own file/struct with methods to load, etc?
     operation_log: BlockBasedLog<OperationLogEntry>,
     // When i/o completes, the value will be sent, and the entry can be removed
     // from the tree.  These are needed to prevent the ExtentAllocator from
@@ -240,12 +218,7 @@ impl ZettaCache {
             }
         };
 
-        let checkpoint = ZettaCheckpointPhys::read(
-            &block_access,
-            phys.last_checkpoint.location,
-            phys.last_checkpoint.size,
-        )
-        .await;
+        let checkpoint = ZettaCheckpointPhys::read(&block_access, phys.last_checkpoint).await;
 
         assert_eq!(checkpoint.generation, phys.last_generation);
 
@@ -357,7 +330,8 @@ impl ZettaCache {
     pub async fn lookup(&self, guid: PoolGUID, block: BlockID) -> Option<Vec<u8>> {
         let opt_jh = {
             let mut state = self.state.lock().await;
-            state.lookup(guid, block)
+            // XXX state.lookup() should not be async, so we can drop the state lock before doing any i/o
+            state.lookup(guid, block).await
         };
         match opt_jh {
             Some(receiver) => Some(receiver.await.unwrap()),
@@ -375,7 +349,8 @@ impl ZettaCacheState {
     /// Retrieve from cache, if available.  We assume that we won't often have
     /// concurrent requests for the same block, so in that case we may read it
     /// multiple times.
-    fn lookup(&mut self, guid: PoolGUID, block: BlockID) -> Option<JoinHandle<Vec<u8>>> {
+    // XXX should not be async, so that caller can drop the ZettaCacheState lock before we wait for io.
+    async fn lookup(&mut self, guid: PoolGUID, block: BlockID) -> Option<JoinHandle<Vec<u8>>> {
         let key = IndexKey { guid, block };
         let atime = self.current_atime();
         let pc = self.pending_changes.get_mut(&key);
@@ -385,9 +360,15 @@ impl ZettaCacheState {
             Some(PendingChange::UpdateAtime(value_ref)) => *value_ref,
             Some(PendingChange::Remove()) => return None,
             None => {
-                // XXX Check on-disk index, yield new value to insert to pending
-                // XXX will require that we make sure the index chunk can't go away while we are reading it
-                return None;
+                // Check on-disk index.
+                // XXX Should not be await-ing, so that caller can drop the
+                // ZettaCacheState lock before we wait for io.  Will require
+                // that we make sure the index chunk can't go away while we are
+                // reading it.
+                match self.index.lookup_by_key(&key, |entry| entry.key).await {
+                    Some(entry) => entry.value,
+                    None => return None,
+                }
             }
         };
 
@@ -476,7 +457,12 @@ impl ZettaCacheState {
                 let _permit = write_sem.acquire().await.unwrap();
             }
 
-            let vec = block_access.read_raw(value.location, value.size).await;
+            let vec = block_access
+                .read_raw(Extent {
+                    location: value.location,
+                    size: value.size,
+                })
+                .await;
             sem2.add_permits(1);
             vec
         }))
@@ -641,10 +627,8 @@ impl ZettaCacheState {
             last_valid_data_offset: self.last_valid_data_offset,
         };
 
-        let mut checkpoint_location = DiskLocation {
-            offset: self.super_phys.last_checkpoint.location.offset
-                + self.super_phys.last_checkpoint.size as u64,
-        };
+        let mut checkpoint_location =
+            self.super_phys.last_checkpoint.location + self.super_phys.last_checkpoint.size;
 
         let raw = self.block_access.json_chunk_to_raw(&checkpoint);
         if raw.len()

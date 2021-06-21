@@ -1,3 +1,5 @@
+use crate::base_types::DiskLocation;
+use crate::base_types::Extent;
 use anyhow::{anyhow, Result};
 use log::*;
 use more_asserts::*;
@@ -10,8 +12,6 @@ use std::os::unix::prelude::AsRawFd;
 use std::time::Instant;
 use tokio::fs::File;
 use tokio::fs::OpenOptions;
-
-use crate::zettacache::DiskLocation;
 
 //const MIN_SECTOR_SIZE: usize = 4 * 1024;
 const MIN_SECTOR_SIZE: usize = 512;
@@ -92,8 +92,8 @@ impl BlockAccess {
 
     // offset and length must be sector-aligned
     // maybe this should return Bytes?
-    pub async fn read_raw(&self, location: DiskLocation, length: usize) -> Vec<u8> {
-        assert_eq!(length, self.round_up_to_sector(length));
+    pub async fn read_raw(&self, extent: Extent) -> Vec<u8> {
+        assert_eq!(extent.size, self.round_up_to_sector(extent.size));
         let fd = self.disk.as_raw_fd();
         let sector_size = self.sector_size;
         let begin = Instant::now();
@@ -101,23 +101,22 @@ impl BlockAccess {
             let mut v = Vec::new();
             // XXX use unsafe code to avoid double initializing it?
             // XXX directio requires the pointer to be sector-aligned, requiring this grossness
-            v.resize(length + sector_size, 0);
+            v.resize(extent.size + sector_size, 0);
             let aligned = unsafe {
                 let ptr = v.as_mut_ptr() as usize;
                 let aligned_ptr = (ptr + sector_size - 1) / sector_size * sector_size;
                 assert_le!(aligned_ptr - v.as_mut_ptr() as usize, sector_size);
-                std::slice::from_raw_parts_mut(aligned_ptr as *mut u8, length)
+                std::slice::from_raw_parts_mut(aligned_ptr as *mut u8, extent.size)
             };
-            nix::sys::uio::pread(fd, aligned, location.offset as i64).unwrap();
+            nix::sys::uio::pread(fd, aligned, extent.location.offset as i64).unwrap();
             // XXX copying again!
             aligned.to_owned()
         })
         .await
         .unwrap();
         trace!(
-            "read({:?} len={}) returned in {}us",
-            location,
-            length,
+            "read({:?}) returned in {}us",
+            extent,
             begin.elapsed().as_micros()
         );
         vec

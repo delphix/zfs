@@ -1,6 +1,8 @@
+use more_asserts::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::*;
+use std::ops::Add;
 
 /*
  * Things that are stored on disk.
@@ -50,5 +52,52 @@ impl Display for BlockID {
 impl BlockID {
     pub fn next(&self) -> BlockID {
         BlockID(self.0 + 1)
+    }
+}
+
+// ZettaCache types
+
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
+pub struct DiskLocation {
+    // note: will need to add disk ID to support multiple disks
+    pub offset: u64,
+}
+impl Add<u64> for DiskLocation {
+    type Output = DiskLocation;
+    fn add(self, rhs: u64) -> Self::Output {
+        DiskLocation {
+            offset: self.offset + rhs,
+        }
+    }
+}
+impl Add<usize> for DiskLocation {
+    type Output = DiskLocation;
+    fn add(self, rhs: usize) -> Self::Output {
+        self + rhs as u64
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
+pub struct Extent {
+    pub location: DiskLocation,
+    // XXX for space efficiency and clarity, make this u32? since it's stored on disk?
+    pub size: usize, // note: since we read it into contiguous memory, it can't be more than usize
+}
+
+impl Extent {
+    pub fn range(&self, relative_offset: usize, size: usize) -> Extent {
+        assert_ge!(self.size, relative_offset + size);
+        Extent {
+            location: self.location + relative_offset,
+            size,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
+pub struct GenerationID(pub u64);
+impl GenerationID {
+    pub fn next(&self) -> GenerationID {
+        GenerationID(self.0 + 1)
     }
 }
