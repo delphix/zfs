@@ -29,6 +29,7 @@ const MAX_PENDING_CHANGES: usize = 100_000; // XXX should be based on RAM usage,
 struct ZettaSuperBlockPhys {
     checkpoint_ring_buffer_size: u32,
     slab_size: u32,
+    // XXX change to "checkpoint ID"
     last_generation: GenerationID,
     last_checkpoint: Extent,
     // XXX put sector size in here too and verify it matches what the disk says now?
@@ -63,7 +64,7 @@ struct ZettaCheckpointPhys {
     generation: GenerationID,
     extent_allocator: ExtentAllocatorPhys,
     last_valid_data_offset: u64, // XXX move to BlockAllocatorPhys
-    index: BlockBasedLogPhys,
+    index: BlockBasedLogWithSummaryPhys,
     chunk_summary: BlockBasedLogPhys,
     operation_log: BlockBasedLogPhys,
 }
@@ -125,8 +126,8 @@ impl BlockBasedLogEntry for IndexEntry {}
 
 #[derive(Debug, Serialize, Deserialize, Copy, Clone)]
 struct ChunkSummaryEntry {
+    offset: LogOffset,
     first_key: IndexKey,
-    offset: u64, // logical offset in log
 }
 impl OnDisk for ChunkSummaryEntry {}
 impl BlockBasedLogEntry for ChunkSummaryEntry {}
@@ -151,7 +152,7 @@ struct ZettaCacheState {
     // and then this is useful.  Same goes for block_access.
     extent_allocator: Arc<ExtentAllocator>,
     // XXX move this to its own file/struct with methods to flush, etc?
-    index: BlockBasedLog<IndexEntry>,
+    index: BlockBasedLogWithSummary<IndexEntry>,
     chunk_summary: BlockBasedLog<ChunkSummaryEntry>,
     // XXX move this to its own file/struct with methods to load, etc?
     operation_log: BlockBasedLog<OperationLogEntry>,
@@ -243,11 +244,12 @@ impl ZettaCache {
             block_access: block_access.clone(),
             size,
             pending_changes,
-            index: BlockBasedLog::open(
+            index: BlockBasedLogWithSummary::open(
                 block_access.clone(),
                 extent_allocator.clone(),
                 checkpoint.index,
-            ),
+            )
+            .await,
             chunk_summary: BlockBasedLog::open(
                 block_access.clone(),
                 extent_allocator.clone(),
@@ -292,6 +294,7 @@ impl ZettaCache {
                         match pending_changes.entry(key) {
                             btree_map::Entry::Occupied(mut oe) => match oe.get() {
                                 PendingChange::Remove() => {
+                                    trace!("insert with existing removal; changing to RemoveThenInsert: {:?} {:?}", key, value);
                                     oe.insert(PendingChange::RemoveThenInsert(value));
                                 }
                                 _ => {
@@ -304,12 +307,14 @@ impl ZettaCache {
                                 }
                             },
                             btree_map::Entry::Vacant(ve) => {
+                                trace!("insert {:?} {:?}", key, value);
                                 ve.insert(PendingChange::Insert(value));
                             }
                         }
                         num_insert_entries += 1;
                     }
                     OperationLogEntry::Remove(key) => {
+                        trace!("remove {:?}", key);
                         pending_changes.insert(key, PendingChange::Remove());
                         num_remove_entries += 1;
                     }
@@ -387,6 +392,7 @@ impl ZettaCacheState {
                     // PendingChange::Removal since there's nothing to remove
                     // from the index.
                     assert_eq!(*value_ref, value);
+                    trace!("removing Insert from pending_changes {:?} {:?}", key, value);
                     self.pending_changes.remove(&key);
                 }
                 Some(PendingChange::RemoveThenInsert(value_ref)) => {
@@ -395,6 +401,11 @@ impl ZettaCacheState {
                     // PendingChange::Remove so that the Index entry won't be
                     // found.
                     assert_eq!(*value_ref, value);
+                    trace!(
+                        "changing RemoveThenInsert to Remove in pending_changes {:?} {:?}",
+                        key,
+                        value
+                    );
                     self.pending_changes.insert(key, PendingChange::Remove());
                 }
                 Some(PendingChange::UpdateAtime(value_ref)) => {
@@ -402,6 +413,11 @@ impl ZettaCacheState {
                     // have an Insert for this key, but the key is in the
                     // Index.
                     assert_eq!(*value_ref, value);
+                    trace!(
+                        "changing UpdateAtime to Remove in pending_changes {:?} {:?}",
+                        key,
+                        value
+                    );
                     self.pending_changes.insert(key, PendingChange::Remove());
                 }
                 Some(PendingChange::Remove()) => {
@@ -409,9 +425,11 @@ impl ZettaCacheState {
                 }
                 None => {
                     // only in Index, not pending_changes
+                    trace!("adding Remove to pending_changes {:?} {:?}", key, value);
                     self.pending_changes.insert(key, PendingChange::Remove());
                 }
             }
+            trace!("adding Remove to operation_log {:?} {:?}", key, value);
             self.operation_log.append(OperationLogEntry::Remove(key));
             return None;
         }
@@ -435,6 +453,11 @@ impl ZettaCacheState {
             Some(PendingChange::Remove()) => panic!("invalid state"),
             None => {
                 // only in Index, not pending_changes
+                trace!(
+                    "adding UpdateAtime to pending_changes {:?} {:?}",
+                    key,
+                    value
+                );
                 self.pending_changes
                     .insert(key, PendingChange::UpdateAtime(value));
             }
@@ -501,9 +524,20 @@ impl ZettaCacheState {
             size: buf_size,
         };
 
+        // XXX we'd like to assert that this is not already in the index
+        // (otherwise we would need to use a PendingChange::RemoveThenInsert).
+        // However, this is not an async fn so we can't do the read here.  We
+        // could spawn a new task, but currently reading the index requires the
+        // big lock.
+
         match self.pending_changes.entry(key) {
             btree_map::Entry::Occupied(mut oe) => match oe.get() {
                 PendingChange::Remove() => {
+                    trace!(
+                        "adding RemoveThenInsert to pending_changes {:?} {:?}",
+                        key,
+                        value
+                    );
                     oe.insert(PendingChange::RemoveThenInsert(value));
                 }
                 _ => {
@@ -512,6 +546,7 @@ impl ZettaCacheState {
                 }
             },
             btree_map::Entry::Vacant(ve) => {
+                trace!("adding Insert to pending_changes {:?} {:?}", key, value);
                 ve.insert(PendingChange::Insert(value));
             }
         }
@@ -534,6 +569,7 @@ impl ZettaCacheState {
         }
         */
 
+        trace!("adding Insert to operation_log {:?} {:?}", key, value);
         self.operation_log
             .append(OperationLogEntry::Insert((key, value)));
 
@@ -671,23 +707,24 @@ impl ZettaCacheState {
 
     async fn merge_pending_changes(&mut self) {
         let begin = Instant::now();
-        info!(
-            "writing new index to merge {} pending changes into index of {} entries",
-            self.pending_changes.len(),
-            "XXX",
-        );
         // XXX when we are continually merging, over multiple checkpoints, we
         // will probably want the BlockBasedLog to know about multiple
         // generations, and therefore we'd keep the one BlockBasedLog but create
         // a new generation (as we do with ObjectBasedLog).
-        let mut next_generation_index = BlockBasedLog::open(
+        let mut next_generation_index = BlockBasedLogWithSummary::open(
             self.block_access.clone(),
             self.extent_allocator.clone(),
-            BlockBasedLogPhys::default(),
-        );
-        // XXX need to also create ChunkSummary, so that we can find individual chunks.
-        let mut pending_changes_iter = self.pending_changes.iter_mut().peekable();
+            BlockBasedLogWithSummaryPhys::default(),
+        )
+        .await;
         self.index.flush().await;
+        info!(
+            "writing new index to merge {} pending changes into index of {} entries",
+            self.pending_changes.len(),
+            self.index.len(),
+        );
+        // XXX load operation_log and verify that the pending_changes match it?
+        let mut pending_changes_iter = self.pending_changes.iter().peekable();
         self.index
             .iter()
             .for_each(|entry| {
@@ -801,10 +838,14 @@ impl ZettaCacheState {
         self.pending_changes.clear();
         self.index.clear();
         self.index = next_generation_index;
+        self.operation_log.clear();
+
+        // Note: the caller is about to flush as well, but we want to count the time in the below info!
+        self.index.flush().await;
 
         info!(
             "wrote new index with {} entries in {}ms",
-            "XXX",
+            self.index.len(),
             begin.elapsed().as_millis()
         );
     }

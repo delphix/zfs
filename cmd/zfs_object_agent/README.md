@@ -9,15 +9,6 @@ This is a prototype of the ZFS Object Storage Agent.
 
 ## Setup:
 
-On Linux test VM (can be in dcol or dcoa):
-```sh
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-# choose option 1, default installation
-source $HOME/.cargo/env #or logout and log back in
-sudo apt-get update -y
-sudo apt-get install -y pkg-config
-```
-
 On laptop (optional; assumes OSX but probably works on linux too):
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh

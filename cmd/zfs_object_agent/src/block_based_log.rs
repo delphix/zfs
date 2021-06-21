@@ -11,11 +11,14 @@ use more_asserts::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::cmp::max;
+use std::cmp::min;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::ops::Add;
 use std::ops::Bound::*;
 use std::ops::Sub;
 use std::sync::Arc;
+use std::time::Instant;
 
 // XXX maybe this is wasteful for the smaller logs?
 const DEFAULT_EXTENT_SIZE: usize = 128 * 1024 * 1024;
@@ -34,17 +37,36 @@ pub struct BlockBasedLogPhys {
     num_entries: u64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct BlockBasedLogWithSummaryPhys {
+    this: BlockBasedLogPhys,
+    chunk_summary: BlockBasedLogPhys,
+}
+
 pub trait BlockBasedLogEntry: 'static + OnDisk + Copy + Clone + Unpin + Send + Sync {}
 //pub trait OrderedBlockBasedLogEntry: BlockBasedLogEntry + Ord {}
+
+#[derive(Debug, Serialize, Deserialize, Copy, Clone)]
+pub struct BlockBasedLogChunkSummaryEntry<T: BlockBasedLogEntry> {
+    offset: LogOffset,
+    #[serde(bound(deserialize = "T: DeserializeOwned"))]
+    first_entry: T,
+}
+impl<T: BlockBasedLogEntry> OnDisk for BlockBasedLogChunkSummaryEntry<T> {}
+impl<T: BlockBasedLogEntry> BlockBasedLogEntry for BlockBasedLogChunkSummaryEntry<T> {}
 
 pub struct BlockBasedLog<T: BlockBasedLogEntry> {
     block_access: Arc<BlockAccess>,
     extent_allocator: Arc<ExtentAllocator>,
     phys: BlockBasedLogPhys,
-    // XXX need to load this from the chunkSummary
-    // XXX need to detect if this is present or not, and fail operations that rely on it if not present
-    chunks: Vec<(LogOffset, T)>, // Stores first entry (and offset) of each chunk.
     pending_entries: Vec<T>,
+}
+
+pub struct BlockBasedLogWithSummary<T: BlockBasedLogEntry> {
+    this: BlockBasedLog<T>,
+    chunk_summary: BlockBasedLog<BlockBasedLogChunkSummaryEntry<T>>,
+    //chunks: Vec<(LogOffset, T)>, // Stores first entry (and offset) of each chunk.
+    chunks: Vec<BlockBasedLogChunkSummaryEntry<T>>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -68,7 +90,6 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
             block_access,
             extent_allocator,
             phys,
-            chunks: Vec::new(),
             pending_entries: Vec::new(),
         }
     }
@@ -77,12 +98,23 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
         self.phys.clone()
     }
 
+    pub fn len(&self) -> u64 {
+        self.phys.num_entries + self.pending_entries.len() as u64
+    }
+
     pub fn append(&mut self, entry: T) {
         self.pending_entries.push(entry);
         // XXX if too many pending, initiate flush?
     }
 
     pub async fn flush(&mut self) {
+        self.flush_impl(|_, _, _| {}).await
+    }
+
+    async fn flush_impl<F>(&mut self, mut new_chunk_fn: F)
+    where
+        F: FnMut(ChunkID, LogOffset, T),
+    {
         if self.pending_entries.is_empty() {
             return;
         }
@@ -129,8 +161,7 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
             // XXX would be better to aggregate lots of buffers into one write
             writes_stream.push(self.block_access.write_raw(extent.location, raw_chunk));
 
-            assert_eq!(ChunkID(self.chunks.len() as u64), chunk.id);
-            self.chunks.push((chunk.offset, first_entry));
+            new_chunk_fn(chunk.id, chunk.offset, first_entry);
 
             self.phys.num_entries += chunk.entries.len() as u64;
             self.phys.next_chunk = self.phys.next_chunk.next();
@@ -186,15 +217,17 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
         // a huge deal I guess since it should be small.
         let phys = self.phys.clone();
         let block_access = self.block_access.clone();
+        let next_chunk_offset = self.phys.next_chunk_offset;
         stream! {
             let mut num_entries = 0;
             let mut chunk_id = ChunkID(0);
-            for (_offset, extent) in phys.extents.iter() {
+            for (offset, extent) in phys.extents.iter() {
                 // XXX probably want to do smaller i/os than the entire extent (up to 128MB)
                 // XXX also want to issue a few in parallel?
-                // XXX if this extent is at the end, we don't need to read the
-                // unused part of it (based on next_chunk_offset)
-                let extent_bytes = block_access.read_raw(*extent).await;
+
+                let truncated_extent =
+                    extent.range(0, min(extent.size, (next_chunk_offset - *offset) as usize));
+                let extent_bytes = block_access.read_raw(truncated_extent).await;
                 // XXX handle checksum error here
                 let mut total_consumed = 0;
                 while total_consumed < extent_bytes.len() {
@@ -221,23 +254,100 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
             assert_eq!(phys.num_entries, num_entries);
         }
     }
+}
+
+impl<T: BlockBasedLogEntry> BlockBasedLogWithSummary<T> {
+    pub async fn open(
+        block_access: Arc<BlockAccess>,
+        extent_allocator: Arc<ExtentAllocator>,
+        phys: BlockBasedLogWithSummaryPhys,
+    ) -> BlockBasedLogWithSummary<T> {
+        let chunk_summary = BlockBasedLog::open(
+            block_access.clone(),
+            extent_allocator.clone(),
+            phys.chunk_summary,
+        );
+
+        // load in summary from disk
+        let begin = Instant::now();
+        let chunks = chunk_summary.iter().collect::<Vec<_>>().await;
+        info!(
+            "loaded summary of {} chunks in {}ms",
+            chunks.len(),
+            begin.elapsed().as_millis()
+        );
+
+        BlockBasedLogWithSummary {
+            this: BlockBasedLog::open(block_access.clone(), extent_allocator.clone(), phys.this),
+            chunk_summary,
+            chunks,
+        }
+    }
+
+    pub fn get_phys(&self) -> BlockBasedLogWithSummaryPhys {
+        BlockBasedLogWithSummaryPhys {
+            this: self.this.get_phys(),
+            chunk_summary: self.chunk_summary.get_phys(),
+        }
+    }
+
+    pub fn len(&self) -> u64 {
+        self.this.len()
+    }
+
+    pub fn append(&mut self, entry: T) {
+        self.this.append(entry)
+    }
+
+    pub async fn flush(&mut self) {
+        let chunks = &mut self.chunks;
+        let chunk_summary = &mut self.chunk_summary;
+        self.this
+            .flush_impl(|chunk_id, offset, first_entry| {
+                assert_eq!(ChunkID(chunks.len() as u64), chunk_id);
+                let entry = BlockBasedLogChunkSummaryEntry {
+                    offset,
+                    first_entry,
+                };
+                chunks.push(entry);
+                chunk_summary.append(entry);
+            })
+            .await;
+        // Note: it would be possible to redesign flush_impl() such that it did
+        // all the "real" work and then returned a future that would just wait
+        // for the i/o to complete.  Then we could be writing to disk both
+        // "this" and the summary at the same time.
+
+        self.chunk_summary.flush().await;
+    }
+
+    pub fn clear(&mut self) {
+        self.this.clear();
+        self.chunk_summary.clear();
+    }
+
+    /// Iterates the on-disk state; panics if there are pending changes.
+    pub fn iter(&self) -> impl Stream<Item = T> {
+        self.this.iter()
+    }
 
     /// Returns the exact location/size of this chunk (not the whole contiguous extent)
     fn chunk_extent(&self, chunk_id: usize) -> Extent {
-        let (chunk_offset, _first_entry) = self.chunks[chunk_id];
+        let chunk_summary = self.chunks[chunk_id];
         let chunk_size = if chunk_id == self.chunks.len() - 1 {
-            self.phys.next_chunk_offset - chunk_offset
+            self.this.phys.next_chunk_offset - chunk_summary.offset
         } else {
-            self.chunks[chunk_id + 1].0 - chunk_offset
+            self.chunks[chunk_id + 1].offset - chunk_summary.offset
         } as usize;
 
         let (extent_offset, extent) = self
+            .this
             .phys
             .extents
-            .range((Unbounded, Included(chunk_offset)))
+            .range((Unbounded, Included(chunk_summary.offset)))
             .next_back()
             .unwrap();
-        extent.range((chunk_offset - *extent_offset) as usize, chunk_size)
+        extent.range((chunk_summary.offset - *extent_offset) as usize, chunk_size)
     }
 
     /// Entries must have been added in sorted order, according to the provided
@@ -247,13 +357,13 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
         B: Ord + Debug,
         F: FnMut(&T) -> B,
     {
-        assert_eq!(ChunkID(self.chunks.len() as u64), self.phys.next_chunk);
+        assert_eq!(ChunkID(self.chunks.len() as u64), self.this.phys.next_chunk);
         // XXX would be nice to also store last entry in the log, so that if we
         // look for something after it, we can return None without reading the
         // last chunk.
         let chunk_id = match self
             .chunks
-            .binary_search_by_key(key, |(_offset, first_entry)| f(first_entry))
+            .binary_search_by_key(key, |chunk_summary| f(&chunk_summary.first_entry))
         {
             Ok(index) => index,
             Err(index) if index == 0 => return None, // key is before the first chunk, therefore not present
@@ -267,9 +377,12 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
             chunk_extent,
             key
         );
-        let chunk_bytes = self.block_access.read_raw(chunk_extent).await;
-        let (chunk, _consumed): (BlockBasedLogChunk<T>, usize) =
-            self.block_access.json_chunk_from_raw(&chunk_bytes).unwrap();
+        let chunk_bytes = self.this.block_access.read_raw(chunk_extent).await;
+        let (chunk, _consumed): (BlockBasedLogChunk<T>, usize) = self
+            .this
+            .block_access
+            .json_chunk_from_raw(&chunk_bytes)
+            .unwrap();
         assert_eq!(chunk.id, ChunkID(chunk_id as u64));
         match chunk.entries.binary_search_by_key(key, f) {
             Ok(index) => Some(chunk.entries[index]),
@@ -281,6 +394,13 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
 #[derive(Serialize, Deserialize, Default, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
 pub struct LogOffset(u64);
 
+impl Add<usize> for LogOffset {
+    type Output = LogOffset;
+
+    fn add(self, rhs: usize) -> Self::Output {
+        LogOffset(self.0 + rhs as u64)
+    }
+}
 impl Sub<LogOffset> for LogOffset {
     type Output = u64;
 
