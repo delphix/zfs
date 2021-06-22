@@ -44,7 +44,6 @@ pub struct BlockBasedLogWithSummaryPhys {
 }
 
 pub trait BlockBasedLogEntry: 'static + OnDisk + Copy + Clone + Unpin + Send + Sync {}
-//pub trait OrderedBlockBasedLogEntry: BlockBasedLogEntry + Ord {}
 
 #[derive(Debug, Serialize, Deserialize, Copy, Clone)]
 pub struct BlockBasedLogChunkSummaryEntry<T: BlockBasedLogEntry> {
@@ -65,7 +64,6 @@ pub struct BlockBasedLog<T: BlockBasedLogEntry> {
 pub struct BlockBasedLogWithSummary<T: BlockBasedLogEntry> {
     this: BlockBasedLog<T>,
     chunk_summary: BlockBasedLog<BlockBasedLogChunkSummaryEntry<T>>,
-    //chunks: Vec<(LogOffset, T)>, // Stores first entry (and offset) of each chunk.
     chunks: Vec<BlockBasedLogChunkSummaryEntry<T>>,
 }
 
@@ -200,15 +198,6 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
             },
         }
     }
-
-    /*
-    fn capacity(&self) -> LogOffset {
-        match self.phys.extents.iter().next_back() {
-            Some((offset, extent)) => offset + extent.size,
-            None => 0,
-        }
-    }
-    */
 
     /// Iterates the on-disk state; panics if there are pending changes.
     pub fn iter(&self) -> impl Stream<Item = T> {

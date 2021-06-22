@@ -29,9 +29,8 @@ const MAX_PENDING_CHANGES: usize = 100_000; // XXX should be based on RAM usage,
 struct ZettaSuperBlockPhys {
     checkpoint_ring_buffer_size: u32,
     slab_size: u32,
-    // XXX change to "checkpoint ID"
-    last_generation: GenerationID,
-    last_checkpoint: Extent,
+    last_checkpoint_id: CheckpointID,
+    last_checkpoint_extent: Extent,
     // XXX put sector size in here too and verify it matches what the disk says now?
     // XXX put disk size in here so we can detect expansion?
 }
@@ -61,7 +60,7 @@ impl ZettaSuperBlockPhys {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ZettaCheckpointPhys {
-    generation: GenerationID,
+    generation: CheckpointID,
     extent_allocator: ExtentAllocatorPhys,
     last_valid_data_offset: u64, // XXX move to BlockAllocatorPhys
     index: BlockBasedLogWithSummaryPhys,
@@ -170,7 +169,7 @@ impl ZettaCache {
         let metadata_start = SUPERBLOCK_SIZE + DEFAULT_CHECKPOINT_RING_BUFFER_SIZE;
         let data_start = metadata_start + DEFAULT_METADATA_SIZE;
         let checkpoint = ZettaCheckpointPhys {
-            generation: GenerationID(0),
+            generation: CheckpointID(0),
             extent_allocator: ExtentAllocatorPhys {
                 first_valid_offset: metadata_start as u64,
                 last_valid_offset: data_start as u64,
@@ -194,13 +193,13 @@ impl ZettaCache {
         let phys = ZettaSuperBlockPhys {
             checkpoint_ring_buffer_size: DEFAULT_CHECKPOINT_RING_BUFFER_SIZE as u32,
             slab_size: DEFAULT_SLAB_SIZE as u32,
-            last_checkpoint: Extent {
+            last_checkpoint_extent: Extent {
                 location: DiskLocation {
                     offset: SUPERBLOCK_SIZE as u64,
                 },
                 size: checkpoint_size,
             },
-            last_generation: GenerationID(0),
+            last_checkpoint_id: CheckpointID(0),
         };
         phys.write(&block_access).await;
     }
@@ -219,9 +218,10 @@ impl ZettaCache {
             }
         };
 
-        let checkpoint = ZettaCheckpointPhys::read(&block_access, phys.last_checkpoint).await;
+        let checkpoint =
+            ZettaCheckpointPhys::read(&block_access, phys.last_checkpoint_extent).await;
 
-        assert_eq!(checkpoint.generation, phys.last_generation);
+        assert_eq!(checkpoint.generation, phys.last_checkpoint_id);
 
         let metadata_start = SUPERBLOCK_SIZE + phys.checkpoint_ring_buffer_size as usize;
         // XXX pass in the metadata_start to ExtentAllocator::open, rather than
@@ -613,7 +613,7 @@ impl ZettaCacheState {
     async fn flush_checkpoint(&mut self) {
         debug!(
             "flushing checkpoint {:?}",
-            self.super_phys.last_generation.next()
+            self.super_phys.last_checkpoint_id.next()
         );
 
         let begin = Instant::now();
@@ -655,7 +655,7 @@ impl ZettaCacheState {
         .await;
 
         let checkpoint = ZettaCheckpointPhys {
-            generation: self.super_phys.last_generation.next(),
+            generation: self.super_phys.last_checkpoint_id.next(),
             extent_allocator: self.extent_allocator.get_phys(),
             index: self.index.get_phys(),
             chunk_summary: self.chunk_summary.get_phys(),
@@ -663,8 +663,8 @@ impl ZettaCacheState {
             last_valid_data_offset: self.last_valid_data_offset,
         };
 
-        let mut checkpoint_location =
-            self.super_phys.last_checkpoint.location + self.super_phys.last_checkpoint.size;
+        let mut checkpoint_location = self.super_phys.last_checkpoint_extent.location
+            + self.super_phys.last_checkpoint_extent.size;
 
         let raw = self.block_access.json_chunk_to_raw(&checkpoint);
         if raw.len()
@@ -674,8 +674,8 @@ impl ZettaCacheState {
             checkpoint_location.offset = SUPERBLOCK_SIZE as u64;
             assert_le!(
                 raw.len(),
-                (self.super_phys.last_checkpoint.location.offset - checkpoint_location.offset)
-                    as usize,
+                (self.super_phys.last_checkpoint_extent.location.offset
+                    - checkpoint_location.offset) as usize,
             );
             // XXX The above assertion could fail if there isn't enough
             // checkpoint space for 3 checkpoints (the existing one that
@@ -687,20 +687,20 @@ impl ZettaCacheState {
         }
         debug!("writing to {:?}: {:#?}", checkpoint_location, checkpoint);
 
-        self.super_phys.last_checkpoint = Extent {
+        self.super_phys.last_checkpoint_extent = Extent {
             location: checkpoint_location,
             size: raw.len(),
         };
         self.block_access.write_raw(checkpoint_location, raw).await;
 
-        self.super_phys.last_generation = self.super_phys.last_generation.next();
+        self.super_phys.last_checkpoint_id = self.super_phys.last_checkpoint_id.next();
         self.super_phys.write(&self.block_access).await;
 
         self.extent_allocator.checkpoint_done();
 
         debug!(
             "completed checkpoint {:?} in {}ms",
-            self.super_phys.last_generation,
+            self.super_phys.last_checkpoint_id,
             begin.elapsed().as_millis()
         );
     }
@@ -711,10 +711,10 @@ impl ZettaCacheState {
         // will probably want the BlockBasedLog to know about multiple
         // generations, and therefore we'd keep the one BlockBasedLog but create
         // a new generation (as we do with ObjectBasedLog).
-        let mut next_generation_index = BlockBasedLogWithSummary::open(
+        let mut new_index = BlockBasedLogWithSummary::open(
             self.block_access.clone(),
             self.extent_allocator.clone(),
-            BlockBasedLogWithSummaryPhys::default(),
+            Default::default(),
         )
         .await;
         self.index.flush().await;
@@ -740,7 +740,7 @@ impl ZettaCacheState {
                         break;
                     }
                     // Add this new entry to the index
-                    next_generation_index.append(IndexEntry {
+                    new_index.append(IndexEntry {
                         key: **pc_key,
                         value: *pc_value,
                     });
@@ -757,7 +757,7 @@ impl ZettaCacheState {
                         } else {
                             // There shouldn't be a pending removal of an entry that doesn't exist in the index.
                             assert_gt!(**pc_key, entry.key);
-                            next_generation_index.append(entry);
+                            new_index.append(entry);
                         }
                     }
                     Some((pc_key, PendingChange::Insert(_pc_value))) => {
@@ -766,14 +766,14 @@ impl ZettaCacheState {
                         // to be removed first, resulting in a
                         // PendingChange::RemoveThenInsert.
                         assert_gt!(**pc_key, entry.key);
-                        next_generation_index.append(entry);
+                        new_index.append(entry);
                     }
                     Some((pc_key, PendingChange::RemoveThenInsert(pc_value))) => {
                         if **pc_key == entry.key {
                             // This key must have been removed (evicted) and then re-inserted.
                             // Add the pending change to the next generation instead of the current index's entry
                             assert_eq!(pc_value.size, entry.value.size);
-                            next_generation_index.append(IndexEntry {
+                            new_index.append(IndexEntry {
                                 key: **pc_key,
                                 value: *pc_value,
                             });
@@ -783,7 +783,7 @@ impl ZettaCacheState {
                         } else {
                             // We shouldn't have skipped any, because there has to be a corresponding Index entry
                             assert_gt!(**pc_key, entry.key);
-                            next_generation_index.append(entry);
+                            new_index.append(entry);
                         }
                     }
                     Some((pc_key, PendingChange::UpdateAtime(pc_value))) => {
@@ -791,7 +791,7 @@ impl ZettaCacheState {
                             // Add the pending entry to the next generation instead of the current index's entry
                             assert_eq!(pc_value.location, entry.value.location);
                             assert_eq!(pc_value.size, entry.value.size);
-                            next_generation_index.append(IndexEntry {
+                            new_index.append(IndexEntry {
                                 key: **pc_key,
                                 value: *pc_value,
                             });
@@ -801,12 +801,12 @@ impl ZettaCacheState {
                         } else {
                             // We shouldn't have skipped any, because there has to be a corresponding Index entry
                             assert_gt!(**pc_key, entry.key);
-                            next_generation_index.append(entry);
+                            new_index.append(entry);
                         }
                     }
                     None => {
                         // no more pending changes
-                        next_generation_index.append(entry);
+                        new_index.append(entry);
                     }
                 }
                 future::ready(())
@@ -819,7 +819,7 @@ impl ZettaCacheState {
                 pc_key,
                 pc_value
             );
-            next_generation_index.append(IndexEntry {
+            new_index.append(IndexEntry {
                 key: **pc_key,
                 value: *pc_value,
             });
@@ -837,7 +837,7 @@ impl ZettaCacheState {
 
         self.pending_changes.clear();
         self.index.clear();
-        self.index = next_generation_index;
+        self.index = new_index;
         self.operation_log.clear();
 
         // Note: the caller is about to flush as well, but we want to count the time in the below info!

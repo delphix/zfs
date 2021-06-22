@@ -95,9 +95,9 @@ impl Extent {
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
-pub struct GenerationID(pub u64);
-impl GenerationID {
-    pub fn next(&self) -> GenerationID {
-        GenerationID(self.0 + 1)
+pub struct CheckpointID(pub u64);
+impl CheckpointID {
+    pub fn next(&self) -> CheckpointID {
+        CheckpointID(self.0 + 1)
     }
 }
