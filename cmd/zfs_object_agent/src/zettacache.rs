@@ -285,7 +285,8 @@ impl ZettaCache {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
-                debug!("{:?}", my_cache.metrics);
+                debug!("metrics: {:?}", my_cache.metrics);
+                //let x = &my_cache.metrics.lookup.response_time.histogram();
             }
         });
 
@@ -310,12 +311,12 @@ impl ZettaCache {
                                     trace!("insert with existing removal; changing to RemoveThenInsert: {:?} {:?}", key, value);
                                     oe.insert(PendingChange::RemoveThenInsert(value));
                                 }
-                                _ => {
+                                pc @ _ => {
                                     panic!(
-                                        "Inserting {:?} into already existing entry {:?} {:?}",
-                                        oe.get(),
+                                        "Inserting {:?} {:?} into already existing entry {:?}",
                                         key,
-                                        value
+                                        value,
+                                        pc,
                                     );
                                 }
                             },
@@ -327,8 +328,29 @@ impl ZettaCache {
                         num_insert_entries += 1;
                     }
                     OperationLogEntry::Remove(key) => {
-                        trace!("remove {:?}", key);
-                        pending_changes.insert(key, PendingChange::Remove());
+                        match pending_changes.entry(key) {
+                            btree_map::Entry::Occupied(mut oe) => match oe.get() {
+                                PendingChange::Insert(value) => {
+                                    trace!("remove with existing insert; clearing {:?} {:?}", key, value);
+                                    oe.remove();
+                                }
+                                PendingChange::RemoveThenInsert(value) => {
+                                    trace!("remove with existing removetheninsert; changing to remove: {:?} {:?}", key, value);
+                                    oe.insert(PendingChange::Remove());
+                                }
+                                pc @ _ => {
+                                    panic!(
+                                        "Removing {:?} from already existing entry {:?}",
+                                        key,
+                                        pc,
+                                    );
+                                }
+                            },
+                            btree_map::Entry::Vacant(ve) => {
+                                trace!("remove {:?}", key);
+                                ve.insert(PendingChange::Remove());
+                            }
+                        }
                         num_remove_entries += 1;
                     }
                 };
@@ -734,9 +756,10 @@ impl ZettaCacheState {
         .await;
         self.index.flush().await;
         info!(
-            "writing new index to merge {} pending changes into index of {} entries",
+            "writing new index to merge {} pending changes into index of {} entries ({} MB)",
             self.pending_changes.len(),
             self.index.len(),
+            self.index.num_bytes() / 1024 / 1024,
         );
         // XXX load operation_log and verify that the pending_changes match it?
         let mut pending_changes_iter = self.pending_changes.iter().peekable();
@@ -859,9 +882,11 @@ impl ZettaCacheState {
         self.index.flush().await;
 
         info!(
-            "wrote new index with {} entries in {}ms",
+            "wrote new index with {} entries ({} MB) in {}ms ({:.1}MB/s)",
             self.index.len(),
-            begin.elapsed().as_millis()
+            self.index.num_bytes() / 1024 / 1024,
+            begin.elapsed().as_millis(),
+            (self.index.num_bytes() as f64 / 1024f64 / 1024f64) / begin.elapsed().as_secs_f64(),
         );
     }
 }

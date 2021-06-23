@@ -100,6 +100,11 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
         self.phys.num_entries + self.pending_entries.len() as u64
     }
 
+    /// Size of the on-disk representation
+    pub fn num_bytes(&self) -> u64 {
+        self.phys.next_chunk_offset.0
+    }
+
     pub fn append(&mut self, entry: T) {
         self.pending_entries.push(entry);
         // XXX if too many pending, initiate flush?
@@ -283,6 +288,11 @@ impl<T: BlockBasedLogEntry> BlockBasedLogWithSummary<T> {
 
     pub fn len(&self) -> u64 {
         self.this.len()
+    }
+
+    /// Size of the on-disk representation
+    pub fn num_bytes(&self) -> u64 {
+        self.this.num_bytes() + self.chunk_summary.num_bytes()
     }
 
     pub fn append(&mut self, entry: T) {
