@@ -7,6 +7,8 @@ use anyhow::Result;
 use futures::future;
 use futures::stream::*;
 use log::*;
+use metered::common::ResponseTime;
+use metered::metered;
 use more_asserts::*;
 use serde::{Deserialize, Serialize};
 use std::collections::btree_map;
@@ -113,6 +115,7 @@ enum PendingChange {
 pub struct ZettaCache {
     // XXX may need to break up this big lock.  At least we aren't holding it while doing i/o
     state: Arc<tokio::sync::Mutex<ZettaCacheState>>,
+    metrics: Arc<ZettaCacheMetrics>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Copy, Clone)]
@@ -150,7 +153,6 @@ struct ZettaCacheState {
     // need the lock inside it.  But hopefully we split up the big State lock
     // and then this is useful.  Same goes for block_access.
     extent_allocator: Arc<ExtentAllocator>,
-    // XXX move this to its own file/struct with methods to flush, etc?
     index: BlockBasedLogWithSummary<IndexEntry>,
     chunk_summary: BlockBasedLog<ChunkSummaryEntry>,
     // XXX move this to its own file/struct with methods to load, etc?
@@ -163,6 +165,7 @@ struct ZettaCacheState {
     outstanding_writes: BTreeMap<IndexValue, Arc<Semaphore>>,
 }
 
+#[metered(registry=ZettaCacheMetrics)]
 impl ZettaCache {
     pub async fn create(path: &str) {
         let block_access = BlockAccess::new(path).await;
@@ -265,6 +268,7 @@ impl ZettaCache {
 
         let this = ZettaCache {
             state: Arc::new(tokio::sync::Mutex::new(state)),
+            metrics: Default::default(),
         };
 
         let my_cache = this.clone();
@@ -273,6 +277,15 @@ impl ZettaCache {
             loop {
                 interval.tick().await;
                 my_cache.state.lock().await.flush_checkpoint().await;
+            }
+        });
+
+        let my_cache = this.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                debug!("{:?}", my_cache.metrics);
             }
         });
 
@@ -332,6 +345,7 @@ impl ZettaCache {
         pending_changes
     }
 
+    #[measure(ResponseTime)]
     pub async fn lookup(&self, guid: PoolGUID, block: BlockID) -> Option<Vec<u8>> {
         let opt_jh = {
             let mut state = self.state.lock().await;
@@ -344,6 +358,7 @@ impl ZettaCache {
         }
     }
 
+    #[measure(ResponseTime)]
     pub async fn insert(&self, guid: PoolGUID, block: BlockID, buf: Vec<u8>) {
         let mut state = self.state.lock().await;
         state.insert(guid, block, buf);

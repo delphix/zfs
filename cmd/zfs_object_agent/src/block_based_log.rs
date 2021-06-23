@@ -211,19 +211,20 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
             let mut num_entries = 0;
             let mut chunk_id = ChunkID(0);
             for (offset, extent) in phys.extents.iter() {
-                // XXX probably want to do smaller i/os than the entire extent (up to 128MB)
-                // XXX also want to issue a few in parallel?
+                // XXX Probably want to do smaller i/os than the entire extent
+                // (which is up to 128MB).  Also want to issue a few in
+                // parallel?
 
                 let truncated_extent =
                     extent.range(0, min(extent.size, (next_chunk_offset - *offset) as usize));
                 let extent_bytes = block_access.read_raw(truncated_extent).await;
-                // XXX handle checksum error here
                 let mut total_consumed = 0;
                 while total_consumed < extent_bytes.len() {
                     let chunk_location = DiskLocation {
                         offset: extent.location.offset + total_consumed as u64,
                     };
                     trace!("decoding {:?} from {:?}", chunk_id, chunk_location);
+                    // XXX handle checksum error here
                     let (chunk, consumed): (BlockBasedLogChunk<T>, usize) = block_access
                         .json_chunk_from_raw(&extent_bytes[total_consumed..])
                         .context(format!("{:?} at {:?}", chunk_id, chunk_location,))
