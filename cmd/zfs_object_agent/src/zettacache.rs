@@ -422,52 +422,7 @@ impl ZettaCacheState {
                 key,
                 value
             );
-            match pc {
-                Some(PendingChange::Insert(value_ref)) => {
-                    // The operation_log has an Insert for this key, and the key
-                    // is not in the Index.  We don't need a
-                    // PendingChange::Removal since there's nothing to remove
-                    // from the index.
-                    assert_eq!(*value_ref, value);
-                    trace!("removing Insert from pending_changes {:?} {:?}", key, value);
-                    self.pending_changes.remove(&key);
-                }
-                Some(PendingChange::RemoveThenInsert(value_ref)) => {
-                    // The operation_log has a Remove, and then an Insert for
-                    // this key, so the key is in the Index.  We need a
-                    // PendingChange::Remove so that the Index entry won't be
-                    // found.
-                    assert_eq!(*value_ref, value);
-                    trace!(
-                        "changing RemoveThenInsert to Remove in pending_changes {:?} {:?}",
-                        key,
-                        value
-                    );
-                    self.pending_changes.insert(key, PendingChange::Remove());
-                }
-                Some(PendingChange::UpdateAtime(value_ref)) => {
-                    // It's just an atime update, so the operation_log doesn't
-                    // have an Insert for this key, but the key is in the
-                    // Index.
-                    assert_eq!(*value_ref, value);
-                    trace!(
-                        "changing UpdateAtime to Remove in pending_changes {:?} {:?}",
-                        key,
-                        value
-                    );
-                    self.pending_changes.insert(key, PendingChange::Remove());
-                }
-                Some(PendingChange::Remove()) => {
-                    panic!("invalid state");
-                }
-                None => {
-                    // only in Index, not pending_changes
-                    trace!("adding Remove to pending_changes {:?} {:?}", key, value);
-                    self.pending_changes.insert(key, PendingChange::Remove());
-                }
-            }
-            trace!("adding Remove to operation_log {:?} {:?}", key, value);
-            self.operation_log.append(OperationLogEntry::Remove(key));
+            self.evict_block(key);
             return None;
         }
 
@@ -526,6 +481,55 @@ impl ZettaCacheState {
             sem2.add_permits(1);
             vec
         }))
+    }
+
+    fn evict_block(&mut self, key: IndexKey) {
+        match self.pending_changes.get_mut(&key) {
+            Some(PendingChange::Insert(value)) => {
+                // The operation_log has an Insert for this key, and the key
+                // is not in the Index.  We don't need a
+                // PendingChange::Removal since there's nothing to remove
+                // from the index.
+                //assert_eq!(*value_ref, value);
+                trace!("removing Insert from pending_changes {:?} {:?}", key, value);
+                self.pending_changes.remove(&key);
+            }
+            Some(PendingChange::RemoveThenInsert(value)) => {
+                // The operation_log has a Remove, and then an Insert for
+                // this key, so the key is in the Index.  We need a
+                // PendingChange::Remove so that the Index entry won't be
+                // found.
+                //assert_eq!(*value_ref, value);
+                trace!(
+                    "changing RemoveThenInsert to Remove in pending_changes {:?} {:?}",
+                    key,
+                    value,
+                );
+                self.pending_changes.insert(key, PendingChange::Remove());
+            }
+            Some(PendingChange::UpdateAtime(value)) => {
+                // It's just an atime update, so the operation_log doesn't
+                // have an Insert for this key, but the key is in the
+                // Index.
+                //assert_eq!(*value_ref, value);
+                trace!(
+                    "changing UpdateAtime to Remove in pending_changes {:?} {:?}",
+                    key,
+                    value,
+                );
+                self.pending_changes.insert(key, PendingChange::Remove());
+            }
+            Some(PendingChange::Remove()) => {
+                panic!("invalid state");
+            }
+            None => {
+                // only in Index, not pending_changes
+                trace!("adding Remove to pending_changes {:?}", key);
+                self.pending_changes.insert(key, PendingChange::Remove());
+            }
+        }
+        trace!("adding Remove to operation_log {:?}", key);
+        self.operation_log.append(OperationLogEntry::Remove(key));
     }
 
     /// Insert this block to the cache, if space and performance parameters
@@ -882,10 +886,10 @@ impl ZettaCacheState {
         self.index.flush().await;
 
         info!(
-            "wrote new index with {} entries ({} MB) in {}ms ({:.1}MB/s)",
+            "wrote new index with {} entries ({} MB) in {:.1}s ({:.1}MB/s)",
             self.index.len(),
             self.index.num_bytes() / 1024 / 1024,
-            begin.elapsed().as_millis(),
+            begin.elapsed().as_secs_f64(),
             (self.index.num_bytes() as f64 / 1024f64 / 1024f64) / begin.elapsed().as_secs_f64(),
         );
     }

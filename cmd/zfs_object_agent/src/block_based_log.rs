@@ -267,8 +267,9 @@ impl<T: BlockBasedLogEntry> BlockBasedLogWithSummary<T> {
         let begin = Instant::now();
         let chunks = chunk_summary.iter().collect::<Vec<_>>().await;
         info!(
-            "loaded summary of {} chunks in {}ms",
+            "loaded summary of {} chunks ({}KB) in {}ms",
             chunks.len(),
+            chunk_summary.num_bytes() / 1024,
             begin.elapsed().as_millis()
         );
 
