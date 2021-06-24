@@ -385,6 +385,8 @@ impl<T: BlockBasedLogEntry> BlockBasedLogWithSummary<T> {
             .json_chunk_from_raw(&chunk_bytes)
             .unwrap();
         assert_eq!(chunk.id, ChunkID(chunk_id as u64));
+        // XXX can we assert that we are looking in the right chunk?
+        // XXX I think we'd want to the chunk to have the next chunk's first key as well
         match chunk.entries.binary_search_by_key(key, f) {
             Ok(index) => Some(chunk.entries[index]),
             Err(_) => None,
