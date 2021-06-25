@@ -23,7 +23,7 @@ use std::time::Instant;
 // XXX maybe this is wasteful for the smaller logs?
 const DEFAULT_EXTENT_SIZE: usize = 128 * 1024 * 1024;
 //const READ_IO_SIZE: usize = 1 * 1024 * 1024;
-const ENTRIES_PER_CHUNK: usize = 100;
+const ENTRIES_PER_CHUNK: usize = 200;
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct BlockBasedLogPhys {

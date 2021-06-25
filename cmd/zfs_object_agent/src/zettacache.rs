@@ -9,7 +9,6 @@ use futures::stream::*;
 use log::*;
 use metered::common::*;
 use metered::hdr_histogram::AtomicHdrHistogram;
-use metered::measure;
 use metered::metered;
 use metered::time_source::StdInstantMicros;
 use more_asserts::*;
@@ -119,14 +118,6 @@ pub struct ZettaCache {
     // XXX may need to break up this big lock.  At least we aren't holding it while doing i/o
     state: Arc<tokio::sync::Mutex<ZettaCacheState>>,
     metrics: Arc<ZettaCacheMetrics>,
-    manual_metrics: Arc<ManualMetrics>,
-}
-
-// XXX remove?
-#[derive(Default, Debug)]
-struct ManualMetrics {
-    miss_without_index_read: HitCount,
-    miss_after_index_read: HitCount,
 }
 
 #[derive(Debug, Serialize, Deserialize, Copy, Clone)]
@@ -285,7 +276,6 @@ impl ZettaCache {
         let this = ZettaCache {
             state: Arc::new(tokio::sync::Mutex::new(state)),
             metrics: Default::default(),
-            manual_metrics: Default::default(),
         };
 
         let my_cache = this.clone();
@@ -438,7 +428,6 @@ impl ZettaCache {
             }
             LookupContinuation::None => {
                 self.cache_miss_without_index_read(&key);
-                measure!(&self.manual_metrics.miss_without_index_read, {});
                 None
             }
             LookupContinuation::CheckIndex(jh) => match jh.await.unwrap() {
@@ -457,7 +446,6 @@ impl ZettaCache {
                         }
                         LookupContinuation::None => {
                             self.cache_miss_after_index_read(&key);
-                            measure!(&self.manual_metrics.miss_after_index_read, {});
                             None
                         }
                         LookupContinuation::CheckIndex(_) => panic!("invalid state"),

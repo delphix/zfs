@@ -12,6 +12,8 @@ use num::Num;
 use num::NumCast;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
+use std::io::Write;
 use std::os::unix::prelude::AsRawFd;
 use std::time::Instant;
 use tokio::fs::File;
@@ -180,21 +182,17 @@ impl BlockAccess {
         (n + sector_size - N::one()) / sector_size * sector_size
     }
 
-    // Given a logical write of this size, what will the raw size be?
-    pub fn get_raw_size(&self, len: usize) -> usize {
-        // XXX serialized size should be constant; could precomute it
-        // Note: relies on bincode::config::FixintEncoding, which the serialize/deserialize functions use
-        let header_size = bincode::serialized_size(&BlockHeader {
-            payload_size: len,
-            checksum: 0,
-        })
-        .unwrap() as usize;
-        self.round_up_to_sector(header_size + len)
-    }
-
     // XXX ideally this would return a sector-aligned address, so it can be used directly for a directio write
     pub fn json_chunk_to_raw<T: Serialize>(&self, struct_obj: &T) -> Vec<u8> {
-        let payload = serde_json::to_vec(struct_obj).unwrap();
+        let json = serde_json::to_vec(struct_obj).unwrap();
+        let mut encoder = lz4::EncoderBuilder::new()
+            .level(4)
+            .build(Vec::new())
+            .unwrap();
+        encoder.write(&json).unwrap();
+        let (payload, result) = encoder.finish();
+        result.unwrap();
+
         let header = BlockHeader {
             payload_size: payload.len(),
             checksum: seahash::hash(&payload),
@@ -234,7 +232,13 @@ impl BlockAccess {
             ));
         }
 
-        let struct_obj: T = serde_json::from_slice(data)?;
+        let mut decoder = lz4::Decoder::new(data).unwrap();
+        let mut json = Vec::new();
+        decoder.read_to_end(&mut json).unwrap();
+        let (_, result) = decoder.finish();
+        result.unwrap();
+
+        let struct_obj: T = serde_json::from_slice(&json)?;
         Ok((
             struct_obj,
             self.round_up_to_sector(header_size + data.len()),
