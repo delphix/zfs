@@ -19,7 +19,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use std::time::SystemTime;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
@@ -68,7 +67,8 @@ struct ZettaCheckpointPhys {
     generation: CheckpointID,
     extent_allocator: ExtentAllocatorPhys,
     last_valid_data_offset: u64, // XXX move to BlockAllocatorPhys
-    index: BlockBasedLogWithSummaryPhys,
+    last_atime: Atime,
+    index: ZettaCacheIndexPhys,
     chunk_summary: BlockBasedLogPhys,
     operation_log: BlockBasedLogPhys,
 }
@@ -103,7 +103,7 @@ struct IndexValue {
     // isn't passing us the expected read size.  So we need to change some
     // interfaces to make that work right.
     size: usize,
-    atime: u64,
+    atime: Atime,
 }
 
 #[derive(Debug)]
@@ -140,10 +140,75 @@ impl BlockBasedLogEntry for ChunkSummaryEntry {}
 #[derive(Debug, Serialize, Deserialize, Copy, Clone)]
 enum OperationLogEntry {
     Insert((IndexKey, IndexValue)),
-    Remove(IndexKey),
+    Remove((IndexKey, Atime)),
 }
 impl OnDisk for OperationLogEntry {}
 impl BlockBasedLogEntry for OperationLogEntry {}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+struct AtimeHistogramPhys {
+    histogram: Vec<u64>,
+}
+
+impl AtimeHistogramPhys {
+    fn insert(&mut self, atime: Atime) {
+        let atime_usize = atime.0 as usize;
+        if atime_usize >= self.histogram.len() {
+            self.histogram.resize(atime_usize + 1, 0);
+        }
+        self.histogram[atime_usize] += 1;
+    }
+
+    fn remove(&mut self, atime: Atime) {
+        let atime_usize = atime.0 as usize;
+        self.histogram[atime_usize] -= 1;
+    }
+
+    fn clear(&mut self) {
+        self.histogram.clear();
+    }
+}
+
+struct ZettaCacheIndex {
+    atime_histogram: AtimeHistogramPhys,
+    log: BlockBasedLogWithSummary<IndexEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct ZettaCacheIndexPhys {
+    atime_histogram: AtimeHistogramPhys,
+    log: BlockBasedLogWithSummaryPhys,
+}
+
+impl ZettaCacheIndex {
+    async fn open(
+        block_access: Arc<BlockAccess>,
+        extent_allocator: Arc<ExtentAllocator>,
+        phys: ZettaCacheIndexPhys,
+    ) -> Self {
+        Self {
+            atime_histogram: phys.atime_histogram,
+            log: BlockBasedLogWithSummary::open(block_access, extent_allocator, phys.log).await,
+        }
+    }
+
+    fn get_phys(&self) -> ZettaCacheIndexPhys {
+        ZettaCacheIndexPhys {
+            atime_histogram: self.atime_histogram.clone(),
+            log: self.log.get_phys(),
+        }
+    }
+
+    fn append(&mut self, entry: IndexEntry) {
+        self.atime_histogram.insert(entry.value.atime);
+        self.log.append(entry);
+    }
+
+    fn clear(&mut self) {
+        self.atime_histogram.clear();
+        self.log.clear();
+    }
+}
 
 struct ZettaCacheState {
     block_access: Arc<BlockAccess>,
@@ -156,7 +221,8 @@ struct ZettaCacheState {
     // need the lock inside it.  But hopefully we split up the big State lock
     // and then this is useful.  Same goes for block_access.
     extent_allocator: Arc<ExtentAllocator>,
-    index: Arc<tokio::sync::RwLock<BlockBasedLogWithSummary<IndexEntry>>>,
+    atime_histogram: AtimeHistogramPhys, // includes pending_changes, including AtimeUpdate which is not logged
+    index: Arc<tokio::sync::RwLock<ZettaCacheIndex>>,
     chunk_summary: BlockBasedLog<ChunkSummaryEntry>,
     // XXX move this to its own file/struct with methods to load, etc?
     operation_log: BlockBasedLog<OperationLogEntry>,
@@ -166,6 +232,7 @@ struct ZettaCacheState {
     // complete before we complete the next checkpoint.
     outstanding_reads: BTreeMap<IndexValue, Arc<Semaphore>>,
     outstanding_writes: BTreeMap<IndexValue, Arc<Semaphore>>,
+    atime: Atime,
 }
 
 #[metered(registry=ZettaCacheMetrics)]
@@ -187,6 +254,7 @@ impl ZettaCache {
             index: Default::default(),
             chunk_summary: Default::default(),
             operation_log: Default::default(),
+            last_atime: Atime(0),
         };
         let raw = block_access.json_chunk_to_raw(&checkpoint);
         assert_le!(raw.len(), DEFAULT_CHECKPOINT_RING_BUFFER_SIZE);
@@ -247,20 +315,25 @@ impl ZettaCache {
             checkpoint.operation_log,
         );
 
-        let pending_changes = Self::load_operation_log(&operation_log).await;
+        let index = ZettaCacheIndex::open(
+            block_access.clone(),
+            extent_allocator.clone(),
+            checkpoint.index,
+        )
+        .await;
+
+        // XXX would be nice to periodically load the operation_log and verify
+        // that our state's pending_changes & atime_histogram match it
+        let (pending_changes, atime_histogram) =
+            Self::load_operation_log(&operation_log, &index.atime_histogram).await;
+        debug!("atime_histogram: {:#?}", atime_histogram);
 
         let state = ZettaCacheState {
             block_access: block_access.clone(),
             size,
             pending_changes,
-            index: Arc::new(tokio::sync::RwLock::new(
-                BlockBasedLogWithSummary::open(
-                    block_access.clone(),
-                    extent_allocator.clone(),
-                    checkpoint.index,
-                )
-                .await,
-            )),
+            atime_histogram,
+            index: Arc::new(tokio::sync::RwLock::new(index)),
             chunk_summary: BlockBasedLog::open(
                 block_access.clone(),
                 extent_allocator.clone(),
@@ -272,6 +345,7 @@ impl ZettaCache {
             super_phys: phys,
             outstanding_reads: BTreeMap::new(),
             outstanding_writes: BTreeMap::new(),
+            atime: checkpoint.last_atime,
         };
 
         let this = ZettaCache {
@@ -299,16 +373,33 @@ impl ZettaCache {
             }
         });
 
+        let my_cache = this.clone();
+        tokio::spawn(async move {
+            // XXX maybe we should bump the atime after a set number of
+            // accesses, so each histogram bucket starts with the same count.
+            // We could then add an auxiliary structure saying what wall clock
+            // time each atime value corresponds to.
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let mut state = my_cache.state.lock().await;
+                state.atime = state.atime.next();
+                drop(state);
+            }
+        });
+
         this
     }
 
     async fn load_operation_log(
         operation_log: &BlockBasedLog<OperationLogEntry>,
-    ) -> BTreeMap<IndexKey, PendingChange> {
+        index_atime_histogram: &AtimeHistogramPhys,
+    ) -> (BTreeMap<IndexKey, PendingChange>, AtimeHistogramPhys) {
         let begin = Instant::now();
         let mut num_insert_entries: u64 = 0;
         let mut num_remove_entries: u64 = 0;
         let mut pending_changes = BTreeMap::new();
+        let mut atime_histogram = index_atime_histogram.clone();
         operation_log
             .iter()
             .for_each(|entry| {
@@ -335,8 +426,9 @@ impl ZettaCache {
                             }
                         }
                         num_insert_entries += 1;
+                        atime_histogram.insert(value.atime);
                     }
-                    OperationLogEntry::Remove(key) => {
+                    OperationLogEntry::Remove((key, atime)) => {
                         match pending_changes.entry(key) {
                             btree_map::Entry::Occupied(mut oe) => match oe.get() {
                                 PendingChange::Insert(value) => {
@@ -361,6 +453,7 @@ impl ZettaCache {
                             }
                         }
                         num_remove_entries += 1;
+                        atime_histogram.remove(atime);
                     }
                 };
                 future::ready(())
@@ -373,7 +466,7 @@ impl ZettaCache {
             pending_changes.len(),
             begin.elapsed().as_millis()
         );
-        pending_changes
+        (pending_changes, atime_histogram)
     }
 
     /*
@@ -501,6 +594,7 @@ impl ZettaCacheState {
                     .index
                     .read()
                     .await
+                    .log
                     .lookup_by_key(&key, |entry| entry.key)
                     .await
                 {
@@ -521,12 +615,16 @@ impl ZettaCacheState {
             // Note: we could pass in the (mutable) pending_change reference,
             // which would let evict_block() avoid looking it up again.  But
             // this is not a common code path, and this interface seems cleaner.
-            self.evict_block(key);
+            self.evict_block(key, value);
             return None;
         }
 
         trace!("cache hit: reading {:?} from {:?}", key, value);
-        value.atime = atime;
+        if value.atime != atime {
+            self.atime_histogram.remove(value.atime);
+            self.atime_histogram.insert(atime);
+            value.atime = atime;
+        }
 
         // Note: we're just updating the atime, which is not logged to the
         // operation_log.  If we crash, recent atime updates will be lost.
@@ -610,6 +708,7 @@ impl ZettaCacheState {
                     my_index
                         .read()
                         .await
+                        .log
                         .lookup_by_key(&key, |entry| entry.key)
                         .await
                         .map(|e| e.value)
@@ -641,12 +740,16 @@ impl ZettaCacheState {
             // Note: we could pass in the (mutable) pending_change reference,
             // which would let evict_block() avoid looking it up again.  But
             // this is not a common code path, and this interface seems cleaner.
-            self.evict_block(key);
+            self.evict_block(key, value);
             return LookupContinuation::None;
         }
 
         trace!("cache hit: reading {:?} from {:?}", key, value);
-        value.atime = atime;
+        if value.atime != atime {
+            self.atime_histogram.remove(value.atime);
+            self.atime_histogram.insert(atime);
+            value.atime = atime;
+        }
 
         // Note: we're just updating the atime, which is not logged to the
         // operation_log.  If we crash, recent atime updates will be lost.
@@ -714,7 +817,7 @@ impl ZettaCacheState {
         &mut self,
         key: IndexKey,
         value_opt: Option<IndexValue>,
-    ) -> Option<impl Future<Output = Vec<u8>>> {
+    ) -> Option<Box<dyn Future<Output = Vec<u8>>>> {
         let atime = self.current_atime();
 
         // Note: we're here because there was no PendingChange for this key, but
@@ -747,12 +850,16 @@ impl ZettaCacheState {
             // Note: we could pass in the (mutable) pending_change reference,
             // which would let evict_block() avoid looking it up again.  But
             // this is not a common code path, and this interface seems cleaner.
-            self.evict_block(key);
+            self.evict_block(key, value);
             return None;
         }
 
         trace!("cache hit: reading {:?} from {:?}", key, value);
-        value.atime = atime;
+        if value.atime != atime {
+            self.atime_histogram.remove(value.atime);
+            self.atime_histogram.insert(atime);
+            value.atime = atime;
+        }
 
         // Note: we're just updating the atime, which is not logged to the
         // operation_log.  If we crash, recent atime updates will be lost.
@@ -795,7 +902,7 @@ impl ZettaCacheState {
         let block_access = self.block_access.clone();
 
         // XXX the caller just waits on this, so it would be cleaner to just return the closure.
-        Some(async move {
+        Some(Box::new(async move {
             if let Some(write_sem) = write_sem_opt {
                 trace!("{:?} at {:?}: waiting for outstanding write", key, value);
                 let _permit = write_sem.acquire().await.unwrap();
@@ -809,7 +916,7 @@ impl ZettaCacheState {
                 .await;
             sem2.add_permits(1);
             vec
-        })
+        }))
     }
 
     /*
@@ -927,7 +1034,7 @@ impl ZettaCacheState {
     }
     */
 
-    fn evict_block(&mut self, key: IndexKey) {
+    fn evict_block(&mut self, key: IndexKey, value: IndexValue) {
         match self.pending_changes.get_mut(&key) {
             Some(PendingChange::Insert(value)) => {
                 // The operation_log has an Insert for this key, and the key
@@ -973,7 +1080,9 @@ impl ZettaCacheState {
             }
         }
         trace!("adding Remove to operation_log {:?}", key);
-        self.operation_log.append(OperationLogEntry::Remove(key));
+        self.atime_histogram.remove(value.atime);
+        self.operation_log
+            .append(OperationLogEntry::Remove((key, value.atime)));
     }
 
     /// Insert this block to the cache, if space and performance parameters
@@ -1035,6 +1144,7 @@ impl ZettaCacheState {
                 ve.insert(PendingChange::Insert(value));
             }
         }
+        self.atime_histogram.insert(value.atime);
 
         trace!("adding Insert to operation_log {:?} {:?}", key, value);
         self.operation_log
@@ -1053,13 +1163,8 @@ impl ZettaCacheState {
         self.outstanding_writes.insert(value, sem);
     }
 
-    // XXX change to return a newtype?
-    pub fn current_atime(&self) -> u64 {
-        // XXX change to minutes of running pool?
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
+    pub fn current_atime(&self) -> Atime {
+        self.atime
     }
 
     /// returns offset, or None if there's no space
@@ -1115,7 +1220,7 @@ impl ZettaCacheState {
         }
 
         future::join3(
-            self.index.write().await.flush(),
+            self.index.write().await.log.flush(),
             self.chunk_summary.flush(),
             self.operation_log.flush(),
         )
@@ -1128,6 +1233,7 @@ impl ZettaCacheState {
             chunk_summary: self.chunk_summary.get_phys(),
             operation_log: self.operation_log.get_phys(),
             last_valid_data_offset: self.last_valid_data_offset,
+            last_atime: self.atime,
         };
 
         let mut checkpoint_location = self.super_phys.last_checkpoint_extent.location
@@ -1178,23 +1284,24 @@ impl ZettaCacheState {
         // will probably want the BlockBasedLog to know about multiple
         // generations, and therefore we'd keep the one BlockBasedLog but create
         // a new generation (as we do with ObjectBasedLog).
-        let mut new_index = BlockBasedLogWithSummary::open(
+        let mut new_index = ZettaCacheIndex::open(
             self.block_access.clone(),
             self.extent_allocator.clone(),
             Default::default(),
         )
         .await;
         let mut old_index = self.index.write().await;
-        old_index.flush().await;
+        old_index.log.flush().await;
         info!(
             "writing new index to merge {} pending changes into index of {} entries ({} MB)",
             self.pending_changes.len(),
-            old_index.len(),
-            old_index.num_bytes() / 1024 / 1024,
+            old_index.log.len(),
+            old_index.log.num_bytes() / 1024 / 1024,
         );
         // XXX load operation_log and verify that the pending_changes match it?
         let mut pending_changes_iter = self.pending_changes.iter().peekable();
         old_index
+            .log
             .iter()
             .for_each(|entry| {
                 // First, process any pending changes which are before this
@@ -1305,7 +1412,13 @@ impl ZettaCacheState {
         );
 
         // Note: the caller is about to flush as well, but we want to count the time in the below info!
-        new_index.flush().await;
+        new_index.log.flush().await;
+
+        debug!("new histogram: {:#?}", new_index.atime_histogram);
+        assert_eq!(
+            new_index.atime_histogram.histogram,
+            self.atime_histogram.histogram
+        );
 
         self.pending_changes.clear();
         old_index.clear();
@@ -1315,10 +1428,10 @@ impl ZettaCacheState {
 
         info!(
             "wrote new index with {} entries ({} MB) in {:.1}s ({:.1}MB/s)",
-            new_index.len(),
-            new_index.num_bytes() / 1024 / 1024,
+            new_index.log.len(),
+            new_index.log.num_bytes() / 1024 / 1024,
             begin.elapsed().as_secs_f64(),
-            (new_index.num_bytes() as f64 / 1024f64 / 1024f64) / begin.elapsed().as_secs_f64(),
+            (new_index.log.num_bytes() as f64 / 1024f64 / 1024f64) / begin.elapsed().as_secs_f64(),
         );
         self.index = Arc::new(tokio::sync::RwLock::new(new_index));
     }

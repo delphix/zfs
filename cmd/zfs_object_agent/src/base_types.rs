@@ -101,3 +101,11 @@ impl CheckpointID {
         CheckpointID(self.0 + 1)
     }
 }
+
+#[derive(Serialize, Deserialize, Default, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
+pub struct Atime(pub u64);
+impl Atime {
+    pub fn next(&self) -> Atime {
+        Atime(self.0 + 1)
+    }
+}
