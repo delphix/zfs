@@ -7,8 +7,11 @@ use anyhow::Result;
 use futures::future;
 use futures::stream::*;
 use log::*;
-use metered::common::ResponseTime;
+use metered::common::*;
+use metered::hdr_histogram::AtomicHdrHistogram;
+use metered::measure;
 use metered::metered;
+use metered::time_source::StdInstantMicros;
 use more_asserts::*;
 use serde::{Deserialize, Serialize};
 use std::collections::btree_map;
@@ -116,6 +119,14 @@ pub struct ZettaCache {
     // XXX may need to break up this big lock.  At least we aren't holding it while doing i/o
     state: Arc<tokio::sync::Mutex<ZettaCacheState>>,
     metrics: Arc<ZettaCacheMetrics>,
+    manual_metrics: Arc<ManualMetrics>,
+}
+
+// XXX remove?
+#[derive(Default, Debug)]
+struct ManualMetrics {
+    miss_without_index_read: HitCount,
+    miss_after_index_read: HitCount,
 }
 
 #[derive(Debug, Serialize, Deserialize, Copy, Clone)]
@@ -274,6 +285,7 @@ impl ZettaCache {
         let this = ZettaCache {
             state: Arc::new(tokio::sync::Mutex::new(state)),
             metrics: Default::default(),
+            manual_metrics: Default::default(),
         };
 
         let my_cache = this.clone();
@@ -290,7 +302,8 @@ impl ZettaCache {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
-                debug!("metrics: {:?}", my_cache.metrics);
+                debug!("metrics: {:#?}", my_cache.metrics);
+                my_cache.state.lock().await.block_access.dump_metrics();
                 //let x = &my_cache.metrics.lookup.response_time.histogram();
             }
         });
@@ -385,7 +398,30 @@ impl ZettaCache {
         }
     }
 
-    #[measure(ResponseTime)]
+    #[measure(HitCount)]
+    fn cache_miss_without_index_read(&self, key: &IndexKey) {
+        trace!("cache miss without reading index for {:?}", key);
+    }
+
+    #[measure(HitCount)]
+    fn cache_miss_after_index_read(&self, key: &IndexKey) {
+        trace!("cache miss after reading index for {:?}", key);
+    }
+
+    #[measure(HitCount)]
+    fn cache_hit_without_index_read(&self, key: &IndexKey) {
+        trace!("cache hit without reading index for {:?}", key);
+    }
+
+    #[measure(HitCount)]
+    fn cache_hit_after_index_read(&self, key: &IndexKey) {
+        trace!("cache hit after reading index for {:?}", key);
+    }
+
+    #[measure(type = ResponseTime<AtomicHdrHistogram, StdInstantMicros>)]
+    #[measure(InFlight)]
+    #[measure(Throughput)]
+    #[measure(HitCount)]
     pub async fn lookup(&self, guid: PoolGUID, block: BlockID) -> Option<Vec<u8>> {
         let key = IndexKey { guid, block };
         let opt_jh = {
@@ -396,21 +432,32 @@ impl ZettaCache {
             // XXX have lookup2() return a future that returns a future; if we
             // already found the location (or None), we can arrange for the last
             // Future to return it
-            LookupContinuation::Some(jh) => Some(jh.await.unwrap()),
+            LookupContinuation::Some(jh) => {
+                self.cache_hit_without_index_read(&key);
+                Some(jh.await.unwrap())
+            }
             LookupContinuation::None => {
-                trace!("cache miss without reading index for {:?}", key);
+                self.cache_miss_without_index_read(&key);
+                measure!(&self.manual_metrics.miss_without_index_read, {});
                 None
             }
             LookupContinuation::CheckIndex(jh) => match jh.await.unwrap() {
-                None => None,
+                None => {
+                    self.cache_miss_after_index_read(&key);
+                    None
+                }
                 Some(ie) => {
                     let mut state = self.state.lock().await;
                     // XXX would be nice for the type system to enforce that if
                     // we pass Some(value), it can't return CheckIndex
                     match state.lookup2(ie.key, Some(ie.value)) {
-                        LookupContinuation::Some(jh) => Some(jh.await.unwrap()),
+                        LookupContinuation::Some(jh) => {
+                            self.cache_hit_after_index_read(&key);
+                            Some(jh.await.unwrap())
+                        }
                         LookupContinuation::None => {
-                            trace!("cache miss after reading index for {:?}", key);
+                            self.cache_miss_after_index_read(&key);
+                            measure!(&self.manual_metrics.miss_after_index_read, {});
                             None
                         }
                         LookupContinuation::CheckIndex(_) => panic!("invalid state"),
@@ -420,7 +467,10 @@ impl ZettaCache {
         }
     }
 
-    #[measure(ResponseTime)]
+    #[measure(type = ResponseTime<AtomicHdrHistogram, StdInstantMicros>)]
+    #[measure(InFlight)]
+    #[measure(Throughput)]
+    #[measure(HitCount)]
     pub async fn insert(&self, guid: PoolGUID, block: BlockID, buf: Vec<u8>) {
         let mut state = self.state.lock().await;
         state.insert(guid, block, buf);

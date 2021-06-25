@@ -2,6 +2,10 @@ use crate::base_types::DiskLocation;
 use crate::base_types::Extent;
 use anyhow::{anyhow, Result};
 use log::*;
+use metered::common::*;
+use metered::hdr_histogram::AtomicHdrHistogram;
+use metered::metered;
+use metered::time_source::StdInstantMicros;
 use more_asserts::*;
 use nix::sys::stat::SFlag;
 use num::Num;
@@ -27,6 +31,7 @@ pub struct BlockAccess {
     disk: File,
     size: u64,
     sector_size: usize,
+    metrics: BlockAccessMetrics,
 }
 
 // Generate ioctl function
@@ -41,6 +46,7 @@ const CUSTOM_OFLAGS: i32 = 0;
 // XXX this is very thread intensive.  On Linux, we can use "glommio" to use
 // io_uring for much lower overheads.  Or SPDK (which can use io_uring or nvme
 // hardware directly).  Or at least use O_DIRECT.
+#[metered(registry=BlockAccessMetrics)]
 impl BlockAccess {
     pub async fn new(disk_path: &str) -> BlockAccess {
         let disk = OpenOptions::new()
@@ -80,6 +86,7 @@ impl BlockAccess {
             disk,
             size,
             sector_size,
+            metrics: Default::default(),
         };
         info!("opening cache file {}: {:?}", disk_path, this);
 
@@ -90,8 +97,16 @@ impl BlockAccess {
         self.size
     }
 
+    pub fn dump_metrics(&self) {
+        debug!("metrics: {:#?}", self.metrics);
+    }
+
     // offset and length must be sector-aligned
     // maybe this should return Bytes?
+    #[measure(type = ResponseTime<AtomicHdrHistogram, StdInstantMicros>)]
+    #[measure(InFlight)]
+    #[measure(Throughput)]
+    #[measure(HitCount)]
     pub async fn read_raw(&self, extent: Extent) -> Vec<u8> {
         assert_eq!(extent.size, self.round_up_to_sector(extent.size));
         let fd = self.disk.as_raw_fd();
@@ -124,6 +139,10 @@ impl BlockAccess {
 
     // offset and data.len() must be sector-aligned
     // maybe this should take Bytes?
+    #[measure(type = ResponseTime<AtomicHdrHistogram, StdInstantMicros>)]
+    #[measure(InFlight)]
+    #[measure(Throughput)]
+    #[measure(HitCount)]
     pub async fn write_raw(&self, location: DiskLocation, data: Vec<u8>) {
         let fd = self.disk.as_raw_fd();
         let sector_size = self.sector_size;
