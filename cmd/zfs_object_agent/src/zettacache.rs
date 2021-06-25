@@ -6,7 +6,6 @@ use crate::extent_allocator::ExtentAllocatorPhys;
 use anyhow::Result;
 use futures::future;
 use futures::stream::*;
-use futures::Future;
 use log::*;
 use metered::common::ResponseTime;
 use metered::metered;
@@ -14,7 +13,6 @@ use more_asserts::*;
 use serde::{Deserialize, Serialize};
 use std::collections::btree_map;
 use std::collections::BTreeMap;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -26,7 +24,7 @@ const SUPERBLOCK_SIZE: usize = 4 * 1024;
 //const SUPERBLOCK_MAGIC: u64 = 0x2e11acac4e;
 const DEFAULT_CHECKPOINT_RING_BUFFER_SIZE: usize = 1 * 1024 * 1024;
 const DEFAULT_SLAB_SIZE: usize = 16 * 1024 * 1024;
-const DEFAULT_METADATA_SIZE: usize = 4 * 1024 * 1024;
+const DEFAULT_METADATA_SIZE_PCT: f64 = 10.0; // XXX metadata takes a ton of space due to JSON + no compression.  Can lower this to test forced eviction.
 const MAX_PENDING_CHANGES: usize = 100_000; // XXX should be based on RAM usage, ~tens of millions at least
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -172,7 +170,10 @@ impl ZettaCache {
     pub async fn create(path: &str) {
         let block_access = BlockAccess::new(path).await;
         let metadata_start = SUPERBLOCK_SIZE + DEFAULT_CHECKPOINT_RING_BUFFER_SIZE;
-        let data_start = metadata_start + DEFAULT_METADATA_SIZE;
+        let data_start = block_access.round_up_to_sector(
+            metadata_start as u64
+                + (DEFAULT_METADATA_SIZE_PCT / 100.0 * block_access.size() as f64) as u64,
+        );
         let checkpoint = ZettaCheckpointPhys {
             generation: CheckpointID(0),
             extent_allocator: ExtentAllocatorPhys {
