@@ -1,6 +1,7 @@
 use crate::base_types::DiskLocation;
 use crate::base_types::Extent;
 use anyhow::{anyhow, Result};
+use bincode::Options;
 use log::*;
 use metered::common::*;
 use metered::hdr_histogram::AtomicHdrHistogram;
@@ -12,6 +13,7 @@ use num::Num;
 use num::NumCast;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
 use std::os::unix::prelude::AsRawFd;
@@ -25,6 +27,8 @@ const MIN_SECTOR_SIZE: usize = 512;
 #[derive(Serialize, Deserialize, Debug)]
 struct BlockHeader {
     payload_size: usize,
+    encoding: EncodeType,
+    compression: CompressType,
     checksum: u64,
 }
 
@@ -34,6 +38,18 @@ pub struct BlockAccess {
     size: u64,
     sector_size: usize,
     metrics: BlockAccessMetrics,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum CompressType {
+    None,
+    Lz4,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum EncodeType {
+    Json,
+    Bincode,
 }
 
 // Generate ioctl function
@@ -183,18 +199,37 @@ impl BlockAccess {
     }
 
     // XXX ideally this would return a sector-aligned address, so it can be used directly for a directio write
-    pub fn json_chunk_to_raw<T: Serialize>(&self, struct_obj: &T) -> Vec<u8> {
-        let json = serde_json::to_vec(struct_obj).unwrap();
-        let mut encoder = lz4::EncoderBuilder::new()
-            .level(4)
-            .build(Vec::new())
-            .unwrap();
-        encoder.write(&json).unwrap();
-        let (payload, result) = encoder.finish();
-        result.unwrap();
+    pub fn chunk_to_raw<T: Serialize>(&self, encoding: EncodeType, struct_obj: &T) -> Vec<u8> {
+        let (payload, compression) = match encoding {
+            EncodeType::Json => {
+                let json = serde_json::to_vec(struct_obj).unwrap();
+                let mut lz4_encoder = lz4::EncoderBuilder::new()
+                    .level(4)
+                    .build(Vec::new())
+                    .unwrap();
+                lz4_encoder.write(&json).unwrap();
+                let (payload, result) = lz4_encoder.finish();
+                result.unwrap();
+                (payload, CompressType::Lz4)
+            }
+            EncodeType::Bincode => {
+                let payload = Self::bincode_options().serialize(struct_obj).unwrap();
+                // XXX It's faster to not lz4 compress this, even though
+                // compression would get us around 2x (27B -> 14B for index
+                // entries).  But if we were to use multiple CPU's, or be able
+                // to do this incrementally in the background so that we don't
+                // need the absolute maximum throughput, then we should try
+                // compression again.  The decompression time would still be
+                // relevant but is much faster than compression so might be
+                // fine.
+                (payload, CompressType::None)
+            }
+        };
 
         let header = BlockHeader {
             payload_size: payload.len(),
+            encoding,
+            compression,
             checksum: seahash::hash(&payload),
         };
         let header_bytes = bincode::serialize(&header).unwrap();
@@ -207,10 +242,16 @@ impl BlockAccess {
         buf
     }
 
+    fn bincode_options() -> impl bincode::Options {
+        // Note: DefaultOptions uses varint encoding (unlike bincode::serialize())
+        bincode::DefaultOptions::new()
+    }
+
     /// returns deserialized struct and amount of the buf that was consumed
-    pub fn json_chunk_from_raw<T: DeserializeOwned>(&self, buf: &[u8]) -> Result<(T, usize)> {
-        let header: BlockHeader = bincode::deserialize(&buf).unwrap();
-        let header_size = bincode::serialized_size(&header).unwrap() as usize;
+    pub fn chunk_from_raw<T: DeserializeOwned>(&self, buf: &[u8]) -> Result<(T, usize)> {
+        let mut cursor = Cursor::new(buf);
+        let header: BlockHeader = bincode::deserialize_from(&mut cursor).unwrap();
+        let header_size = cursor.position() as usize;
 
         if header.payload_size as usize > buf.len() - header_size {
             return Err(anyhow!(
@@ -232,13 +273,22 @@ impl BlockAccess {
             ));
         }
 
-        let mut decoder = lz4::Decoder::new(data).unwrap();
-        let mut json = Vec::new();
-        decoder.read_to_end(&mut json).unwrap();
-        let (_, result) = decoder.finish();
-        result.unwrap();
+        let mut serde_vec = Vec::new();
+        let serde_slice = match header.compression {
+            CompressType::None => data,
+            CompressType::Lz4 => {
+                let mut decoder = lz4::Decoder::new(data).unwrap();
+                decoder.read_to_end(&mut serde_vec).unwrap();
+                let (_, result) = decoder.finish();
+                result.unwrap();
+                &serde_vec
+            }
+        };
 
-        let struct_obj: T = serde_json::from_slice(&json)?;
+        let struct_obj: T = match header.encoding {
+            EncodeType::Json => serde_json::from_slice(&serde_slice)?,
+            EncodeType::Bincode => Self::bincode_options().deserialize(&serde_slice)?,
+        };
         Ok((
             struct_obj,
             self.round_up_to_sector(header_size + data.len()),

@@ -1,5 +1,6 @@
 use crate::base_types::*;
 use crate::block_access::BlockAccess;
+use crate::block_access::EncodeType;
 use crate::extent_allocator::ExtentAllocator;
 use anyhow::Context;
 use async_stream::stream;
@@ -14,6 +15,7 @@ use std::cmp::max;
 use std::cmp::min;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::ops::Add;
 use std::ops::Bound::*;
 use std::ops::Sub;
@@ -133,7 +135,8 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
             let first_entry = *chunk.entries.first().unwrap();
 
             let mut extent = self.next_write_location();
-            let raw_chunk = self.block_access.json_chunk_to_raw(&chunk);
+            // XXX I think we only want to use Bincode for the main index?
+            let raw_chunk = self.block_access.chunk_to_raw(EncodeType::Bincode, &chunk);
             let raw_size = raw_chunk.len();
             if raw_size > extent.size {
                 // free the unused tail of this extent
@@ -231,7 +234,7 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
                     trace!("decoding {:?} from {:?}", chunk_id, chunk_location);
                     // XXX handle checksum error here
                     let (chunk, consumed): (BlockBasedLogChunk<T>, usize) = block_access
-                        .json_chunk_from_raw(&extent_bytes[total_consumed..])
+                        .chunk_from_raw(&extent_bytes[total_consumed..])
                         .context(format!("{:?} at {:?}", chunk_id, chunk_location,))
                         .unwrap();
                     assert_eq!(chunk.id, chunk_id);
@@ -351,9 +354,7 @@ impl<T: BlockBasedLogEntry> BlockBasedLogWithSummary<T> {
         extent.range((chunk_summary.offset - *extent_offset) as usize, chunk_size)
     }
 
-    /// Entries must have been added in sorted order, according to the provided
-    /// key-extraction function.  Similar to Vec::binary_search_by_key().
-    pub async fn lookup_by_key<B, F>(&self, key: &B, mut f: F) -> Option<T>
+    async fn lookup_by_key_impl<B, F>(&self, key: &B, mut f: F) -> Option<T>
     where
         B: Ord + Debug,
         F: FnMut(&T) -> B,
@@ -379,11 +380,8 @@ impl<T: BlockBasedLogEntry> BlockBasedLogWithSummary<T> {
             key
         );
         let chunk_bytes = self.this.block_access.read_raw(chunk_extent).await;
-        let (chunk, _consumed): (BlockBasedLogChunk<T>, usize) = self
-            .this
-            .block_access
-            .json_chunk_from_raw(&chunk_bytes)
-            .unwrap();
+        let (chunk, _consumed): (BlockBasedLogChunk<T>, usize) =
+            self.this.block_access.chunk_from_raw(&chunk_bytes).unwrap();
         assert_eq!(chunk.id, ChunkID(chunk_id as u64));
         // XXX can we assert that we are looking in the right chunk?
         // XXX I think we'd want to the chunk to have the next chunk's first key as well
@@ -391,6 +389,41 @@ impl<T: BlockBasedLogEntry> BlockBasedLogWithSummary<T> {
             Ok(index) => Some(chunk.entries[index]),
             Err(_) => None,
         }
+    }
+
+    /// Entries must have been added in sorted order, according to the provided
+    /// key-extraction function.  Similar to Vec::binary_search_by_key().  The
+    /// Guard returned helps the caller ensure that the Entry doesn't live
+    /// longer than the reference on the Log (however, since the Entry is Copy,
+    /// the caller still needs to be careful to not copy it, then drop the Log,
+    /// allowing the Log to be modified before using the copy of the Entry).
+    pub async fn lookup_by_key<'a, B, F>(
+        &'a self,
+        key: &B,
+        f: F,
+    ) -> Option<BlockBasedLogValueGuard<'a, T>>
+    where
+        B: Ord + Debug,
+        F: FnMut(&T) -> B,
+    {
+        let value = self.lookup_by_key_impl(key, f).await;
+        value.map(|v| BlockBasedLogValueGuard {
+            inner: v,
+            _marker: &PhantomData,
+        })
+    }
+}
+
+pub struct BlockBasedLogValueGuard<'a, T: BlockBasedLogEntry> {
+    inner: T,
+    _marker: &'a PhantomData<T>,
+}
+
+impl<'a, T: BlockBasedLogEntry> std::ops::Deref for BlockBasedLogValueGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
 }
 

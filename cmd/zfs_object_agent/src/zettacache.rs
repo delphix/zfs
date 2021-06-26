@@ -16,17 +16,18 @@ use more_asserts::*;
 use serde::{Deserialize, Serialize};
 use std::collections::btree_map;
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
 
 const SUPERBLOCK_SIZE: usize = 4 * 1024;
 //const SUPERBLOCK_MAGIC: u64 = 0x2e11acac4e;
 const DEFAULT_CHECKPOINT_RING_BUFFER_SIZE: usize = 1 * 1024 * 1024;
 const DEFAULT_SLAB_SIZE: usize = 16 * 1024 * 1024;
-const DEFAULT_METADATA_SIZE_PCT: f64 = 10.0; // XXX metadata takes a ton of space due to JSON + no compression.  Can lower this to test forced eviction.
+const DEFAULT_METADATA_SIZE_PCT: f64 = 1.0; // Can lower this to test forced eviction.
 const MAX_PENDING_CHANGES: usize = 100_000; // XXX should be based on RAM usage, ~tens of millions at least
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -48,14 +49,14 @@ impl ZettaSuperBlockPhys {
                 size: SUPERBLOCK_SIZE,
             })
             .await;
-        let (this, _): (Self, usize) = block_access.json_chunk_from_raw(&raw)?;
+        let (this, _): (Self, usize) = block_access.chunk_from_raw(&raw)?;
         debug!("got {:#?}", this);
         Ok(this)
     }
 
     async fn write(&self, block_access: &BlockAccess) {
         debug!("writing {:#?}", self);
-        let raw = block_access.json_chunk_to_raw(self);
+        let raw = block_access.chunk_to_raw(EncodeType::Json, self);
         block_access
             .write_raw(DiskLocation { offset: 0 }, raw)
             .await;
@@ -76,7 +77,7 @@ struct ZettaCheckpointPhys {
 impl ZettaCheckpointPhys {
     async fn read(block_access: &BlockAccess, extent: Extent) -> ZettaCheckpointPhys {
         let raw = block_access.read_raw(extent).await;
-        let (this, _): (Self, usize) = block_access.json_chunk_from_raw(&raw).unwrap();
+        let (this, _): (Self, usize) = block_access.chunk_from_raw(&raw).unwrap();
         debug!("got {:#?}", this);
         this
     }
@@ -106,7 +107,7 @@ struct IndexValue {
     atime: Atime,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum PendingChange {
     Insert(IndexValue),
     UpdateAtime(IndexValue),
@@ -116,9 +117,40 @@ enum PendingChange {
 
 #[derive(Clone)]
 pub struct ZettaCache {
+    // lock ordering: index first then state
+    index: Arc<tokio::sync::RwLock<ZettaCacheIndex>>,
     // XXX may need to break up this big lock.  At least we aren't holding it while doing i/o
     state: Arc<tokio::sync::Mutex<ZettaCacheState>>,
     metrics: Arc<ZettaCacheMetrics>,
+}
+
+struct NonAsyncMutexGuard<'a, T> {
+    inner: tokio::sync::MutexGuard<'a, T>,
+    // force this to not be Send
+    _marker: PhantomData<*const ()>,
+}
+//impl<'a, T> !Send for NonAsyncMutexGuard<'a, T> {}
+
+impl<'a, T> std::ops::Deref for NonAsyncMutexGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<'a, T> std::ops::DerefMut for NonAsyncMutexGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+// XXX implement this as a new trait on Mutex?
+async fn lock_non_async<T>(lock: &tokio::sync::Mutex<T>) -> NonAsyncMutexGuard<'_, T> {
+    NonAsyncMutexGuard {
+        inner: lock.lock().await,
+        _marker: PhantomData,
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Copy, Clone)]
@@ -222,7 +254,6 @@ struct ZettaCacheState {
     // and then this is useful.  Same goes for block_access.
     extent_allocator: Arc<ExtentAllocator>,
     atime_histogram: AtimeHistogramPhys, // includes pending_changes, including AtimeUpdate which is not logged
-    index: Arc<tokio::sync::RwLock<ZettaCacheIndex>>,
     chunk_summary: BlockBasedLog<ChunkSummaryEntry>,
     // XXX move this to its own file/struct with methods to load, etc?
     operation_log: BlockBasedLog<OperationLogEntry>,
@@ -256,7 +287,7 @@ impl ZettaCache {
             operation_log: Default::default(),
             last_atime: Atime(0),
         };
-        let raw = block_access.json_chunk_to_raw(&checkpoint);
+        let raw = block_access.chunk_to_raw(EncodeType::Json, &checkpoint);
         assert_le!(raw.len(), DEFAULT_CHECKPOINT_RING_BUFFER_SIZE);
         let checkpoint_size = raw.len();
         block_access
@@ -333,7 +364,6 @@ impl ZettaCache {
             size,
             pending_changes,
             atime_histogram,
-            index: Arc::new(tokio::sync::RwLock::new(index)),
             chunk_summary: BlockBasedLog::open(
                 block_access.clone(),
                 extent_allocator.clone(),
@@ -349,6 +379,7 @@ impl ZettaCache {
         };
 
         let this = ZettaCache {
+            index: Arc::new(tokio::sync::RwLock::new(index)),
             state: Arc::new(tokio::sync::Mutex::new(state)),
             metrics: Default::default(),
         };
@@ -358,7 +389,13 @@ impl ZettaCache {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                my_cache.state.lock().await.flush_checkpoint().await;
+                let mut index = my_cache.index.write().await;
+                my_cache
+                    .state
+                    .lock()
+                    .await
+                    .flush_checkpoint(&mut index)
+                    .await;
             }
         });
 
@@ -369,7 +406,6 @@ impl ZettaCache {
                 interval.tick().await;
                 debug!("metrics: {:#?}", my_cache.metrics);
                 my_cache.state.lock().await.block_access.dump_metrics();
-                //let x = &my_cache.metrics.lookup.response_time.histogram();
             }
         });
 
@@ -469,21 +505,6 @@ impl ZettaCache {
         (pending_changes, atime_histogram)
     }
 
-    /*
-    #[measure(ResponseTime)]
-    pub async fn lookup_old(&self, guid: PoolGUID, block: BlockID) -> Option<Vec<u8>> {
-        let opt_jh = {
-            let mut state = self.state.lock().await;
-            // XXX state.lookup() should not be async, so we can drop the state lock before doing any i/o
-            state.lookup(guid, block).await
-        };
-        match opt_jh {
-            Some(jh) => Some(jh.await.unwrap()),
-            None => None,
-        }
-    }
-    */
-
     #[measure(HitCount)]
     fn cache_miss_without_index_read(&self, key: &IndexKey) {
         trace!("cache miss without reading index for {:?}", key);
@@ -504,49 +525,86 @@ impl ZettaCache {
         trace!("cache hit after reading index for {:?}", key);
     }
 
+    async fn lock_state_non_async(&self) -> NonAsyncMutexGuard<'_, ZettaCacheState> {
+        lock_non_async(&self.state).await
+    }
+
     #[measure(type = ResponseTime<AtomicHdrHistogram, StdInstantMicros>)]
     #[measure(InFlight)]
     #[measure(Throughput)]
     #[measure(HitCount)]
     pub async fn lookup(&self, guid: PoolGUID, block: BlockID) -> Option<Vec<u8>> {
+        // We want to hold the index lock over the whole operation so that the index can't change after we get the value from it.
+        // Lock ordering requres that we lock the index before locking the state.
+        let index = self.index.read().await;
         let key = IndexKey { guid, block };
-        let opt_jh = {
-            let mut state = self.state.lock().await;
-            state.lookup2(key)
-        };
-        match opt_jh {
-            // XXX have lookup2() return a future that returns a future; if we
-            // already found the location (or None), we can arrange for the last
-            // Future to return it
-            LookupContinuation::Some(jh) => {
-                self.cache_hit_without_index_read(&key);
-                Some(jh.await.unwrap())
-            }
-            LookupContinuation::None => {
-                self.cache_miss_without_index_read(&key);
-                None
-            }
-            LookupContinuation::CheckIndex(jh) => match jh.await.unwrap() {
-                None => {
-                    self.cache_miss_after_index_read(&key);
-                    None
-                }
-                Some(value) => {
-                    let mut state = self.state.lock().await;
-                    // XXX would be nice for the type system to enforce that if
-                    // we pass Some(value), it can't return CheckIndex
-                    match state.lookup3(key, Some(value)) {
-                        Some(fut) => {
-                            self.cache_hit_after_index_read(&key);
-                            Some(fut.await)
-                        }
-                        None => {
-                            self.cache_miss_after_index_read(&key);
-                            None
+        let read_data_fut_opt = {
+            // We don't want to hold the state lock while reading from disk.  We
+            // use lock_state_non_async() to ensure that we can't hold it across
+            // .await.
+            let mut state = self.lock_state_non_async().await;
+            match state.pending_changes.get(&key).map(|pc| *pc) {
+                Some(pc) => {
+                    match pc {
+                        PendingChange::Insert(value) => Some(state.lookup(key, value)),
+                        PendingChange::RemoveThenInsert(value) => Some(state.lookup(key, value)),
+                        PendingChange::UpdateAtime(value) => Some(state.lookup(key, value)),
+                        PendingChange::Remove() => {
+                            // Pending change says this has been removed
+                            Some(data_reader_none())
                         }
                     }
                 }
-            },
+                None => {
+                    // No pending change; need to look in index
+                    None
+                }
+            }
+        };
+
+        if let Some(read_data_fut) = read_data_fut_opt {
+            // pending state tells us what to do
+            match read_data_fut.await {
+                Some(vec) => {
+                    self.cache_hit_without_index_read(&key);
+                    return Some(vec);
+                }
+                None => {
+                    self.cache_miss_without_index_read(&key);
+                    return None;
+                }
+            }
+        }
+
+        trace!("lookup has no pending_change; checking index for {:?}", key);
+        // read value from on-disk index
+        match index.log.lookup_by_key(&key, |entry| entry.key).await {
+            None => {
+                // key not in index
+                self.cache_miss_after_index_read(&key);
+                return None;
+            }
+            Some(entry) => {
+                // read data from location indicated by index
+
+                // We don't want to hold the state lock while reading from disk.
+                // We use lock_state_non_async() to ensure that we can't hold it
+                // across .await.
+                let read_data_fut = self
+                    .lock_state_non_async()
+                    .await
+                    .lookup_with_value_from_index(key, Some(entry.value));
+                match read_data_fut.await {
+                    Some(vec) => {
+                        self.cache_hit_after_index_read(&key);
+                        return Some(vec);
+                    }
+                    None => {
+                        self.cache_miss_after_index_read(&key);
+                        return None;
+                    }
+                }
+            }
         }
     }
 
@@ -560,285 +618,40 @@ impl ZettaCache {
     }
 }
 
-//type LookupContinuation =
-//    Box<dyn FnOnce(&mut ZettaCacheState) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> + Send>;
-enum LookupContinuation {
-    //Some(Box<dyn Future<Output = Vec<u8>>>),
-    Some(JoinHandle<Vec<u8>>),
-    None,
-    CheckIndex(JoinHandle<Option<IndexValue>>),
+type DataReader = Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send>>;
+
+fn data_reader_none() -> DataReader {
+    Box::pin(async move { None })
 }
 
 impl ZettaCacheState {
-    /*
-    /// Retrieve from cache, if available.  We assume that we won't often have
-    /// concurrent requests for the same block, so in that case we may read it
-    /// multiple times.
-    // XXX should not be async, so that caller can drop the ZettaCacheState lock before we wait for io.
-    async fn lookup(&mut self, guid: PoolGUID, block: BlockID) -> Option<JoinHandle<Vec<u8>>> {
-        let key = IndexKey { guid, block };
-        let atime = self.current_atime();
-        let pc = self.pending_changes.get_mut(&key);
-        let mut value = match pc {
-            Some(PendingChange::Insert(value_ref)) => *value_ref,
-            Some(PendingChange::RemoveThenInsert(value_ref)) => *value_ref,
-            Some(PendingChange::UpdateAtime(value_ref)) => *value_ref,
-            Some(PendingChange::Remove()) => return None,
-            None => {
-                // Check on-disk index.
-                // XXX Should not be await-ing, so that caller can drop the
-                // ZettaCacheState lock before we wait for io.  Will require
-                // that we make sure the index chunk can't go away while we are
-                // reading it.
-                match self
-                    .index
-                    .read()
-                    .await
-                    .log
-                    .lookup_by_key(&key, |entry| entry.key)
-                    .await
-                {
-                    Some(entry) => entry.value,
-                    None => return None,
-                }
-            }
-        };
-
-        if value.location.offset < self.extent_allocator.get_phys().last_valid_offset {
-            // The metadata overwrote this data, so it's no longer in the cache.
-            // Remove from index and return None.
-            trace!(
-                "{:?} at {:?} was overwritten by metadata allocator; removing from cache",
-                key,
-                value
-            );
-            // Note: we could pass in the (mutable) pending_change reference,
-            // which would let evict_block() avoid looking it up again.  But
-            // this is not a common code path, and this interface seems cleaner.
-            self.evict_block(key, value);
-            return None;
-        }
-
-        trace!("cache hit: reading {:?} from {:?}", key, value);
-        if value.atime != atime {
-            self.atime_histogram.remove(value.atime);
-            self.atime_histogram.insert(atime);
-            value.atime = atime;
-        }
-
-        // Note: we're just updating the atime, which is not logged to the
-        // operation_log.  If we crash, recent atime updates will be lost.
-        // XXX on clean shutdown, log the atimes?
-        match pc {
-            Some(PendingChange::Insert(value_ref)) => {
-                *value_ref = value;
-            }
-            Some(PendingChange::RemoveThenInsert(value_ref)) => {
-                *value_ref = value;
-            }
-            Some(PendingChange::UpdateAtime(value_ref)) => {
-                *value_ref = value;
-            }
-            Some(PendingChange::Remove()) => panic!("invalid state"),
-            None => {
-                // only in Index, not pending_changes
-                trace!(
-                    "adding UpdateAtime to pending_changes {:?} {:?}",
-                    key,
-                    value
-                );
-                self.pending_changes
-                    .insert(key, PendingChange::UpdateAtime(value));
-            }
-        }
-
-        // If there's a write to this location in progress, we will need to wait for it to complete before reading.
-        // Since we won't be able to remove the entry from outstanding_writes after we wait, we just get the semaphore.
-        let write_sem_opt = self
-            .outstanding_writes
-            .get_mut(&value)
-            .map(|arc| arc.clone());
-
-        let sem = Arc::new(Semaphore::new(0));
-        let sem2 = sem.clone();
-        self.outstanding_reads.insert(value, sem);
-        let block_access = self.block_access.clone();
-        // XXX the caller just waits on this, so it would be cleaner to just return the closure.
-        Some(tokio::spawn(async move {
-            if let Some(write_sem) = write_sem_opt {
-                trace!("{:?} at {:?}: waiting for outstanding write", key, value);
-                let _permit = write_sem.acquire().await.unwrap();
-            }
-
-            let vec = block_access
-                .read_raw(Extent {
-                    location: value.location,
-                    size: value.size,
-                })
-                .await;
-            sem2.add_permits(1);
-            vec
-        }))
-    }
-    */
-
-    // If called with value_opt=Some(), this won't return CheckIndex.
-    // XXX would be nice to enforce this with the type system, i.e. have
-    // different functions.  But these would share a lot of code, so we'd have
-    // to figure out how to factor it out into yet another function
-    fn lookup2(&mut self, key: IndexKey) -> LookupContinuation {
-        let atime = self.current_atime();
-
-        // Note: we're here because there was no PendingChange for this key, but
-        // since we dropped the lock, a PendingChange may have been inserted
-        // since then.  So we need to check for a PendingChange before using the
-        // value from the index.
-        let pc = self.pending_changes.get_mut(&key);
-        let mut value = match pc {
-            Some(PendingChange::Insert(value_ref)) => *value_ref,
-            Some(PendingChange::RemoveThenInsert(value_ref)) => *value_ref,
-            Some(PendingChange::UpdateAtime(value_ref)) => *value_ref,
-            Some(PendingChange::Remove()) => return LookupContinuation::None,
-            None => {
-                // use value from on-disk index
-                let my_index = self.index.clone();
-                // XXX the caller just waits on this, so it would be cleaner to just return the closure.
-                trace!("lookup has no pending_change; checking index for {:?}", key);
-                return LookupContinuation::CheckIndex(tokio::spawn(async move {
-                    my_index
-                        .read()
-                        .await
-                        .log
-                        .lookup_by_key(&key, |entry| entry.key)
-                        .await
-                        .map(|e| e.value)
-                    // XXX When the await completes, the
-                    // RwLockReadGuard will be dropped, so we aren't
-                    // holding the index's lock when we pass the
-                    // value back to the 2nd execution of this
-                    // function.  That means that the index could
-                    // change after we do the lookup, and we could
-                    // be using a stale value.  This should usually
-                    // be OK since changes to the index go through
-                    // the pending_changes first, and we are
-                    // checking the pending_changes again.  But it
-                    // could be that the pending change is made and
-                    // then the index rewritten to reflect that,
-                    // before we get the 2nd call.
-                }));
-            }
-        };
-
-        if value.location.offset < self.extent_allocator.get_phys().last_valid_offset {
-            // The metadata overwrote this data, so it's no longer in the cache.
-            // Remove from index and return None.
-            trace!(
-                "{:?} at {:?} was overwritten by metadata allocator; removing from cache",
-                key,
-                value
-            );
-            // Note: we could pass in the (mutable) pending_change reference,
-            // which would let evict_block() avoid looking it up again.  But
-            // this is not a common code path, and this interface seems cleaner.
-            self.evict_block(key, value);
-            return LookupContinuation::None;
-        }
-
-        trace!("cache hit: reading {:?} from {:?}", key, value);
-        if value.atime != atime {
-            self.atime_histogram.remove(value.atime);
-            self.atime_histogram.insert(atime);
-            value.atime = atime;
-        }
-
-        // Note: we're just updating the atime, which is not logged to the
-        // operation_log.  If we crash, recent atime updates will be lost.
-        // XXX on clean shutdown, log the atimes?
-        match pc {
-            Some(PendingChange::Insert(value_ref)) => {
-                *value_ref = value;
-            }
-            Some(PendingChange::RemoveThenInsert(value_ref)) => {
-                *value_ref = value;
-            }
-            Some(PendingChange::UpdateAtime(value_ref)) => {
-                *value_ref = value;
-            }
-            Some(PendingChange::Remove()) => panic!("invalid state"),
-            None => {
-                // only in Index, not pending_changes
-                trace!(
-                    "adding UpdateAtime to pending_changes {:?} {:?}",
-                    key,
-                    value
-                );
-                // XXX would be nice to have saved the btreemap::Entry so we
-                // don't have to traverse the tree again.
-                self.pending_changes
-                    .insert(key, PendingChange::UpdateAtime(value));
-            }
-        }
-
-        // If there's a write to this location in progress, we will need to wait for it to complete before reading.
-        // Since we won't be able to remove the entry from outstanding_writes after we wait, we just get the semaphore.
-        let write_sem_opt = self
-            .outstanding_writes
-            .get_mut(&value)
-            .map(|arc| arc.clone());
-
-        let sem = Arc::new(Semaphore::new(0));
-        let sem2 = sem.clone();
-        self.outstanding_reads.insert(value, sem);
-        let block_access = self.block_access.clone();
-
-        // XXX the caller just waits on this, so it would be cleaner to just return the closure.
-        LookupContinuation::Some(tokio::spawn(async move {
-            if let Some(write_sem) = write_sem_opt {
-                trace!("{:?} at {:?}: waiting for outstanding write", key, value);
-                let _permit = write_sem.acquire().await.unwrap();
-            }
-
-            let vec = block_access
-                .read_raw(Extent {
-                    location: value.location,
-                    size: value.size,
-                })
-                .await;
-            sem2.add_permits(1);
-            vec
-        }))
-    }
-
-    // If called with value_opt=Some(), this won't return CheckIndex.
-    // XXX would be nice to enforce this with the type system, i.e. have
-    // different functions.  But these would share a lot of code, so we'd have
-    // to figure out how to factor it out into yet another function
-    fn lookup3(
+    fn lookup_with_value_from_index(
         &mut self,
         key: IndexKey,
-        value_opt: Option<IndexValue>,
-    ) -> Option<Box<dyn Future<Output = Vec<u8>>>> {
-        let atime = self.current_atime();
-
+        value_from_index_opt: Option<IndexValue>,
+    ) -> DataReader {
         // Note: we're here because there was no PendingChange for this key, but
         // since we dropped the lock, a PendingChange may have been inserted
         // since then.  So we need to check for a PendingChange before using the
         // value from the index.
-        let pc = self.pending_changes.get_mut(&key);
-        let mut value = match pc {
+        let value = match self.pending_changes.get(&key) {
             Some(PendingChange::Insert(value_ref)) => *value_ref,
             Some(PendingChange::RemoveThenInsert(value_ref)) => *value_ref,
             Some(PendingChange::UpdateAtime(value_ref)) => *value_ref,
-            Some(PendingChange::Remove()) => return None,
+            Some(PendingChange::Remove()) => return data_reader_none(),
             None => {
                 // use value from on-disk index
-                match value_opt {
+                match value_from_index_opt {
                     Some(value) => value,
-                    None => return None,
+                    None => return data_reader_none(),
                 }
             }
         };
 
+        self.lookup(key, value)
+    }
+
+    fn lookup(&mut self, key: IndexKey, mut value: IndexValue) -> DataReader {
         if value.location.offset < self.extent_allocator.get_phys().last_valid_offset {
             // The metadata overwrote this data, so it's no longer in the cache.
             // Remove from index and return None.
@@ -851,134 +664,16 @@ impl ZettaCacheState {
             // which would let evict_block() avoid looking it up again.  But
             // this is not a common code path, and this interface seems cleaner.
             self.evict_block(key, value);
-            return None;
+            return data_reader_none();
         }
-
         trace!("cache hit: reading {:?} from {:?}", key, value);
-        if value.atime != atime {
+        if value.atime != self.atime {
             self.atime_histogram.remove(value.atime);
-            self.atime_histogram.insert(atime);
-            value.atime = atime;
+            self.atime_histogram.insert(self.atime);
+            value.atime = self.atime;
         }
-
-        // Note: we're just updating the atime, which is not logged to the
-        // operation_log.  If we crash, recent atime updates will be lost.
-        // XXX on clean shutdown, log the atimes?
-        match pc {
-            Some(PendingChange::Insert(value_ref)) => {
-                *value_ref = value;
-            }
-            Some(PendingChange::RemoveThenInsert(value_ref)) => {
-                *value_ref = value;
-            }
-            Some(PendingChange::UpdateAtime(value_ref)) => {
-                *value_ref = value;
-            }
-            Some(PendingChange::Remove()) => panic!("invalid state"),
-            None => {
-                // only in Index, not pending_changes
-                trace!(
-                    "adding UpdateAtime to pending_changes {:?} {:?}",
-                    key,
-                    value
-                );
-                // XXX would be nice to have saved the btreemap::Entry so we
-                // don't have to traverse the tree again.
-                self.pending_changes
-                    .insert(key, PendingChange::UpdateAtime(value));
-            }
-        }
-
-        // If there's a write to this location in progress, we will need to wait for it to complete before reading.
-        // Since we won't be able to remove the entry from outstanding_writes after we wait, we just get the semaphore.
-        let write_sem_opt = self
-            .outstanding_writes
-            .get_mut(&value)
-            .map(|arc| arc.clone());
-
-        let sem = Arc::new(Semaphore::new(0));
-        let sem2 = sem.clone();
-        self.outstanding_reads.insert(value, sem);
-        let block_access = self.block_access.clone();
-
-        // XXX the caller just waits on this, so it would be cleaner to just return the closure.
-        Some(Box::new(async move {
-            if let Some(write_sem) = write_sem_opt {
-                trace!("{:?} at {:?}: waiting for outstanding write", key, value);
-                let _permit = write_sem.acquire().await.unwrap();
-            }
-
-            let vec = block_access
-                .read_raw(Extent {
-                    location: value.location,
-                    size: value.size,
-                })
-                .await;
-            sem2.add_permits(1);
-            vec
-        }))
-    }
-
-    /*
-    // If called with value_opt=Some(), this won't return CheckIndex.
-    // XXX would be nice to enforce this with the type system, i.e. have
-    // different functions.  But these would share a lot of code, so we'd have
-    // to figure out how to factor it out into yet another function
-    fn lookup5(
-        &mut self,
-        key: IndexKey,
-        value_opt: Option<IndexValue>,
-    ) -> Box<dyn Future<Output = Option<Vec<u8>>>> {
-        let atime = self.current_atime();
-
-        // Note: we're here because there was no PendingChange for this key, but
-        // since we dropped the lock, a PendingChange may have been inserted
-        // since then.  So we need to check for a PendingChange before using the
-        // value from the index.
+        // XXX looking up again.  But can't pass in both &mut self and &mut PendingChange
         let pc = self.pending_changes.get_mut(&key);
-        let mut value = match pc {
-            Some(PendingChange::Insert(value_ref)) => *value_ref,
-            Some(PendingChange::RemoveThenInsert(value_ref)) => *value_ref,
-            Some(PendingChange::UpdateAtime(value_ref)) => *value_ref,
-            Some(PendingChange::Remove()) => return Box::new(async move { None }),
-            None => {
-                // use value from on-disk index
-                match value_opt {
-                    Some(value) => value,
-                    None => {
-                        let my_index = self.index.clone();
-                        trace!("lookup has no pending_change; checking index for {:?}", key);
-                        return Box::new(async move {
-                            let index = my_index.read().await;
-                            let entry = index.lookup_by_key(&key, |entry| entry.key).await;
-                            self.lookup5(key, entry.map(|e| e.value)).await
-                        });
-                    }
-                }
-            }
-        };
-
-        if value.location.offset < self.extent_allocator.get_phys().last_valid_offset {
-            // The metadata overwrote this data, so it's no longer in the cache.
-            // Remove from index and return None.
-            trace!(
-                "{:?} at {:?} was overwritten by metadata allocator; removing from cache",
-                key,
-                value
-            );
-            // Note: we could pass in the (mutable) pending_change reference,
-            // which would let evict_block() avoid looking it up again.  But
-            // this is not a common code path, and this interface seems cleaner.
-            self.evict_block(key);
-            return Box::new(async move { None });
-        }
-
-        trace!("cache hit: reading {:?} from {:?}", key, value);
-        value.atime = atime;
-
-        // Note: we're just updating the atime, which is not logged to the
-        // operation_log.  If we crash, recent atime updates will be lost.
-        // XXX on clean shutdown, log the atimes?
         match pc {
             Some(PendingChange::Insert(value_ref)) => {
                 *value_ref = value;
@@ -1015,8 +710,7 @@ impl ZettaCacheState {
         let sem2 = sem.clone();
         self.outstanding_reads.insert(value, sem);
         let block_access = self.block_access.clone();
-
-        Box::new(async move {
+        Box::pin(async move {
             if let Some(write_sem) = write_sem_opt {
                 trace!("{:?} at {:?}: waiting for outstanding write", key, value);
                 let _permit = write_sem.acquire().await.unwrap();
@@ -1029,28 +723,28 @@ impl ZettaCacheState {
                 })
                 .await;
             sem2.add_permits(1);
+            // XXX we can easily handle an io error here by returning None
             Some(vec)
         })
     }
-    */
 
     fn evict_block(&mut self, key: IndexKey, value: IndexValue) {
         match self.pending_changes.get_mut(&key) {
-            Some(PendingChange::Insert(value)) => {
+            Some(PendingChange::Insert(value_ref)) => {
                 // The operation_log has an Insert for this key, and the key
                 // is not in the Index.  We don't need a
                 // PendingChange::Removal since there's nothing to remove
                 // from the index.
-                //assert_eq!(*value_ref, value);
+                assert_eq!(*value_ref, value);
                 trace!("removing Insert from pending_changes {:?} {:?}", key, value);
                 self.pending_changes.remove(&key);
             }
-            Some(PendingChange::RemoveThenInsert(value)) => {
+            Some(PendingChange::RemoveThenInsert(value_ref)) => {
                 // The operation_log has a Remove, and then an Insert for
                 // this key, so the key is in the Index.  We need a
                 // PendingChange::Remove so that the Index entry won't be
                 // found.
-                //assert_eq!(*value_ref, value);
+                assert_eq!(*value_ref, value);
                 trace!(
                     "changing RemoveThenInsert to Remove in pending_changes {:?} {:?}",
                     key,
@@ -1058,11 +752,11 @@ impl ZettaCacheState {
                 );
                 self.pending_changes.insert(key, PendingChange::Remove());
             }
-            Some(PendingChange::UpdateAtime(value)) => {
+            Some(PendingChange::UpdateAtime(value_ref)) => {
                 // It's just an atime update, so the operation_log doesn't
                 // have an Insert for this key, but the key is in the
                 // Index.
-                //assert_eq!(*value_ref, value);
+                assert_eq!(*value_ref, value);
                 trace!(
                     "changing UpdateAtime to Remove in pending_changes {:?} {:?}",
                     key,
@@ -1113,7 +807,7 @@ impl ZettaCacheState {
 
         let key = IndexKey { guid, block };
         let value = IndexValue {
-            atime: self.current_atime(),
+            atime: self.atime,
             location,
             size: buf_size,
         };
@@ -1163,10 +857,6 @@ impl ZettaCacheState {
         self.outstanding_writes.insert(value, sem);
     }
 
-    pub fn current_atime(&self) -> Atime {
-        self.atime
-    }
-
     /// returns offset, or None if there's no space
     fn allocate_block(&mut self, size: usize) -> Option<DiskLocation> {
         let end = self.last_valid_data_offset + size as u64;
@@ -1182,7 +872,7 @@ impl ZettaCacheState {
         }
     }
 
-    async fn flush_checkpoint(&mut self) {
+    async fn flush_checkpoint(&mut self, index: &mut ZettaCacheIndex) {
         debug!(
             "flushing checkpoint {:?}",
             self.super_phys.last_checkpoint_id.next()
@@ -1193,7 +883,7 @@ impl ZettaCacheState {
         // Wait for all outstanding reads, so that if the ExtentAllocator needs
         // to overwrite some blocks, there aren't any outstanding i/os to that
         // region.
-        // XXX It would be better to only do wait for the reads that are in the
+        // XXX It would be better to only wait for the reads that are in the
         // region that we're overwriting.  But it will be tricky to do the
         // waiting down in the ExtentAllocator.  If we get that working, we'll
         // still need to clean up the outstanding_reads entries that have
@@ -1216,11 +906,14 @@ impl ZettaCacheState {
         self.outstanding_writes.clear();
 
         if self.pending_changes.len() > MAX_PENDING_CHANGES {
-            self.merge_pending_changes().await;
+            index.log.flush().await;
+            let new_index = self.merge_pending_changes(index).await;
+            index.clear();
+            *index = new_index;
         }
 
         future::join3(
-            self.index.write().await.log.flush(),
+            index.log.flush(),
             self.chunk_summary.flush(),
             self.operation_log.flush(),
         )
@@ -1229,7 +922,7 @@ impl ZettaCacheState {
         let checkpoint = ZettaCheckpointPhys {
             generation: self.super_phys.last_checkpoint_id.next(),
             extent_allocator: self.extent_allocator.get_phys(),
-            index: self.index.read().await.get_phys(),
+            index: index.get_phys(),
             chunk_summary: self.chunk_summary.get_phys(),
             operation_log: self.operation_log.get_phys(),
             last_valid_data_offset: self.last_valid_data_offset,
@@ -1239,7 +932,9 @@ impl ZettaCacheState {
         let mut checkpoint_location = self.super_phys.last_checkpoint_extent.location
             + self.super_phys.last_checkpoint_extent.size;
 
-        let raw = self.block_access.json_chunk_to_raw(&checkpoint);
+        let raw = self
+            .block_access
+            .chunk_to_raw(EncodeType::Json, &checkpoint);
         if raw.len()
             > (checkpoint.extent_allocator.first_valid_offset - checkpoint_location.offset) as usize
         {
@@ -1278,7 +973,7 @@ impl ZettaCacheState {
         );
     }
 
-    async fn merge_pending_changes(&mut self) {
+    async fn merge_pending_changes(&mut self, old_index: &ZettaCacheIndex) -> ZettaCacheIndex {
         let begin = Instant::now();
         // XXX when we are continually merging, over multiple checkpoints, we
         // will probably want the BlockBasedLog to know about multiple
@@ -1290,8 +985,6 @@ impl ZettaCacheState {
             Default::default(),
         )
         .await;
-        let mut old_index = self.index.write().await;
-        old_index.log.flush().await;
         info!(
             "writing new index to merge {} pending changes into index of {} entries ({} MB)",
             self.pending_changes.len(),
@@ -1421,9 +1114,6 @@ impl ZettaCacheState {
         );
 
         self.pending_changes.clear();
-        old_index.clear();
-        drop(old_index);
-
         self.operation_log.clear();
 
         info!(
@@ -1433,6 +1123,6 @@ impl ZettaCacheState {
             begin.elapsed().as_secs_f64(),
             (new_index.log.num_bytes() as f64 / 1024f64 / 1024f64) / begin.elapsed().as_secs_f64(),
         );
-        self.index = Arc::new(tokio::sync::RwLock::new(new_index));
+        new_index
     }
 }
