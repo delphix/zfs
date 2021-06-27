@@ -457,11 +457,8 @@ vdev_is_hole(uint64_t *hole_array, uint_t holes, uint_t id)
 }
 
 static void
-copy_creds(nvlist_t *src, nvlist_t *dst)
+copy_credentials_profile(nvlist_t *src, nvlist_t *dst)
 {
-	/*
-	 * If this is an objstore pool, we need to get the credentials.
-	 */
 	nvlist_t *tree, *dsttree;
 	uint_t c, c2, children, dstchildren;
 	nvlist_t **child, **dstchild;
@@ -478,7 +475,7 @@ copy_creds(nvlist_t *src, nvlist_t *dst)
 	    &dstchild, &dstchildren));
 
 	for (c = 0; c < children; c++) {
-		char *type, *creds;
+		char *type, *profile;
 		uint64_t guid;
 		if (nvlist_lookup_string(child[c], ZPOOL_CONFIG_TYPE,
 		    &type) != 0) {
@@ -488,8 +485,11 @@ copy_creds(nvlist_t *src, nvlist_t *dst)
 		if (strcmp(type, VDEV_TYPE_OBJSTORE) != 0)
 			continue;
 
-		creds = fnvlist_lookup_string(child[c],
-		    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS);
+		if (nvlist_lookup_string(child[c],
+		    ZPOOL_CONFIG_CRED_PROFILE, &profile) != 0) {
+			continue;
+		}
+
 		guid = fnvlist_lookup_uint64(child[c], ZPOOL_CONFIG_GUID);
 
 		for (c2 = 0; c2 < dstchildren; c2++) {
@@ -505,7 +505,7 @@ copy_creds(nvlist_t *src, nvlist_t *dst)
 			}
 
 			fnvlist_add_string(dstchild[c2],
-			    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, creds);
+			    ZPOOL_CONFIG_CRED_PROFILE, profile);
 			break;
 		}
 		break;
@@ -876,7 +876,7 @@ get_configs(libpc_handle_t *hdl, pool_list_t *pl, boolean_t active_ok,
 			continue;
 		}
 
-		copy_creds(config, nvl);
+		copy_credentials_profile(config, nvl);
 
 		nvlist_free(config);
 		config = nvl;
@@ -1784,7 +1784,7 @@ zpool_find_import_cached(libpc_handle_t *hdl, importargs_t *iarg)
 		}
 
 		for (c = 0; c < children; c++) {
-			char *type, *creds;
+			char *type, *profile;
 			if (nvlist_lookup_string(child[c], ZPOOL_CONFIG_TYPE,
 			    &type) != 0) {
 				fprintf(stderr, gettext(
@@ -1797,32 +1797,18 @@ zpool_find_import_cached(libpc_handle_t *hdl, importargs_t *iarg)
 				continue;
 
 			if ((nvlist_lookup_string(child[c],
-			    "object-credentials-location",
-			    &creds)) != 0) {
-				fprintf(stderr, gettext("cannot import '%s': "
-				    "No objstore credentials located.\n"),
-				    name);
-				goto errout;
+			    "object-credentials-profile",
+			    &profile)) == 0) {
+				fnvlist_add_string(child[c],
+				    ZPOOL_CONFIG_CRED_PROFILE, profile);
+				break;
 			}
-
-			char *credentials;
-			if (iarg->handle_creds(hdl->lpc_lib_handle,
-			    creds, &credentials) != 0) {
-				fprintf(stderr, gettext("cannot import '%s': "
-				    "Failed to "
-				    "retrieve objstore credentials.\n"), name);
-				goto errout;
-			}
-			fnvlist_add_string(child[c],
-			    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, credentials);
-			free(credentials);
-			break;
 		}
 
 		if ((dst = zutil_refresh_config(hdl, src)) == NULL)
 			goto errout;
 
-		copy_creds(src, dst);
+		copy_credentials_profile(src, dst);
 
 		if (nvlist_add_nvlist(pools, nvpair_name(elem), dst) != 0) {
 			(void) zutil_no_memory(hdl);

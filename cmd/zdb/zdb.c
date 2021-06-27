@@ -780,7 +780,7 @@ usage(void)
 	    "\t%s [-AdiPv] [-e [-V] [-p <path> ...]] [-U <cache>]\n"
 	    "\t\t[<poolname>[/<dataset | objset id>] [<object | range> ...]\n"
 	    "\t%s [-AdiPv] [-e [-V] -a <endpoint> -g <region> -B <bucket> "
-	    "-f <creds>]\n"
+	    "-f <creds profile>]\n"
 	    "\t\t[<poolname>[/<dataset | objset id>] [<object | range> ...]\n"
 	    "\t%s [-v] <bookmark>\n"
 	    "\t%s -C [-A] [-U <cache>]\n"
@@ -864,8 +864,8 @@ usage(void)
 	    "-e to specify object-store endpoint\n");
 	(void) fprintf(stderr, "        -g <region> object-store region\n");
 	(void) fprintf(stderr, "        -B <bucket> object-store bucket\n");
-	(void) fprintf(stderr, "        -g <creds> object-store credential "
-	    "uri\n");
+	(void) fprintf(stderr, "        -f <profile> object-store credentials "
+	    "profile\n");
 	(void) fprintf(stderr, "        -P print numbers in parseable form\n");
 	(void) fprintf(stderr, "        -q don't print label contents\n");
 	(void) fprintf(stderr, "        -t <txg> -- highest txg to use when "
@@ -8330,7 +8330,7 @@ zdb_embedded_block(char *thing)
 
 static nvlist_t *
 make_objectstore_prop(char *endpoint, char *region, char *bucket,
-    char *creds)
+    char *creds_profile)
 {
 	if (endpoint == NULL) {
 		(void) fprintf(stderr,
@@ -8347,11 +8347,6 @@ make_objectstore_prop(char *endpoint, char *region, char *bucket,
 		    "object-store bucket not specified.\n");
 		usage();
 	}
-	if (creds == NULL) {
-		(void) fprintf(stderr,
-		    "object-store credentials not specified.\n");
-		usage();
-	}
 
 	nvlist_t *nv = fnvlist_alloc();
 	fnvlist_add_string(nv, ZPOOL_CONFIG_PATH, bucket);
@@ -8359,60 +8354,10 @@ make_objectstore_prop(char *endpoint, char *region, char *bucket,
 	    endpoint);
 	fnvlist_add_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_REGION),
 	    region);
-	fnvlist_add_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS),
-	    creds);
+	fnvlist_add_string(nv, zpool_prop_to_name(ZPOOL_PROP_OBJ_CRED_PROFILE),
+	    creds_profile);
 
 	return (nv);
-}
-
-static int
-load_obj_store_creds(char *obj_store_creds_file, char *obj_store_creds,
-    size_t cred_buf_size)
-{
-	int rc = 0;
-	char *file = obj_store_creds_file;
-	if (strlen(obj_store_creds_file) <= 8 ||
-	    strncmp("file:///", obj_store_creds_file, 8) == 0) {
-		file = obj_store_creds_file + 7;
-	} else {
-		return (EINVAL);
-	}
-
-	int fd = open(file, O_RDONLY);
-	if (fd == -1) {
-		(void) fprintf(stderr, "can't open %s", obj_store_creds_file);
-		return (errno);
-	}
-
-	int read_size = read(fd, obj_store_creds, cred_buf_size - 1);
-	if (read_size == -1) {
-		(void) fprintf(stderr, "can't read %s", obj_store_creds_file);
-		rc = errno;
-	} else {
-		obj_store_creds[read_size] = '\0';
-	}
-
-	(void) close(fd);
-
-	return (rc);
-}
-
-static int
-get_objstore_credentials(void *hdl, char *credloc, char **creds)
-{
-	char zo_obj_store_creds[MAXNAMELEN];
-
-	int rc = load_obj_store_creds(credloc, zo_obj_store_creds, MAXNAMELEN);
-	if (rc > 0) {
-		(void) fprintf(stderr,
-		    "Failed to read object-store credentials.\n");
-		exit(1);
-	}
-
-	*creds = umem_alloc(sizeof (zo_obj_store_creds), UMEM_NOFAIL);
-	bcopy(zo_obj_store_creds, *creds, sizeof (zo_obj_store_creds));
-
-	return (0);
 }
 
 int
@@ -8429,7 +8374,7 @@ main(int argc, char **argv)
 	char *endpoint = NULL;
 	char *region = NULL;
 	char *bucket = NULL;
-	char *creds = NULL;
+	char *creds_profile = "default";
 	int nsearch = 0;
 	char *target, *target_pool, dsname[ZFS_MAX_DATASET_NAME_LEN];
 	nvlist_t *policy = NULL;
@@ -8559,7 +8504,7 @@ main(int argc, char **argv)
 			objstore = 1;
 			break;
 		case 'f':
-			creds = optarg;
+			creds_profile = optarg;
 			objstore = 1;
 			break;
 		case 'g':
@@ -8723,10 +8668,7 @@ main(int argc, char **argv)
 		args.can_be_active = B_TRUE;
 		if (objstore) {
 			args.props = make_objectstore_prop(endpoint, region,
-			    bucket, creds);
-			args.handle_creds =
-			    (int (*)(void *, char *, char **))
-			    get_objstore_credentials;
+			    bucket, creds_profile);
 		}
 		error = zpool_find_config(NULL, target_pool, &cfg, &args,
 		    &libzpool_config_ops);

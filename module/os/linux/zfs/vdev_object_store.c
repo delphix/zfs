@@ -53,7 +53,7 @@
 #define	AGENT_TXG		"TXG"
 #define	AGENT_GUID		"GUID"
 #define	AGENT_BUCKET		"bucket"
-#define	AGENT_CREDENTIALS	"credentials"
+#define	AGENT_CRED_PROFILE	"credentials_profile"
 #define	AGENT_ENDPOINT		"endpoint"
 #define	AGENT_REGION		"region"
 #define	AGENT_BLKID		"block"
@@ -108,8 +108,7 @@ typedef struct vdev_object_store {
 	vdev_t *vos_vdev;
 	char *vos_endpoint;
 	char *vos_region;
-	char *vos_credential_location;
-	char *vos_credentials;
+	char *vos_cred_profile;
 	kthread_t *vos_agent_thread;
 	kmutex_t vos_lock;
 	kcondvar_t vos_cv;
@@ -484,7 +483,10 @@ agent_create_pool(vdev_t *vd, vdev_object_store_t *vos)
 	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_CREATE_POOL);
 	fnvlist_add_string(nv, AGENT_NAME, spa_name(vd->vdev_spa));
 	fnvlist_add_uint64(nv, AGENT_GUID, spa_guid(vd->vdev_spa));
-	fnvlist_add_string(nv, AGENT_CREDENTIALS, vos->vos_credentials);
+	if (vos->vos_cred_profile != NULL) {
+		fnvlist_add_string(nv, AGENT_CRED_PROFILE,
+		    vos->vos_cred_profile);
+	}
 	fnvlist_add_string(nv, AGENT_ENDPOINT, vos->vos_endpoint);
 	fnvlist_add_string(nv, AGENT_REGION, vos->vos_region);
 	fnvlist_add_string(nv, AGENT_BUCKET, vd->vdev_path);
@@ -513,7 +515,10 @@ agent_open_pool(vdev_t *vd, vdev_object_store_t *vos)
 	nvlist_t *nv = fnvlist_alloc();
 	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_OPEN_POOL);
 	fnvlist_add_uint64(nv, AGENT_GUID, spa_guid(vd->vdev_spa));
-	fnvlist_add_string(nv, AGENT_CREDENTIALS, vos->vos_credentials);
+	if (vos->vos_cred_profile != NULL) {
+		fnvlist_add_string(nv, AGENT_CRED_PROFILE,
+		    vos->vos_cred_profile);
+	}
 	fnvlist_add_string(nv, AGENT_ENDPOINT, vos->vos_endpoint);
 	fnvlist_add_string(nv, AGENT_REGION, vos->vos_region);
 	fnvlist_add_string(nv, AGENT_BUCKET, vd->vdev_path);
@@ -708,6 +713,19 @@ object_store_begin_txg(vdev_t *vd, uint64_t txg)
 	mutex_exit(&vos->vos_sock_lock);
 }
 
+static void
+remove_cred_profile(nvlist_t *config)
+{
+	nvlist_t *tree;
+	char *profile;
+
+	tree = fnvlist_lookup_nvlist(config, ZPOOL_CONFIG_VDEV_TREE);
+	if (nvlist_lookup_string(tree,
+	    ZPOOL_CONFIG_CRED_PROFILE, &profile) == 0) {
+		(void) nvlist_remove_all(tree, ZPOOL_CONFIG_CRED_PROFILE);
+	}
+}
+
 void
 object_store_end_txg(vdev_t *vd, nvlist_t *config, uint64_t txg)
 {
@@ -721,6 +739,9 @@ object_store_end_txg(vdev_t *vd, nvlist_t *config, uint64_t txg)
 	 * might be in recovery.
 	 */
 	zfs_object_store_wait(vos, VOS_SOCK_READY);
+
+	// The credentials profile should not be persisted on-disk.
+	remove_cred_profile(config);
 
 	size_t nvlen;
 	char *nvbuf = fnvlist_pack(config, &nvlen);
@@ -1068,19 +1089,12 @@ vdev_object_store_init(spa_t *spa, nvlist_t *nv, void **tsd)
 	} else {
 		return (SET_ERROR(EINVAL));
 	}
-	if (!nvlist_lookup_string(nv,
-	    zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), &val)) {
-		vos->vos_credential_location = kmem_strdup(val);
-	} else {
-		return (SET_ERROR(EINVAL));
-	}
-	if (!nvlist_lookup_string(nv,
-	    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, &val)) {
-		vos->vos_credentials = kmem_strdup(val);
+	if (!nvlist_lookup_string(nv, ZPOOL_CONFIG_CRED_PROFILE, &val)) {
+		vos->vos_cred_profile = kmem_strdup(val);
 	}
 
-	zfs_dbgmsg("vdev_object_store_init, endpoint=%s region=%s cred=%s",
-	    vos->vos_endpoint, vos->vos_region, vos->vos_credentials);
+	zfs_dbgmsg("vdev_object_store_init, endpoint=%s region=%s profile=%s",
+	    vos->vos_endpoint, vos->vos_region, vos->vos_cred_profile);
 
 	return (0);
 }
@@ -1103,11 +1117,8 @@ vdev_object_store_fini(vdev_t *vd)
 	if (vos->vos_region != NULL) {
 		kmem_strfree(vos->vos_region);
 	}
-	if (vos->vos_credential_location != NULL) {
-		kmem_strfree(vos->vos_credential_location);
-	}
-	if (vos->vos_credentials != NULL) {
-		kmem_strfree(vos->vos_credentials);
+	if (vos->vos_cred_profile != NULL) {
+		kmem_strfree(vos->vos_cred_profile);
 	}
 	if (vos->vos_config != NULL) {
 		fnvlist_free(vos->vos_config);
@@ -1297,14 +1308,13 @@ vdev_object_store_config_generate(vdev_t *vd, nvlist_t *nv)
 	vdev_object_store_t *vos = vd->vdev_tsd;
 
 	fnvlist_add_string(nv,
-	    zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS),
-	    vos->vos_credential_location);
-	fnvlist_add_string(nv, ZPOOL_CONFIG_OBJSTORE_CREDENTIALS,
-	    vos->vos_credentials);
-	fnvlist_add_string(nv,
 	    zpool_prop_to_name(ZPOOL_PROP_OBJ_ENDPOINT), vos->vos_endpoint);
 	fnvlist_add_string(nv,
 	    zpool_prop_to_name(ZPOOL_PROP_OBJ_REGION), vos->vos_region);
+	if (vos->vos_cred_profile != NULL) {
+		fnvlist_add_string(nv, ZPOOL_CONFIG_CRED_PROFILE,
+		    vos->vos_cred_profile);
+	}
 }
 
 static void

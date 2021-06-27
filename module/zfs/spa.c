@@ -3722,26 +3722,21 @@ spa_ld_open_rootbp(spa_t *spa)
 }
 
 static void
-copy_objstore_credentials(nvlist_t *src, nvlist_t *dest)
+copy_objstore_cred_profile(nvlist_t *src, nvlist_t *dest)
 {
 	nvlist_t **schild, **dchild;
 	uint_t schildren, dchildren;
-	int error;
 
-	error = nvlist_lookup_nvlist_array(src, ZPOOL_CONFIG_CHILDREN,
-	    &schild, &schildren);
-
-	if (error != 0)
+	if (nvlist_lookup_nvlist_array(src, ZPOOL_CONFIG_CHILDREN,
+	    &schild, &schildren) != 0)
 		return;
 
-	error = nvlist_lookup_nvlist_array(dest, ZPOOL_CONFIG_CHILDREN,
-	    &dchild, &dchildren);
-
-	if (error != 0)
+	if (nvlist_lookup_nvlist_array(dest, ZPOOL_CONFIG_CHILDREN,
+	    &dchild, &dchildren) != 0)
 		return;
 
 	for (int c1 = 0; c1 < schildren; c1++) {
-		char *type, *creds;
+		char *type, *profile;
 		uint64_t guid;
 		if (nvlist_lookup_string(schild[c1], ZPOOL_CONFIG_TYPE,
 		    &type) != 0) {
@@ -3751,8 +3746,10 @@ copy_objstore_credentials(nvlist_t *src, nvlist_t *dest)
 		if (strcmp(type, VDEV_TYPE_OBJSTORE) != 0)
 			continue;
 
-		creds = fnvlist_lookup_string(schild[c1],
-		    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS);
+		if (nvlist_lookup_string(schild[c1], ZPOOL_CONFIG_CRED_PROFILE,
+		    &profile) != 0) {
+			continue;
+		}
 		guid = fnvlist_lookup_uint64(schild[c1], ZPOOL_CONFIG_GUID);
 
 		for (int c2 = 0; c2 < dchildren; c2++) {
@@ -3767,14 +3764,13 @@ copy_objstore_credentials(nvlist_t *src, nvlist_t *dest)
 				continue;
 			}
 			fnvlist_add_string(dchild[c2],
-			    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, creds);
+			    ZPOOL_CONFIG_CRED_PROFILE, profile);
 			break;
 		}
 
 		break;
 	}
 }
-
 
 static int
 spa_ld_trusted_config(spa_t *spa, spa_import_type_t type,
@@ -3823,9 +3819,9 @@ spa_ld_trusted_config(spa_t *spa, spa_import_type_t type,
 
 	/*
 	 * Before we build the new vdev tree, we have to copy the credentials
-	 * for any objstore vdevs from the untrusted config.
+	 * profile for any objstore vdevs from the untrusted config.
 	 */
-	copy_objstore_credentials(fnvlist_lookup_nvlist(spa->spa_config,
+	copy_objstore_cred_profile(fnvlist_lookup_nvlist(spa->spa_config,
 	    ZPOOL_CONFIG_VDEV_TREE), nv);
 
 	/*

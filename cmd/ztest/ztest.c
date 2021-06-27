@@ -169,8 +169,7 @@ typedef struct ztest_shared_opts {
 	char zo_obj_store_endpoint[MAXPATHLEN];
 	char zo_obj_store_region[MAXNAMELEN];
 	char zo_obj_store_bucket[MAXNAMELEN];
-	char zo_obj_store_creds_file[MAXPATHLEN];
-	char zo_obj_store_creds[MAXNAMELEN];
+	char zo_obj_store_creds_profile[MAXNAMELEN];
 	char zo_alt_ztest[MAXNAMELEN];
 	char zo_alt_libpath[MAXNAMELEN];
 	uint64_t zo_vdevs;
@@ -204,7 +203,7 @@ typedef struct ztest_shared_opts {
 #define	DEFAULT_VDEV_DIR "/tmp"
 #define	DEFAULT_ENDPOINT "https://s3-us-west-2.amazonaws.com"
 #define	DEFAULT_REGION "us-west-2"
-#define	DEFAULT_CREDS_FILE "file:///etc/zfs/zpool_credentials"
+#define	DEFAULT_CREDS_PROFILE "default"
 #define	DEFAULT_VDEV_COUNT 5
 #define	DEFAULT_VDEV_SIZE (SPA_MINDEVSIZE * 4)	/* 256m default size */
 #define	DEFAULT_VDEV_SIZE_STR "256M"
@@ -234,10 +233,10 @@ static const ztest_shared_opts_t ztest_opts_defaults = {
 	.zo_pool = DEFAULT_POOL,
 	.zo_dir = DEFAULT_VDEV_DIR,
 	.zo_obj_store = 0,
-	.zo_obj_store_endpoint = "https://s3-us-west-2.amazonaws.com",
-	.zo_obj_store_region = "us-west-2",
+	.zo_obj_store_endpoint = DEFAULT_ENDPOINT,
+	.zo_obj_store_region = DEFAULT_REGION,
 	.zo_obj_store_bucket = { '\0' },
-	.zo_obj_store_creds_file = "file:///etc/zfs/zpool_credentials",
+	.zo_obj_store_creds_profile = DEFAULT_CREDS_PROFILE,
 	.zo_alt_ztest = { '\0' },
 	.zo_alt_libpath = { '\0' },
 	.zo_vdevs = DEFAULT_VDEV_COUNT,
@@ -780,8 +779,9 @@ static ztest_option_t option_table[] = {
 	    NO_DEFAULT, DEFAULT_REGION},
 	{ 'b',	"object-bucket", "STRING", "Object-store bucket",
 	    NO_DEFAULT, NULL},
-	{ 'z',	"object-credentials", "URI", "Object store credentials URI",
-	    NO_DEFAULT, DEFAULT_CREDS_FILE},
+	{ 'z',	"object-credentials-profile", "STRING",
+	    "Object store credentials profile",
+	    NO_DEFAULT, DEFAULT_CREDS_PROFILE},
 	{ 'M',	"multi-host", NULL,
 	    "Multi-host; simulate pool imported on remote host",
 	    NO_DEFAULT, NULL},
@@ -1054,8 +1054,8 @@ process_options(int argc, char **argv)
 			zo->zo_obj_store = 1;
 			break;
 		case 'z':
-			(void) strlcpy(zo->zo_obj_store_creds_file, optarg,
-			    sizeof (zo->zo_obj_store_creds_file));
+			(void) strlcpy(zo->zo_obj_store_creds_profile, optarg,
+			    sizeof (zo->zo_obj_store_creds_profile));
 			zo->zo_obj_store = 1;
 			break;
 		case 'M':
@@ -1265,38 +1265,6 @@ ztest_is_draid_spare(const char *name)
 	return (B_FALSE);
 }
 
-static int
-load_obj_store_creds(char *obj_store_creds_file, char *obj_store_creds,
-    size_t cred_buf_size)
-{
-	int rc = 0;
-	char *file = obj_store_creds_file;
-	if (strlen(obj_store_creds_file) <= 8 ||
-	    strncmp("file:///", obj_store_creds_file, 8) == 0) {
-		file = obj_store_creds_file + 7;
-	} else {
-		return (EINVAL);
-	}
-
-	int fd = open(file, O_RDONLY);
-	if (fd == -1) {
-		(void) fprintf(stderr, "can't open %s", obj_store_creds_file);
-		return (errno);
-	}
-
-	int read_size = read(fd, obj_store_creds, cred_buf_size - 1);
-	if (read_size == -1) {
-		(void) fprintf(stderr, "can't read %s", obj_store_creds_file);
-		rc = errno;
-	} else {
-		obj_store_creds[read_size] = '\0';
-	}
-
-	(void) close(fd);
-
-	return (rc);
-}
-
 static nvlist_t *
 make_vdev_obj_store(void)
 {
@@ -1308,12 +1276,8 @@ make_vdev_obj_store(void)
 	    ztest_opts.zo_obj_store_endpoint);
 	fnvlist_add_string(vdev, zpool_prop_to_name(ZPOOL_PROP_OBJ_REGION),
 	    ztest_opts.zo_obj_store_region);
-	fnvlist_add_string(vdev, zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS),
-	    ztest_opts.zo_obj_store_creds_file);
-	ASSERT0(load_obj_store_creds(ztest_opts.zo_obj_store_creds_file,
-	    ztest_opts.zo_obj_store_creds, MAXNAMELEN));
-	fnvlist_add_string(vdev, ZPOOL_CONFIG_OBJSTORE_CREDENTIALS,
-	    ztest_opts.zo_obj_store_creds);
+	fnvlist_add_string(vdev, ZPOOL_CONFIG_CRED_PROFILE,
+	    ztest_opts.zo_obj_store_creds_profile);
 	return (vdev);
 }
 
@@ -6980,7 +6944,7 @@ ztest_run_zdb(char *pool, uint64_t guid)
 		    ztest_opts.zo_obj_store_endpoint,
 		    ztest_opts.zo_obj_store_region,
 		    ztest_opts.zo_obj_store_bucket,
-		    ztest_opts.zo_obj_store_creds_file,
+		    ztest_opts.zo_obj_store_creds_profile,
 		    (u_longlong_t)guid);
 	} else {
 		snprintf(loc, len, "-p %s %s", ztest_opts.zo_dir, pool);

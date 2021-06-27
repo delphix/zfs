@@ -68,7 +68,6 @@ typedef struct importargs {
 	boolean_t can_be_active; /* can the pool be active?		*/
 	boolean_t scan;		/* prefer scanning to libblkid cache    */
 	nvlist_t *policy;	/* load policy (max txg, rewind, etc.)	*/
-	int (*handle_creds)(void *, char *, char **);
 	nvlist_t *props;
 } importargs_t;
 

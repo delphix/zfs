@@ -163,10 +163,6 @@ fn do_btree() {
 
 async fn do_create() -> Result<(), Box<dyn Error>> {
     let mut client = Client::connect().await;
-    let aws_key_id = env::var("AWS_ACCESS_KEY_ID")
-        .expect("the AWS_ACCESS_KEY_ID environment variable must be set");
-    let secret_key = env::var("AWS_SECRET_ACCESS_KEY")
-        .expect("the AWS_SECRET_ACCESS_KEY environment variable must be set");
     let endpoint = ENDPOINT;
     let region = REGION;
     let bucket_name = BUCKET_NAME;
@@ -174,15 +170,7 @@ async fn do_create() -> Result<(), Box<dyn Error>> {
     let guid = PoolGuid(POOL_GUID);
 
     client
-        .create_pool(
-            &aws_key_id,
-            &secret_key,
-            &region,
-            &endpoint,
-            &bucket_name,
-            guid,
-            &pool_name,
-        )
+        .create_pool(&region, &endpoint, &bucket_name, guid, &pool_name)
         .await;
     client.get_next_response().await;
 
@@ -227,22 +215,11 @@ async fn setup_client(guid: PoolGuid) -> (Client, Txg, BlockId) {
     let mut client = Client::connect().await;
 
     let bucket_name = BUCKET_NAME;
-    let aws_key_id = env::var("AWS_ACCESS_KEY_ID")
-        .expect("the AWS_ACCESS_KEY_ID environment variable must be set");
-    let secret_key = env::var("AWS_SECRET_ACCESS_KEY")
-        .expect("the AWS_SECRET_ACCESS_KEY environment variable must be set");
     let endpoint = ENDPOINT;
     let region = REGION;
 
     client
-        .open_pool(
-            &aws_key_id,
-            &secret_key,
-            &region,
-            endpoint,
-            &bucket_name,
-            guid,
-        )
+        .open_pool(&region, endpoint, &bucket_name, guid)
         .await;
 
     let nvl = client.get_next_response().await;
@@ -482,11 +459,12 @@ fn get_object_access(
     endpoint: &str,
     region: &str,
     bucket: &str,
+    profile: &str,
     aws_access_key_id: Option<&str>,
     aws_secret_access_key: Option<&str>,
 ) -> ObjectAccess {
     match aws_access_key_id {
-        None => ObjectAccess::new(endpoint, region, bucket),
+        None => ObjectAccess::new(endpoint, region, bucket, Some(profile.to_owned())),
         Some(access_id) => {
             // If access_id is specified, aws_secret_access_key should also be specified.
             let secret_key = aws_secret_access_key.unwrap();
@@ -556,6 +534,14 @@ async fn main() {
                 .default_value(BUCKET_NAME),
         )
         .arg(
+            Arg::with_name("profile")
+                .short("p")
+                .long("profile")
+                .help("credentials profile")
+                .takes_value(true)
+                .default_value("default"),
+        )
+        .arg(
             Arg::with_name("aws_access_key_id")
                 .short("i")
                 .long("aws_access_key_id")
@@ -599,6 +585,7 @@ async fn main() {
     let endpoint = matches.value_of("endpoint").unwrap();
     let region_str = matches.value_of("region").unwrap();
     let bucket_name = matches.value_of("bucket").unwrap();
+    let profile = matches.value_of("profile").unwrap();
     let aws_access_key_id = matches.value_of("aws_access_key_id");
     let aws_secret_access_key = matches.value_of("aws_secret_access_key");
 
@@ -608,14 +595,15 @@ async fn main() {
     }
 
     println!(
-        "endpoint: {}, region: {}, bucket: {} access_id: {:?}, secret_key: {:?}",
-        endpoint, region_str, bucket_name, aws_access_key_id, aws_secret_access_key
+        "endpoint: {}, region: {}, bucket: {} profile: {} access_id: {:?}, secret_key: {:?}",
+        endpoint, region_str, bucket_name, profile, aws_access_key_id, aws_secret_access_key
     );
 
     let object_access: ObjectAccess = get_object_access(
         endpoint,
         region_str,
         bucket_name,
+        profile,
         aws_access_key_id,
         aws_secret_access_key,
     );
