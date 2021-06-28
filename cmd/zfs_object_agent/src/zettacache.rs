@@ -124,14 +124,13 @@ pub struct ZettaCache {
     metrics: Arc<ZettaCacheMetrics>,
 }
 
-struct NonAsyncMutexGuard<'a, T> {
+struct NonSendMutexGuard<'a, T> {
     inner: tokio::sync::MutexGuard<'a, T>,
     // force this to not be Send
     _marker: PhantomData<*const ()>,
 }
-//impl<'a, T> !Send for NonAsyncMutexGuard<'a, T> {}
 
-impl<'a, T> std::ops::Deref for NonAsyncMutexGuard<'a, T> {
+impl<'a, T> std::ops::Deref for NonSendMutexGuard<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -139,15 +138,14 @@ impl<'a, T> std::ops::Deref for NonAsyncMutexGuard<'a, T> {
     }
 }
 
-impl<'a, T> std::ops::DerefMut for NonAsyncMutexGuard<'a, T> {
+impl<'a, T> std::ops::DerefMut for NonSendMutexGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
 }
 
-// XXX implement this as a new trait on Mutex?
-async fn lock_non_async<T>(lock: &tokio::sync::Mutex<T>) -> NonAsyncMutexGuard<'_, T> {
-    NonAsyncMutexGuard {
+async fn lock_non_send<T>(lock: &tokio::sync::Mutex<T>) -> NonSendMutexGuard<'_, T> {
+    NonSendMutexGuard {
         inner: lock.lock().await,
         _marker: PhantomData,
     }
@@ -525,8 +523,8 @@ impl ZettaCache {
         trace!("cache hit after reading index for {:?}", key);
     }
 
-    async fn lock_state_non_async(&self) -> NonAsyncMutexGuard<'_, ZettaCacheState> {
-        lock_non_async(&self.state).await
+    async fn lock_state_non_async(&self) -> NonSendMutexGuard<'_, ZettaCacheState> {
+        lock_non_send(&self.state).await
     }
 
     #[measure(type = ResponseTime<AtomicHdrHistogram, StdInstantMicros>)]
