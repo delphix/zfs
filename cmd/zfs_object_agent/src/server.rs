@@ -167,9 +167,13 @@ impl Server {
                         debug!("got request: {:?}", nvl);
                         let uberblock = nvl.lookup("uberblock").unwrap().data();
                         let config = nvl.lookup("config").unwrap().data();
+                        let frees = match nvl.lookup_uint64_array("config") {
+                            Ok(x) => Some(x),
+                            Err(_) => None,
+                        };
                         if let NvData::Uint8Array(slice) = uberblock {
                             if let NvData::Uint8Array(slice2) = config {
-                                server.end_txg(slice.to_vec(), slice2.to_vec());
+                                server.end_txg(slice.to_vec(), slice2.to_vec(), frees);
                             } else {
                                 panic!("config not expected type")
                             }
@@ -385,13 +389,19 @@ impl Server {
     }
 
     // sends response when completed
-    fn end_txg(&mut self, uberblock: Vec<u8>, config: Vec<u8>) {
+    fn end_txg(&mut self, uberblock: Vec<u8>, config: Vec<u8>, frees: Option<Vec<u64>>) {
         let pool = self.pool.as_ref().unwrap().clone();
         let output = self.output.clone();
         // client should have already flushed all writes
         // XXX change to an error return
         assert_eq!(*self.num_outstanding_writes.lock().unwrap(), 0);
         tokio::spawn(async move {
+            if let Some(frees_vec) = frees {
+                for free in frees_vec.chunks_exact(2) {
+                    // XXX maybe better to pass in as a batch so that we don't have to keep grabbing and dropping the lock
+                    pool.free_block(BlockID(free[0]), free[1] as u32).await;
+                }
+            }
             pool.end_txg(uberblock, config).await;
             let mut nvl = NvList::new_unique_names();
             nvl.insert("Type", "end txg done").unwrap();
