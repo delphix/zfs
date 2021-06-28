@@ -3,7 +3,7 @@ use crate::object_access::ObjectAccess;
 use crate::pool::*;
 use crate::zettacache::ZettaCache;
 use log::*;
-use nvpair::{NvData, NvEncoding, NvList};
+use nvpair::{NvData, NvEncoding, NvList, NvListRef};
 use rusoto_s3::S3;
 use std::{cmp::max, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -225,7 +225,7 @@ impl Server {
         w.write_all(buf.as_slice()).await.unwrap();
     }
 
-    fn get_object_access(nvl: &nvpair::NvListRef) -> ObjectAccess {
+    fn get_object_access(nvl: &NvListRef) -> ObjectAccess {
         let bucket_name = nvl.lookup_string("bucket").unwrap();
         let region_str = nvl.lookup_string("region").unwrap();
         let endpoint = nvl.lookup_string("endpoint").unwrap();

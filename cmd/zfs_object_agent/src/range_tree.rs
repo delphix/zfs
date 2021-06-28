@@ -13,7 +13,7 @@ impl RangeTree {
         }
     }
 
-    // panic if already present
+    // panics if already present
     pub fn add(&mut self, start: u64, size: u64) {
         if size == 0 {
             return;
@@ -61,7 +61,7 @@ impl RangeTree {
         }
     }
 
-    // panic if not present
+    // panics if not present
     pub fn remove(&mut self, start: u64, size: u64) {
         assert_ne!(size, 0);
 
