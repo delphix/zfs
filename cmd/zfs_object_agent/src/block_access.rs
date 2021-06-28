@@ -13,7 +13,6 @@ use num::Num;
 use num::NumCast;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
 use std::os::unix::prelude::AsRawFd;
@@ -232,13 +231,16 @@ impl BlockAccess {
             compression,
             checksum: seahash::hash(&payload),
         };
-        let header_bytes = bincode::serialize(&header).unwrap();
-        let raw_len = self.round_up_to_sector(header_bytes.len() + payload.len());
-        let mut tail: Vec<u8> = Vec::new();
-        tail.resize(raw_len - header_bytes.len() - payload.len(), 0);
-        // XXX copying data around; use serde_json::to_writer to append it into a larger-than-necessary vec?
-        let buf = [header_bytes, payload, tail].concat();
-        assert_eq!(buf.len(), raw_len);
+        let header_bytes = serde_json::to_vec(&header).unwrap();
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&header_bytes);
+        // Encode a NUL byte after the header, so that we know where it ends.
+        buf.extend_from_slice(&[0]);
+        // XXX copying data around; use bincode::serialize_into() to append it into a larger-than-necessary vec?
+        buf.extend_from_slice(&payload);
+        buf.resize(self.round_up_to_sector(buf.len()), 0);
+
         buf
     }
 
@@ -249,9 +251,9 @@ impl BlockAccess {
 
     /// returns deserialized struct and amount of the buf that was consumed
     pub fn chunk_from_raw<T: DeserializeOwned>(&self, buf: &[u8]) -> Result<(T, usize)> {
-        let mut cursor = Cursor::new(buf);
-        let header: BlockHeader = bincode::deserialize_from(&mut cursor).unwrap();
-        let header_size = cursor.position() as usize;
+        // size includes the terminating NUL byte
+        let header_size = buf.iter().position(|&c| c == b'\0').unwrap() + 1;
+        let header: BlockHeader = serde_json::from_slice(&buf[..header_size - 1])?;
 
         if header.payload_size as usize > buf.len() - header_size {
             return Err(anyhow!(
