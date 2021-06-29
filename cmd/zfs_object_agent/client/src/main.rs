@@ -1,5 +1,7 @@
 use chrono::prelude::*;
 use chrono::DateTime;
+use clap::Arg;
+use clap::SubCommand;
 use client::Client;
 use lazy_static::lazy_static;
 use libzoa::base_types::*;
@@ -8,6 +10,11 @@ use libzoa::pool::*;
 use nvpair::*;
 use rand::prelude::*;
 use rusoto_core::ByteStream;
+use rusoto_credential::ChainProvider;
+use rusoto_credential::DefaultCredentialsProvider;
+use rusoto_credential::InstanceMetadataProvider;
+use rusoto_credential::ProfileProvider;
+use rusoto_credential::ProvideAwsCredentials;
 use rusoto_s3::*;
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
@@ -35,17 +42,6 @@ lazy_static! {
         Ok(val) => format!("{}/", val),
         Err(_) => "".to_string(),
     };
-    static ref AWS_ACCESS_KEY_ID: String = env::var("AWS_ACCESS_KEY_ID")
-        .expect("the AWS_ACCESS_KEY_ID environment variable must be set");
-    static ref AWS_SECRET_ACCESS_KEY: String = env::var("AWS_SECRET_ACCESS_KEY")
-        .expect("the AWS_SECRET_ACCESS_KEY environment variable must be set");
-    static ref AWS_CREDENTIALS: String = format!(
-        "{}:{}",
-        AWS_ACCESS_KEY_ID.clone(),
-        AWS_SECRET_ACCESS_KEY.clone()
-    );
-    static ref OBJECT_ACCESS: ObjectAccess =
-        ObjectAccess::new(ENDPOINT, REGION, BUCKET_NAME, &AWS_CREDENTIALS.clone());
 }
 
 async fn do_s3(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
@@ -68,6 +64,54 @@ async fn do_s3(bucket: &Bucket) -> Result<(), Box<dyn Error>> {
             println!("found object {}", res.key);
         }
     }
+
+    return std::result::Result::Ok(());
+}
+
+async fn do_rusoto_provider<P>(credentials_provider: P, file: &str)
+where
+    P: ProvideAwsCredentials + Send + Sync + 'static,
+{
+    let http_client = rusoto_core::HttpClient::new().unwrap();
+    let client = S3Client::new_with(
+        http_client,
+        credentials_provider,
+        rusoto_core::Region::UsWest2,
+    );
+
+    let content = "I want to go to S3".as_bytes().to_vec();
+
+    println!("putting {}", file);
+    let req = PutObjectRequest {
+        bucket: BUCKET_NAME.to_string(),
+        key: file.to_string(),
+        body: Some(ByteStream::from(content)),
+        ..Default::default()
+    };
+    match client.put_object(req).await {
+        Ok(result) => {
+            println!("Success {:?}", result);
+        }
+        Err(result) => {
+            println!("Failure {:?}", result);
+        }
+    }
+}
+
+async fn do_rusoto_role() -> Result<(), Box<dyn Error>> {
+    do_rusoto_provider(
+        InstanceMetadataProvider::new(),
+        "test/InstanceMetadataProvider.txt",
+    )
+    .await;
+
+    do_rusoto_provider(ProfileProvider::new().unwrap(), "test/ProfileProvider.txt").await;
+    do_rusoto_provider(ChainProvider::new(), "test/ChainProvider.txt").await;
+    do_rusoto_provider(
+        DefaultCredentialsProvider::new().unwrap(),
+        "test/DefaultCredentialsProvider.txt",
+    )
+    .await;
 
     return std::result::Result::Ok(());
 }
@@ -355,8 +399,7 @@ fn strip_prefix(prefix: &str) -> &str {
     }
 }
 
-async fn find_old_pools(min_age: Duration) -> Vec<String> {
-    let object_access = &OBJECT_ACCESS;
+async fn find_old_pools(object_access: &ObjectAccess, min_age: Duration) -> Vec<String> {
     let mut pool_keys = object_access.collect_prefixes("zfs/").await;
 
     let aws_prefix: &String = &AWS_PREFIX;
@@ -397,9 +440,11 @@ async fn find_old_pools(min_age: Duration) -> Vec<String> {
     vec
 }
 
-async fn do_list_pools(list_all_objects: bool) -> Result<(), Box<dyn Error>> {
-    let object_access = &OBJECT_ACCESS;
-    for pool_keys in find_old_pools(Duration::from_secs(0)).await {
+async fn do_list_pools(
+    object_access: &ObjectAccess,
+    list_all_objects: bool,
+) -> Result<(), Box<dyn Error>> {
+    for pool_keys in find_old_pools(object_access, Duration::from_secs(0)).await {
         // Lookup all objects in the pool.
         if list_all_objects {
             for object in object_access.collect_all_objects(&pool_keys).await {
@@ -410,16 +455,11 @@ async fn do_list_pools(list_all_objects: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn do_destroy_old_pools(args: &Vec<String>) -> Result<(), Box<dyn Error>> {
-    let min_age = if args.len() > 2 {
-        Duration::from_secs(args[2].parse::<u64>().unwrap() * 60 * 60 * 24)
-    } else {
-        panic!("Usage: zoa_test destroy_old_pools <number-of-days>");
-    };
-
-    let object_access = &OBJECT_ACCESS;
-
-    for pool_keys in find_old_pools(min_age).await {
+async fn do_destroy_old_pools(
+    object_access: &ObjectAccess,
+    min_age: Duration,
+) -> Result<(), Box<dyn Error>> {
+    for pool_keys in find_old_pools(object_access, min_age).await {
         for chunk in object_access
             .collect_all_objects(&pool_keys)
             .await
@@ -438,35 +478,198 @@ async fn do_destroy_old_pools(args: &Vec<String>) -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
-    let args: Vec<String> = std::env::args().collect();
+fn get_object_access(
+    endpoint: &str,
+    region: &str,
+    bucket: &str,
+    aws_access_key_id: Option<&str>,
+    aws_secret_access_key: Option<&str>,
+) -> ObjectAccess {
+    match aws_access_key_id {
+        None => ObjectAccess::new(endpoint, region, bucket),
+        Some(access_id) => {
+            // If access_id is specified, aws_secret_access_key should also be specified.
+            let secret_key = aws_secret_access_key.unwrap();
 
-    // assumes that AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment
-    // variables are set
-    let region_str = REGION;
-    let bucket_name = BUCKET_NAME;
+            let client =
+                ObjectAccess::get_client_with_creds(endpoint, region, access_id, secret_key);
 
-    let region: Region = region_str.parse().unwrap();
-    let credentials = Credentials::default().unwrap();
-    let bucket = Bucket::new(bucket_name, region, credentials).unwrap();
-    println!("bucket: {:?}", bucket);
-
-    match &args[1][..] {
-        "s3" => do_s3(&bucket).await.unwrap(),
-        "s3_rusoto" => do_s3_rusoto().await.unwrap(),
-        "list_pools" => do_list_pools(false).await.unwrap(),
-        "list_pool_objects" => do_list_pools(true).await.unwrap(),
-        "destroy_old_pools" => do_destroy_old_pools(&args).await.unwrap(),
-        "create" => do_create().await.unwrap(),
-        "write" => do_write().await.unwrap(),
-        "read" => do_read().await.unwrap(),
-        "free" => do_free().await.unwrap(),
-        "btree" => do_btree(),
-        "nvpair" => do_nvpair(),
-
-        _ => {
-            println!("invalid argument: {}", args[1]);
+            ObjectAccess::from_client(client, bucket)
         }
     }
+}
+
+// Test by writing and deleting an object.
+async fn do_test_connectivity(object_access: &ObjectAccess) {
+    let num = thread_rng().gen::<u64>();
+    let file = format!("test/test_connectivity_{}", num);
+    let content = "test connectivity to S3".as_bytes().to_vec();
+
+    object_access.put_object(&file, content).await;
+    object_access.delete_objects(&[file.to_string()]).await;
+}
+
+async fn test_connectivity(object_access: &ObjectAccess) -> Result<(), Box<dyn Error>> {
+    std::process::exit(
+        match tokio::time::timeout(Duration::from_secs(30), do_test_connectivity(object_access))
+            .await
+        {
+            Err(_) => {
+                eprintln!("Connectivity test failed.");
+                -1
+            }
+            Ok(_) => {
+                println!("Connectivity test succeeded.");
+                0
+            }
+        },
+    );
+}
+
+#[tokio::main]
+async fn main() {
+    let matches = clap::App::new("zoa_test")
+        .about("ZFS object agent test")
+        .version("1.0")
+        .arg(
+            Arg::with_name("endpoint")
+                .short("e")
+                .long("endpoint")
+                .help("S3 endpoint")
+                .takes_value(true)
+                .default_value(ENDPOINT),
+        )
+        .arg(
+            Arg::with_name("region")
+                .short("r")
+                .long("region")
+                .help("S3 region")
+                .takes_value(true)
+                .default_value(REGION),
+        )
+        .arg(
+            Arg::with_name("bucket")
+                .short("b")
+                .long("bucket")
+                .help("S3 bucket")
+                .takes_value(true)
+                .default_value(BUCKET_NAME),
+        )
+        .arg(
+            Arg::with_name("aws_access_key_id")
+                .short("i")
+                .long("aws_access_key_id")
+                .takes_value(true)
+                .help("AWS access key id"),
+        )
+        .arg(
+            Arg::with_name("aws_secret_access_key")
+                .short("s")
+                .long("aws_secret_access_key")
+                .takes_value(true)
+                .help("AWS secret access key"),
+        )
+        .subcommand(SubCommand::with_name("s3").about("s3 test"))
+        .subcommand(SubCommand::with_name("s3_rusoto").about("s3 rusoto test"))
+        .subcommand(SubCommand::with_name("create").about("create test "))
+        .subcommand(SubCommand::with_name("write").about("write test"))
+        .subcommand(SubCommand::with_name("read").about("read test"))
+        .subcommand(SubCommand::with_name("free").about("free test"))
+        .subcommand(SubCommand::with_name("btree").about("btree test"))
+        .subcommand(SubCommand::with_name("nvpair").about("nvpair test"))
+        .subcommand(SubCommand::with_name("rusoto_role").about("rusoto credentials test"))
+        .subcommand(SubCommand::with_name("list_pools").about("list pools"))
+        .subcommand(SubCommand::with_name("list_pool_objects").about("list pool objects"))
+        .subcommand(
+            SubCommand::with_name("destroy_old_pools")
+                .about("destroy old pools")
+                .arg(
+                    Arg::with_name("number-of-days")
+                        .short("d")
+                        .long("number-of-days")
+                        .required(true)
+                        .takes_value(true)
+                        .help("number of days"),
+                ),
+        )
+        .subcommand(SubCommand::with_name("test_connectivity").about("test connectivity"))
+        .get_matches();
+
+    // Command line parameters
+    let endpoint = matches.value_of("endpoint").unwrap();
+    let region_str = matches.value_of("region").unwrap();
+    let bucket_name = matches.value_of("bucket").unwrap();
+    let aws_access_key_id = matches.value_of("aws_access_key_id");
+    let aws_secret_access_key = matches.value_of("aws_secret_access_key");
+
+    if aws_access_key_id.is_some() != aws_secret_access_key.is_some() {
+        matches.usage();
+        panic!("Error: Both aws_access_key_id and aws_secret_access_key should be specified.");
+    }
+
+    println!(
+        "endpoint: {}, region: {}, bucket: {} access_id: {:?}, secret_key: {:?}",
+        endpoint, region_str, bucket_name, aws_access_key_id, aws_secret_access_key
+    );
+
+    let object_access: ObjectAccess = get_object_access(
+        endpoint,
+        region_str,
+        bucket_name,
+        aws_access_key_id,
+        aws_secret_access_key,
+    );
+
+    match matches.subcommand() {
+        ("s3", Some(_matches)) => {
+            let region: Region = region_str.parse().unwrap();
+            let credentials = Credentials::default().unwrap();
+
+            let bucket = Bucket::new(bucket_name, region, credentials).unwrap();
+            println!("bucket: {:?}", bucket);
+            do_s3(&bucket).await.unwrap();
+        }
+        ("s3_rusoto", Some(_matches)) => {
+            do_s3_rusoto().await.unwrap();
+        }
+        ("create", Some(_matches)) => {
+            do_create().await.unwrap();
+        }
+        ("write", Some(_matches)) => {
+            do_write().await.unwrap();
+        }
+        ("read", Some(_matches)) => {
+            do_read().await.unwrap();
+        }
+        ("free", Some(_matches)) => {
+            do_free().await.unwrap();
+        }
+        ("btree", Some(_matches)) => {
+            do_btree();
+        }
+        ("nvpair", Some(_matches)) => {
+            do_nvpair();
+        }
+        ("rusoto_role", Some(_matches)) => {
+            do_rusoto_role().await.unwrap();
+        }
+        ("list_pools", Some(_matches)) => {
+            do_list_pools(&object_access, false).await.unwrap();
+        }
+        ("list_pool_objects", Some(_matches)) => {
+            do_list_pools(&object_access, true).await.unwrap();
+        }
+        ("destroy_old_pools", Some(destroy_matches)) => {
+            let age_str = destroy_matches.value_of("number-of-days").unwrap();
+            let min_age = Duration::from_secs(age_str.parse::<u64>().unwrap() * 60 * 60 * 24);
+
+            do_destroy_old_pools(&object_access, min_age).await.unwrap();
+        }
+        ("test_connectivity", Some(_matches)) => {
+            test_connectivity(&object_access).await.unwrap();
+        }
+        _ => {
+            matches.usage();
+        }
+    };
 }

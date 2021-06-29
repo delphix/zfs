@@ -5,6 +5,8 @@ Before=zfs-import-cache.service
 
 [Service]
 Environment="RUST_BACKTRACE=1"
+Environment="AWS_SECRET_ACCESS_KEY="
+Environment="AWS_ACCESS_KEY_ID="
 ExecStart=/sbin/zfs_object_agent -vv
 Restart=always
 

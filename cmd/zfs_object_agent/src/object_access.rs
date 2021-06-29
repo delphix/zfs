@@ -9,6 +9,7 @@ use log::*;
 use lru::LruCache;
 use rand::prelude::*;
 use rusoto_core::{ByteStream, RusotoError};
+use rusoto_credential::DefaultCredentialsProvider;
 use rusoto_s3::*;
 use std::sync::Arc;
 use std::time::Instant;
@@ -131,13 +132,21 @@ where
 }
 
 impl ObjectAccess {
-    pub fn get_client(endpoint: &str, region_str: &str, creds: &str) -> S3Client {
+    fn get_custom_region(endpoint: &str, region_str: &str) -> rusoto_core::Region {
+        rusoto_core::Region::Custom {
+            name: region_str.to_owned(),
+            endpoint: endpoint.to_owned(),
+        }
+    }
+
+    pub fn get_client_with_creds(
+        endpoint: &str,
+        region_str: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+    ) -> S3Client {
         info!("region: {:?}", region_str);
         info!("Endpoint: {}", endpoint);
-
-        let mut iter = creds.split(':');
-        let access_key_id = iter.next().unwrap().trim();
-        let secret_access_key = iter.next().unwrap().trim();
 
         let http_client = rusoto_core::HttpClient::new().unwrap();
         let creds = rusoto_core::credential::StaticProvider::new(
@@ -146,7 +155,18 @@ impl ObjectAccess {
             None,
             None,
         );
-        rusoto_s3::S3Client::new_with(http_client, creds, rusoto_core::Region::UsWest2)
+        let region = ObjectAccess::get_custom_region(endpoint, region_str);
+        rusoto_s3::S3Client::new_with(http_client, creds, region)
+    }
+
+    pub fn get_client(endpoint: &str, region_str: &str) -> S3Client {
+        info!("region: {:?}", region_str);
+        info!("Endpoint: {}", endpoint);
+
+        let creds = DefaultCredentialsProvider::new().unwrap();
+        let http_client = rusoto_core::HttpClient::new().unwrap();
+        let region = ObjectAccess::get_custom_region(endpoint, region_str);
+        rusoto_s3::S3Client::new_with(http_client, creds, region)
     }
 
     pub fn from_client(client: rusoto_s3::S3Client, bucket: &str) -> Self {
@@ -156,8 +176,8 @@ impl ObjectAccess {
         }
     }
 
-    pub fn new(endpoint: &str, region_str: &str, bucket: &str, creds: &str) -> Self {
-        let client = ObjectAccess::get_client(endpoint, region_str, creds);
+    pub fn new(endpoint: &str, region_str: &str, bucket: &str) -> Self {
+        let client = ObjectAccess::get_client(endpoint, region_str);
 
         ObjectAccess {
             client,
