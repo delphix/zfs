@@ -95,6 +95,7 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
     }
 
     pub fn get_phys(&self) -> BlockBasedLogPhys {
+        assert!(self.pending_entries.is_empty());
         self.phys.clone()
     }
 

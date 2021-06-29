@@ -84,13 +84,17 @@ impl ExtentAllocator {
         assert_le!(best_size, max_size64);
 
         if best_size < min_size as u64 {
-            debug!(
-                "no extents of at least {} bytes available; overwriting {} bytes of data blocks at offset {}",
-                min_size, max_size, state.phys.last_valid_offset
-            );
+            /*
             best_offset = state.phys.last_valid_offset;
             best_size = max_size64;
             state.phys.last_valid_offset += max_size64;
+            */
+            // XXX the block allocator will keep using this, and overwriting our
+            // metadata, until we notify it.
+            panic!(
+                "no extents of at least {} bytes available; overwriting {} bytes of data blocks at offset {}",
+                min_size, max_size, state.phys.last_valid_offset
+            );
         } else {
             // remove segment from allocatable
             state.allocatable.remove(best_offset, best_size);

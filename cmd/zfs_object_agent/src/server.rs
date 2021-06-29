@@ -34,7 +34,9 @@ impl Server {
         }
 
         let mut v = Vec::new();
-        // XXX would be nice if we didn't have to zero it out
+        // XXX would be nice if we didn't have to zero it out.  Should be able
+        // to do that using read_buf(), treating the Vec as a BufMut, but will
+        // require multiple calls to do the equivalent of read_exact().
         v.resize(len64 as usize, 0);
         pipe.read_exact(v.as_mut()).await?;
         let nvl = NvList::try_unpack(v.as_ref()).unwrap();

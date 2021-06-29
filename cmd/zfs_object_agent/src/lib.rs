@@ -1,5 +1,6 @@
 pub mod base_types;
 pub mod block_access;
+pub mod block_allocator;
 pub mod block_based_log;
 pub mod extent_allocator;
 pub mod object_access;
@@ -8,4 +9,5 @@ pub mod object_block_map;
 pub mod pool;
 pub mod range_tree;
 pub mod server;
+pub mod space_map;
 pub mod zettacache;

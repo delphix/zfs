@@ -1,5 +1,7 @@
 use crate::base_types::*;
 use crate::block_access::*;
+use crate::block_allocator::BlockAllocator;
+use crate::block_allocator::BlockAllocatorPhys;
 use crate::block_based_log::*;
 use crate::extent_allocator::ExtentAllocator;
 use crate::extent_allocator::ExtentAllocatorPhys;
@@ -67,7 +69,8 @@ impl ZettaSuperBlockPhys {
 struct ZettaCheckpointPhys {
     generation: CheckpointID,
     extent_allocator: ExtentAllocatorPhys,
-    last_valid_data_offset: u64, // XXX move to BlockAllocatorPhys
+    block_allocator: BlockAllocatorPhys,
+    //last_valid_data_offset: u64, // XXX move to BlockAllocatorPhys
     last_atime: Atime,
     index: ZettaCacheIndexPhys,
     chunk_summary: BlockBasedLogPhys,
@@ -242,9 +245,9 @@ impl ZettaCacheIndex {
 
 struct ZettaCacheState {
     block_access: Arc<BlockAccess>,
-    size: u64,
     super_phys: ZettaSuperBlockPhys,
-    last_valid_data_offset: u64, // XXX move to a BlockAllocator struct
+    block_allocator: BlockAllocator,
+    //last_valid_data_offset: u64, // XXX move to a BlockAllocator struct
     pending_changes: BTreeMap<IndexKey, PendingChange>,
     // XXX Given that we have to lock the entire State to do anything, we might
     // get away with this being a Rc?  And the ExtentAllocator doesn't really
@@ -279,11 +282,14 @@ impl ZettaCache {
                 first_valid_offset: metadata_start as u64,
                 last_valid_offset: data_start as u64,
             },
-            last_valid_data_offset: data_start as u64,
             index: Default::default(),
             chunk_summary: Default::default(),
             operation_log: Default::default(),
             last_atime: Atime(0),
+            block_allocator: BlockAllocatorPhys::new(
+                data_start as u64,
+                block_access.size() - data_start,
+            ),
         };
         let raw = block_access.chunk_to_raw(EncodeType::Json, &checkpoint);
         assert_le!(raw.len(), DEFAULT_CHECKPOINT_RING_BUFFER_SIZE);
@@ -312,7 +318,6 @@ impl ZettaCache {
 
     pub async fn open(path: &str) -> ZettaCache {
         let block_access = Arc::new(BlockAccess::new(path).await);
-        let size = block_access.size();
 
         // if superblock not present, create new cache
         // XXX need a real mechanism for creating/managing the cache devices
@@ -359,7 +364,6 @@ impl ZettaCache {
 
         let state = ZettaCacheState {
             block_access: block_access.clone(),
-            size,
             pending_changes,
             atime_histogram,
             chunk_summary: BlockBasedLog::open(
@@ -368,12 +372,17 @@ impl ZettaCache {
                 checkpoint.chunk_summary,
             ),
             operation_log,
-            extent_allocator,
-            last_valid_data_offset: checkpoint.last_valid_data_offset,
             super_phys: phys,
             outstanding_reads: BTreeMap::new(),
             outstanding_writes: BTreeMap::new(),
             atime: checkpoint.last_atime,
+            block_allocator: BlockAllocator::open(
+                block_access.clone(),
+                extent_allocator.clone(),
+                checkpoint.block_allocator,
+            )
+            .await,
+            extent_allocator,
         };
 
         let this = ZettaCache {
@@ -857,17 +866,9 @@ impl ZettaCacheState {
 
     /// returns offset, or None if there's no space
     fn allocate_block(&mut self, size: usize) -> Option<DiskLocation> {
-        let end = self.last_valid_data_offset + size as u64;
-        if end < self.size {
-            let location_opt = Some(DiskLocation {
-                offset: self.last_valid_data_offset,
-            });
-            self.last_valid_data_offset = end;
-            location_opt
-        } else {
-            debug!("block allocation of {} bytes failed", size);
-            None
-        }
+        self.block_allocator
+            .allocate(size as u64)
+            .map(|extent| extent.location)
     }
 
     async fn flush_checkpoint(&mut self, index: &mut ZettaCacheIndex) {
@@ -923,8 +924,8 @@ impl ZettaCacheState {
             index: index.get_phys(),
             chunk_summary: self.chunk_summary.get_phys(),
             operation_log: self.operation_log.get_phys(),
-            last_valid_data_offset: self.last_valid_data_offset,
             last_atime: self.atime,
+            block_allocator: self.block_allocator.flush().await,
         };
 
         let mut checkpoint_location = self.super_phys.last_checkpoint_extent.location
