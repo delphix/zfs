@@ -43,7 +43,7 @@ impl ExtentAllocator {
     }
 
     pub fn get_phys(&self) -> ExtentAllocatorPhys {
-        self.state.lock().unwrap().phys.clone()
+        self.state.lock().unwrap().phys
     }
 
     pub fn checkpoint_done(&self) {

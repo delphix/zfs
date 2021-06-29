@@ -206,7 +206,7 @@ impl BlockAccess {
                     .level(4)
                     .build(Vec::new())
                     .unwrap();
-                lz4_encoder.write(&json).unwrap();
+                lz4_encoder.write_all(&json).unwrap();
                 let (payload, result) = lz4_encoder.finish();
                 result.unwrap();
                 (payload, CompressType::Lz4)

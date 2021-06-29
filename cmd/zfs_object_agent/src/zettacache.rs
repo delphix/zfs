@@ -25,7 +25,7 @@ use tokio::sync::Semaphore;
 
 const SUPERBLOCK_SIZE: usize = 4 * 1024;
 //const SUPERBLOCK_MAGIC: u64 = 0x2e11acac4e;
-const DEFAULT_CHECKPOINT_RING_BUFFER_SIZE: usize = 1 * 1024 * 1024;
+const DEFAULT_CHECKPOINT_RING_BUFFER_SIZE: usize = 1024 * 1024;
 const DEFAULT_SLAB_SIZE: usize = 16 * 1024 * 1024;
 const DEFAULT_METADATA_SIZE_PCT: f64 = 1.0; // Can lower this to test forced eviction.
 const MAX_PENDING_CHANGES: usize = 100_000; // XXX should be based on RAM usage, ~tens of millions at least
@@ -445,7 +445,7 @@ impl ZettaCache {
                                     trace!("insert with existing removal; changing to RemoveThenInsert: {:?} {:?}", key, value);
                                     oe.insert(PendingChange::RemoveThenInsert(value));
                                 }
-                                pc @ _ => {
+                                pc  => {
                                     panic!(
                                         "Inserting {:?} {:?} into already existing entry {:?}",
                                         key,
@@ -473,7 +473,7 @@ impl ZettaCache {
                                     trace!("remove with existing removetheninsert; changing to remove: {:?} {:?}", key, value);
                                     oe.insert(PendingChange::Remove());
                                 }
-                                pc @ _ => {
+                                pc  => {
                                     panic!(
                                         "Removing {:?} from already existing entry {:?}",
                                         key,
@@ -541,7 +541,7 @@ impl ZettaCache {
             // use lock_state_non_async() to ensure that we can't hold it across
             // .await.
             let mut state = self.lock_state_non_async().await;
-            match state.pending_changes.get(&key).map(|pc| *pc) {
+            match state.pending_changes.get(&key).copied() {
                 Some(pc) => {
                     match pc {
                         PendingChange::Insert(value) => Some(state.lookup(key, value)),
@@ -890,7 +890,7 @@ impl ZettaCacheState {
         // run every second and remove completed entries.  Or have the read task
         // lock the outstanding_reads and remove itself (which might perform
         // worse due to contention on the global lock).
-        for (_value, sem) in &mut self.outstanding_reads {
+        for sem in self.outstanding_reads.values_mut() {
             let _permit = sem.acquire().await.unwrap();
         }
         self.outstanding_reads.clear();
@@ -898,7 +898,7 @@ impl ZettaCacheState {
         // Wait for all outstanding writes, for the same reason as reads, and
         // also so that if we crash, the blocks referenced by the
         // index/operation_log will actually have the correct contents.
-        for (_value, sem) in &mut self.outstanding_writes {
+        for sem in self.outstanding_writes.values_mut() {
             let _permit = sem.acquire().await.unwrap();
         }
         self.outstanding_writes.clear();

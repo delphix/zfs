@@ -291,11 +291,11 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
             let shared_state = self.shared_state.clone();
             let n = self.name.clone();
             stream.push(async move {
-                async move {
+                future::ready(
                     ObjectBasedLogChunk::get(&shared_state.object_access, &n, generation, chunk)
                         .await
-                        .unwrap()
-                }
+                        .unwrap(),
+                )
             });
         }
         // Note: buffered() is needed because rust-s3 creates one connection for

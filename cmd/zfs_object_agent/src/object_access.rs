@@ -323,7 +323,7 @@ impl ObjectAccess {
     pub async fn collect_objects(&self, prefix: &str, start_after: Option<String>) -> Vec<String> {
         let mut vec = Vec::new();
         for output in self.list_objects(prefix, start_after).await {
-            for objects in output.contents {
+            if let Some(objects) = output.contents {
                 for object in objects {
                     vec.push(object.key.unwrap());
                 }
@@ -347,7 +347,7 @@ impl ObjectAccess {
     pub async fn collect_all_objects(&self, prefix: &str) -> Vec<String> {
         let mut vec = Vec::new();
         for output in self.list_objects_impl(prefix, None, None).await {
-            for objects in output.contents {
+            if let Some(objects) = output.contents {
                 for object in objects {
                     vec.push(object.key.unwrap());
                 }

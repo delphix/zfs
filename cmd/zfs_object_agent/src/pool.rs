@@ -643,9 +643,9 @@ impl Pool {
                 for key in vec {
                     let shared_state = shared_state.clone();
                     sub_stream.push(async move {
-                        async move {
-                            DataObjectPhys::get_from_key(&shared_state.object_access, &key).await
-                        }
+                        future::ready(
+                            DataObjectPhys::get_from_key(&shared_state.object_access, &key).await,
+                        )
                     });
                 }
                 sub_stream
@@ -687,7 +687,7 @@ impl Pool {
             let ordered_writes: BTreeSet<BlockID> = syncing_state
                 .pending_unordered_writes
                 .keys()
-                .map(|x| *x)
+                .copied()
                 .collect();
 
             let mut recovered_objects_iter = recovered_objects.into_iter().peekable();
@@ -724,10 +724,9 @@ impl Pool {
                         syncing_state.pending_object = PendingObjectState::NotPending(next_block);
 
                         // skip over writes that were moved to pending_object and written out
-                        while let Some(_) =
-                            peekable_next_if(&mut ordered_writes_iter, |b| b < &next_block)
-                        {
-                        }
+                        while peekable_next_if(&mut ordered_writes_iter, |b| b < &next_block)
+                            .is_some()
+                        {}
                     }
                     _ => {
                         // already-written object is next
@@ -1374,74 +1373,71 @@ async fn reclaim_frees_object(
         let next_block = state.object_block_map.object_to_next_block(object);
         let my_shared_state = shared_state.clone();
         stream.push(async move {
-            async move {
-                let mut phys =
-                    DataObjectPhys::get(&my_shared_state.object_access, my_shared_state.guid, object)
-                        .await
-                        .unwrap();
-                for ent in frees {
-                    // If we crashed in the middle of this operation last time, the
-                    // block may already have been removed (and the object
-                    // rewritten), however the stats were not yet updated (since
-                    // that happens as part of txg_end, atomically with the updates
-                    // to the PendingFreesLog).  In this case we ignore the fact
-                    // that it isn't present, but count this block as removed for
-                    // stats purposes.
-                    if let Some(v) = phys.blocks.remove(&ent.block) {
-                        assert_eq!(v.len() as u32, ent.size);
-                        phys.blocks_size -= v.len() as u32;
-                    }
+            let mut phys =
+                DataObjectPhys::get(&my_shared_state.object_access, my_shared_state.guid, object)
+                    .await
+                    .unwrap();
+            for ent in frees {
+                // If we crashed in the middle of this operation last time, the
+                // block may already have been removed (and the object
+                // rewritten), however the stats were not yet updated (since
+                // that happens as part of txg_end, atomically with the updates
+                // to the PendingFreesLog).  In this case we ignore the fact
+                // that it isn't present, but count this block as removed for
+                // stats purposes.
+                if let Some(v) = phys.blocks.remove(&ent.block) {
+                    assert_eq!(v.len() as u32, ent.size);
+                    phys.blocks_size -= v.len() as u32;
                 }
+            }
 
-                // The object could have been rewritten as part of a previous
-                // reclaim that we crashed in the middle of.  In that case, the
-                // object may have additional blocks which we do not expect
-                // (past next_block).  However, the expected size
-                // (new_object_size) must match the size of the blocks within
-                // the expected range (up to next_block).  Additionally, any
-                // blocks outside the expected range are also represented in
-                // their expected objects.  So, we can correctly remove them
-                // from this object, undoing the previous, uncommitted
-                // consolidation.  Therefore, if the expected size is zero, we
-                // can remove this object without reading it because it doesn't
-                // have any required blocks.  Instead we fabricate an empty
-                // DataObjectPhys with the same metadata as what we expect.
+            // The object could have been rewritten as part of a previous
+            // reclaim that we crashed in the middle of.  In that case, the
+            // object may have additional blocks which we do not expect (past
+            // next_block).  However, the expected size (new_object_size) must
+            // match the size of the blocks within the expected range (up to
+            // next_block).  Additionally, any blocks outside the expected range
+            // are also represented in their expected objects.  So, we can
+            // correctly remove them from this object, undoing the previous,
+            // uncommitted consolidation.  Therefore, if the expected size is
+            // zero, we can remove this object without reading it because it
+            // doesn't have any required blocks.  Instead we fabricate an empty
+            // DataObjectPhys with the same metadata as what we expect.
 
-                if phys.min_block != min_block || phys.next_block != next_block {
-                    debug!("reclaim: {:?} expected range BlockID[{},{}), found BlockID[{},{}), trimming uncommitted consolidation",
-                        object, min_block, next_block, phys.min_block, phys.next_block);
+            if phys.min_block != min_block || phys.next_block != next_block {
+                debug!("reclaim: {:?} expected range BlockID[{},{}), found BlockID[{},{}), trimming uncommitted consolidation",
+                    object, min_block, next_block, phys.min_block, phys.next_block);
+                phys
+                    .blocks
+                    .retain(|block, _| block >= &min_block && block < &next_block);
+                assert_eq!(
+                    new_object_size,
                     phys
                         .blocks
-                        .retain(|block, _| block >= &min_block && block < &next_block);
-                    assert_eq!(
-                        new_object_size,
-                        phys
-                            .blocks
-                            .iter()
-                            .map(|(_, data)| data.len() as u32)
-                            .sum::<u32>()
-                    );
-                    assert_ge!(phys.blocks_size, new_object_size);
-                    phys.blocks_size = new_object_size;
+                        .iter()
+                        .map(|(_, data)| data.len() as u32)
+                        .sum::<u32>()
+                );
+                assert_ge!(phys.blocks_size, new_object_size);
+                phys.blocks_size = new_object_size;
 
-                    assert_le!(phys.min_block, min_block);
-                    phys.min_block = min_block;
-                    assert_ge!(phys.next_block, next_block);
-                    phys.next_block = next_block;
-                } else {
-                    assert_eq!(
-                        new_object_size,
-                        phys
-                            .blocks
-                            .iter()
-                            .map(|(_, data)| data.len() as u32)
-                            .sum::<u32>()
-                    );
-                    assert_eq!(phys.blocks_size, new_object_size);
-                }
-
-                phys
+                assert_le!(phys.min_block, min_block);
+                phys.min_block = min_block;
+                assert_ge!(phys.next_block, next_block);
+                phys.next_block = next_block;
+            } else {
+                assert_eq!(
+                    new_object_size,
+                    phys
+                        .blocks
+                        .iter()
+                        .map(|(_, data)| data.len() as u32)
+                        .sum::<u32>()
+                );
+                assert_eq!(phys.blocks_size, new_object_size);
             }
+
+            future::ready(phys)
         });
     }
     let new_phys = stream
@@ -1534,7 +1530,6 @@ fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState
     let (sender, receiver) = oneshot::channel();
     syncing_state.reclaim_done = Some(receiver);
 
-    let state = state.clone();
     tokio::spawn(async move {
         // load pending frees
         let mut frees_per_object = get_frees_per_obj(&state, pending_frees_log_stream).await;

@@ -133,11 +133,7 @@ impl Server {
                         let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
                         let object_access = Self::get_object_access(nvl.as_ref());
                         server
-                            .open_pool(
-                                &object_access,
-                                guid,
-                                cache.as_ref().and_then(|arc| Some(arc.clone())),
-                            )
+                            .open_pool(&object_access, guid, cache.as_ref().cloned())
                             .await;
                     }
                     "begin txg" => {
@@ -274,7 +270,7 @@ impl Server {
                     continue;
                 }
                 let pool_config = Pool::get_config(&object_access, PoolGUID(guid)).await;
-                if let Err(_) = pool_config {
+                if pool_config.is_err() {
                     client = object_access.release_client();
                     continue;
                 }
@@ -492,7 +488,7 @@ pub async fn do_server(socket_dir: &str, cache_path: Option<&str>) {
             match klistener.accept().await {
                 Ok((socket, _)) => {
                     info!("accepted connection on {}", ksocket_name);
-                    self::Server::start(socket, cache.as_ref().and_then(|x| Some(x.clone())));
+                    self::Server::start(socket, cache.as_ref().cloned());
                 }
                 Err(e) => {
                     warn!("accept() on {} failed: {}", ksocket_name, e);

@@ -397,11 +397,7 @@ impl<T: BlockBasedLogEntry> BlockBasedLogWithSummary<T> {
     /// longer than the reference on the Log (however, since the Entry is Copy,
     /// the caller still needs to be careful to not copy it, then drop the Log,
     /// allowing the Log to be modified before using the copy of the Entry).
-    pub async fn lookup_by_key<'a, B, F>(
-        &'a self,
-        key: &B,
-        f: F,
-    ) -> Option<BlockBasedLogValueGuard<'a, T>>
+    pub async fn lookup_by_key<B, F>(&self, key: &B, f: F) -> Option<BlockBasedLogValueGuard<'_, T>>
     where
         B: Ord + Debug,
         F: FnMut(&T) -> B,

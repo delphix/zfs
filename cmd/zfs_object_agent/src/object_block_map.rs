@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::ops::Bound::*;
 use std::sync::RwLock;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ObjectBlockMap {
     map: RwLock<BTreeSet<ObjectBlockMapEntry>>,
 }
@@ -30,9 +30,7 @@ impl Borrow<BlockID> for ObjectBlockMapEntry {
 
 impl ObjectBlockMap {
     pub fn new() -> Self {
-        ObjectBlockMap {
-            map: RwLock::new(BTreeSet::new()),
-        }
+        ObjectBlockMap::default()
     }
 
     pub fn verify(&self) {
