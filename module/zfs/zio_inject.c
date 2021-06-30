@@ -45,6 +45,7 @@
 #include <sys/zio.h>
 #include <sys/zfs_ioctl.h>
 #include <sys/vdev_impl.h>
+#include <sys/vdev_object_store.h>
 #include <sys/dmu_objset.h>
 #include <sys/dsl_dataset.h>
 #include <sys/metaslab_impl.h>

@@ -33,6 +33,7 @@
 #include <sys/metaslab_impl.h>
 #include <sys/vdev_impl.h>
 #include <sys/vdev_draid.h>
+#include <sys/vdev_object_store.h>
 #include <sys/zio.h>
 #include <sys/spa_impl.h>
 #include <sys/zfeature.h>

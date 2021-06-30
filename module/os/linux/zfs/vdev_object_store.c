@@ -1,20 +1,14 @@
 /*
  * CDDL HEADER START
  *
- * The contents of this file are subject to the terms of the
- * Common Development and Distribution License (the "License").
- * You may not use this file except in compliance with the License.
+ * This file and its contents are supplied under the terms of the
+ * Common Development and Distribution License ("CDDL"), version 1.0.
+ * You may only use this file in accordance with the terms of version
+ * 1.0 of the CDDL.
  *
- * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
- * See the License for the specific language governing permissions
- * and limitations under the License.
- *
- * When distributing Covered Code, include this CDDL HEADER in each
- * file and include the License file at usr/src/OPENSOLARIS.LICENSE.
- * If applicable, add the following below this CDDL HEADER, with the
- * fields enclosed by brackets "[]" replaced with your own identifying
- * information: Portions Copyright [yyyy] [name of copyright owner]
+ * A full copy of the text of the CDDL should have accompanied this
+ * source.  A copy of the CDDL is also available via the Internet at
+ * http://www.illumos.org/license/CDDL.
  *
  * CDDL HEADER END
  */
@@ -27,6 +21,7 @@
 #include <sys/spa_impl.h>
 #include <sys/vdev_impl.h>
 #include <sys/vdev_trim.h>
+#include <sys/vdev_object_store.h>
 #include <sys/zio.h>
 #include <sys/fs/zfs.h>
 #include <sys/fm/fs/zfs.h>
@@ -59,8 +54,8 @@
 #define	AGENT_GUID		"GUID"
 #define	AGENT_BUCKET		"bucket"
 #define	AGENT_CREDENTIALS	"credentials"
-#define	AGENT_ENDPOINT	"endpoint"
-#define	AGENT_REGION	"region"
+#define	AGENT_ENDPOINT		"endpoint"
+#define	AGENT_REGION		"region"
 #define	AGENT_BLKID		"block"
 #define	AGENT_DATA		"data"
 #define	AGENT_REQUEST_ID	"request_id"
@@ -120,6 +115,9 @@ typedef struct vdev_object_store {
 	kmutex_t vos_lock;
 	kcondvar_t vos_cv;
 	boolean_t vos_agent_thread_exit;
+
+	kmutex_t vos_stats_lock;
+	vdev_object_store_stats_t vos_stats;
 
 	kmutex_t vos_sock_lock;
 	kcondvar_t vos_sock_cv;
@@ -758,6 +756,17 @@ object_store_flush_writes(spa_t *spa)
 	agent_flush_writes(vos);
 }
 
+void
+object_store_get_stats(vdev_t *vd, vdev_object_store_stats_t *vossp)
+{
+	ASSERT3P(vd->vdev_ops, ==, &vdev_object_store_ops);
+	vdev_object_store_t *vos = vd->vdev_tsd;
+
+	mutex_enter(&vos->vos_stats_lock);
+	*vossp = vos->vos_stats;
+	mutex_exit(&vos->vos_stats_lock);
+}
+
 static int
 agent_read_all(vdev_object_store_t *vos, void *buf, size_t len)
 {
@@ -826,13 +835,12 @@ agent_reader(void *arg)
 
 	nvlist_t *nv;
 	err = nvlist_unpack(buf, nvlist_len, &nv, KM_SLEEP);
+	kmem_free(buf, nvlist_len);
 	if (err != 0) {
 		zfs_dbgmsg("got error %d from nvlist_unpack(len=%d)",
 		    err, (int)nvlist_len);
 		return (EAGAIN);
 	}
-	// nvlist_t *nv = fnvlist_unpack(buf, nvlist_len);
-	kmem_free(buf, nvlist_len);
 
 	const char *type = fnvlist_lookup_string(nv, AGENT_TYPE);
 	zfs_dbgmsg("got response from agent type=%s", type);
@@ -844,6 +852,30 @@ agent_reader(void *arg)
 		cv_broadcast(&vos->vos_outstanding_cv);
 		mutex_exit(&vos->vos_outstanding_lock);
 	} else if (strcmp(type, "end txg done") == 0) {
+		mutex_enter(&vos->vos_stats_lock);
+		vos->vos_stats.voss_blocks_count =
+		    fnvlist_lookup_uint64(nv, "blocks_count");
+		uint64_t old_blocks_bytes = vos->vos_stats.voss_blocks_bytes;
+		vos->vos_stats.voss_blocks_bytes =
+		    fnvlist_lookup_uint64(nv, "blocks_bytes");
+		int64_t alloc_delta =
+		    vos->vos_stats.voss_blocks_bytes - old_blocks_bytes;
+		vos->vos_stats.voss_pending_frees_count =
+		    fnvlist_lookup_uint64(nv, "pending_frees_count");
+		vos->vos_stats.voss_pending_frees_bytes =
+		    fnvlist_lookup_uint64(nv, "pending_frees_bytes");
+		vos->vos_stats.voss_objects_count =
+		    fnvlist_lookup_uint64(nv, "objects_count");
+		/*
+		vos->vos_vdev->vdev_stat.vs_alloc =
+		    vos->vos_stats.voss_blocks_bytes;
+		    */
+		mutex_exit(&vos->vos_stats_lock);
+
+		metaslab_space_update(vos->vos_vdev,
+		    vos->vos_vdev->vdev_spa->spa_normal_class,
+		    alloc_delta, 0, 0);
+
 		mutex_enter(&vos->vos_outstanding_lock);
 		ASSERT(!vos->vos_serial_done[VOS_SERIAL_END_TXG]);
 		vos->vos_serial_done[VOS_SERIAL_END_TXG] = B_TRUE;
@@ -1016,6 +1048,7 @@ vdev_object_store_init(spa_t *spa, nvlist_t *nv, void **tsd)
 	vos->vos_vdev = NULL;
 	vos->vos_send_txg_selector = VOS_TXG_NONE;
 	mutex_init(&vos->vos_lock, NULL, MUTEX_DEFAULT, NULL);
+	mutex_init(&vos->vos_stats_lock, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&vos->vos_sock_lock, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&vos->vos_outstanding_lock, NULL, MUTEX_DEFAULT, NULL);
 	cv_init(&vos->vos_cv, NULL, CV_DEFAULT, NULL);
@@ -1057,6 +1090,7 @@ vdev_object_store_fini(vdev_t *vd)
 	vdev_object_store_t *vos = vd->vdev_tsd;
 
 	mutex_destroy(&vos->vos_lock);
+	mutex_destroy(&vos->vos_stats_lock);
 	mutex_destroy(&vos->vos_sock_lock);
 	mutex_destroy(&vos->vos_outstanding_lock);
 	cv_destroy(&vos->vos_cv);

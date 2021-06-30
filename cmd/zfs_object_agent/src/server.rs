@@ -156,11 +156,6 @@ impl Server {
                         trace!("got request: {:?}", nvl);
                         server.flush_writes();
                     }
-                    "get props" => {
-                        debug!("got request: {:?}", nvl);
-                        let props = nvl.lookup_nvlist("props").unwrap();
-                        server.get_props(props);
-                    }
                     "end txg" => {
                         debug!("got request: {:?}", nvl);
                         let uberblock = nvl.lookup("uberblock").unwrap().data();
@@ -355,26 +350,6 @@ impl Server {
         pool.initiate_flush(max_blockid);
     }
 
-    // sends response
-    fn get_props(&self, props: NvList) {
-        let pool = self.pool.as_ref().unwrap().clone();
-        let mut props_vec = Vec::new();
-        for p in props.iter() {
-            props_vec.push(p.name().to_str().unwrap().to_owned());
-        }
-        let output = self.output.clone();
-
-        tokio::spawn(async move {
-            let mut response = NvList::new_unique_names();
-            for n in props_vec {
-                let value = pool.get_prop(n.as_ref());
-                response.insert(n, &value).unwrap();
-            }
-            debug!("sending response: {:?}", response);
-            Self::send_response(&output, response).await;
-        });
-    }
-
     // sends response when completed
     fn end_txg(&mut self, uberblock: Vec<u8>, config: Vec<u8>) {
         let pool = self.pool.as_ref().unwrap().clone();
@@ -383,9 +358,16 @@ impl Server {
         // XXX change to an error return
         assert_eq!(*self.num_outstanding_writes.lock().unwrap(), 0);
         tokio::spawn(async move {
-            pool.end_txg(uberblock, config).await;
+            let stats = pool.end_txg(uberblock, config).await;
             let mut nvl = NvList::new_unique_names();
             nvl.insert("Type", "end txg done").unwrap();
+            nvl.insert("blocks_count", &stats.blocks_count).unwrap();
+            nvl.insert("blocks_bytes", &stats.blocks_bytes).unwrap();
+            nvl.insert("pending_frees_count", &stats.pending_frees_count)
+                .unwrap();
+            nvl.insert("pending_frees_bytes", &stats.pending_frees_bytes)
+                .unwrap();
+            nvl.insert("objects_count", &stats.objects_count).unwrap();
             debug!("sending response: {:?}", nvl);
             Self::send_response(&output, nvl).await;
         });

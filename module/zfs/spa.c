@@ -62,6 +62,7 @@
 #include <sys/vdev_trim.h>
 #include <sys/vdev_disk.h>
 #include <sys/vdev_draid.h>
+#include <sys/vdev_object_store.h>
 #include <sys/metaslab.h>
 #include <sys/metaslab_impl.h>
 #include <sys/mmp.h>
@@ -352,14 +353,18 @@ spa_prop_get_config(spa_t *spa, nvlist_t **nvp)
 		 * The $FREE directory was introduced in SPA_VERSION_DEADLISTS,
 		 * when opening pools before this version freedir will be NULL.
 		 */
+		uint64_t freeing = 0;
 		if (pool->dp_free_dir != NULL) {
-			spa_prop_add_list(*nvp, ZPOOL_PROP_FREEING, NULL,
-			    dsl_dir_phys(pool->dp_free_dir)->dd_used_bytes,
-			    src);
-		} else {
-			spa_prop_add_list(*nvp, ZPOOL_PROP_FREEING,
-			    NULL, 0, src);
+			freeing +=
+			    dsl_dir_phys(pool->dp_free_dir)->dd_used_bytes;
 		}
+		if (vdev_is_object_based(rvd->vdev_child[0])) {
+			vdev_object_store_stats_t voss;
+			object_store_get_stats(rvd->vdev_child[0], &voss);
+			freeing += voss.voss_pending_frees_bytes;
+		}
+		spa_prop_add_list(*nvp, ZPOOL_PROP_FREEING, NULL,
+		    freeing, src);
 
 		if (pool->dp_leak_dir != NULL) {
 			spa_prop_add_list(*nvp, ZPOOL_PROP_LEAKED, NULL,

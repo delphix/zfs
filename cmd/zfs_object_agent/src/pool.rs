@@ -70,12 +70,12 @@ impl<T> fmt::Debug for TerseVec<T> {
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Copy)]
-struct PoolStatsPhys {
-    blocks_count: u64, // Note: does not include the pending_object
-    blocks_bytes: u64, // Note: does not include the pending_object
-    pending_frees_count: u64,
-    pending_frees_bytes: u64,
-    objects_count: u64, // XXX shouldn't really be needed since we always have the storage_object_log loaded into the `objects` field
+pub struct PoolStatsPhys {
+    pub blocks_count: u64, // Note: does not include the pending_object
+    pub blocks_bytes: u64, // Note: does not include the pending_object
+    pub pending_frees_count: u64,
+    pub pending_frees_bytes: u64,
+    pub objects_count: u64, // XXX shouldn't really be needed on disk since we always have the storage_object_log loaded into the `objects` field
 }
 impl OnDisk for PoolStatsPhys {}
 
@@ -571,12 +571,12 @@ impl Pool {
                             &format!("zfs/{}/PendingFreesLog", guid),
                         ),
                         pending_object: PendingObjectState::NotPending(BlockID(0)),
-                        pending_unordered_writes: HashMap::new(),
-                        stats: PoolStatsPhys::default(),
+                        pending_unordered_writes: Default::default(),
+                        stats: Default::default(),
                         reclaim_done: None,
-                        rewriting_objects: HashMap::new(),
-                        objects_to_delete: Vec::new(),
-                        pending_flushes: BTreeSet::new(),
+                        rewriting_objects: Default::default(),
+                        objects_to_delete: Default::default(),
+                        pending_flushes: Default::default(),
                     })),
                     zettacache: cache,
                     object_block_map: ObjectBlockMap::new(),
@@ -590,18 +590,6 @@ impl Pool {
         } else {
             Pool::open_from_txg(object_access, &phys, phys.last_txg, cache).await
         }
-    }
-
-    pub fn get_prop(&self, name: &str) -> u64 {
-        self.state.with_syncing_state(|syncing_state| {
-            let stats = syncing_state.stats;
-            match name {
-                "zoa_allocated" => stats.pending_frees_bytes,
-                "zoa_freeing" => stats.pending_frees_bytes,
-                "zoa_objects" => stats.objects_count,
-                _ => panic!("invalid prop name: {}", name),
-            }
-        })
     }
 
     pub fn resume_txg(&self, txg: TXG) {
@@ -803,7 +791,7 @@ impl Pool {
         })
     }
 
-    pub async fn end_txg(&self, uberblock: Vec<u8>, config: Vec<u8>) {
+    pub async fn end_txg(&self, uberblock: Vec<u8>, config: Vec<u8>) -> PoolStatsPhys {
         let state = &self.state;
 
         let mut syncing_state = {
@@ -910,9 +898,13 @@ impl Pool {
         syncing_state.last_txg = txg;
         syncing_state.syncing_txg = None;
 
+        let stats = syncing_state.stats;
+
         // put syncing_state back in the Option
         assert!(state.syncing_state.lock().unwrap().is_none());
         *state.syncing_state.lock().unwrap() = Some(syncing_state);
+
+        stats
     }
 
     fn check_pending_flushes(state: &PoolState, syncing_state: &mut PoolSyncingState) {

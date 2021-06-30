@@ -143,6 +143,7 @@
 #include <sys/vdev.h>
 #include <sys/vdev_impl.h>
 #include <sys/vdev_draid.h>
+#include <sys/vdev_object_store.h>
 #include <sys/uberblock_impl.h>
 #include <sys/metaslab.h>
 #include <sys/metaslab_impl.h>
