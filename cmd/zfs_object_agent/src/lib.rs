@@ -2,6 +2,7 @@ pub mod base_types;
 pub mod block_access;
 pub mod block_allocator;
 pub mod block_based_log;
+pub mod connection;
 pub mod extent_allocator;
 pub mod index;
 pub mod object_access;
