@@ -646,7 +646,7 @@ agent_resume(void *arg)
 	if (spa->spa_load_state == SPA_LOAD_CREATE) {
 		agent_create_pool(vd, vos);
 	}
-	ASSERT0(agent_open_pool(vd, vos,
+	VERIFY0(agent_open_pool(vd, vos,
 		vdev_object_store_open_mode(spa_mode(vd->vdev_spa))));
 
 	mutex_enter(&vos->vos_sock_lock);
@@ -923,7 +923,8 @@ agent_reader(void *arg)
 		zfs_dbgmsg("got pool open failed cause=\"%s\"", cause);
 		ASSERT0(strcmp(cause, "MMP"));
 		fnvlist_add_string(spa->spa_load_info,
-		    ZPOOL_CONFIG_MMP_HOSTNAME, fnvlist_lookup_string(nv, AGENT_HOSTNAME));
+		    ZPOOL_CONFIG_MMP_HOSTNAME, fnvlist_lookup_string(nv,
+		    AGENT_HOSTNAME));
 		fnvlist_add_uint64(spa->spa_load_info,
                     ZPOOL_CONFIG_MMP_STATE, MMP_STATE_ACTIVE);
                 fnvlist_add_uint64(spa->spa_load_info,

@@ -41,6 +41,9 @@ const LONG_OPERATION_DURATION: Duration = Duration::from_secs(2);
 pub struct ObjectAccess {
     client: rusoto_s3::S3Client,
     bucket_str: String,
+    readonly: bool,
+    region_str: String,
+    endpoint_str: String,
 }
 
 /// For testing, prefix all object keys with this string.
@@ -168,19 +171,36 @@ impl ObjectAccess {
         rusoto_s3::S3Client::new_with(http_client, creds, region)
     }
 
-    pub fn from_client(client: rusoto_s3::S3Client, bucket: &str) -> Self {
+    pub fn from_client(
+        client: rusoto_s3::S3Client,
+        bucket: &str,
+        readonly: bool,
+        endpoint: &str,
+        region: &str,
+    ) -> Self {
         ObjectAccess {
             client,
             bucket_str: bucket.to_string(),
+            readonly,
+            region_str: region.to_string(),
+            endpoint_str: endpoint.to_string(),
         }
     }
 
-    pub fn new(endpoint: &str, region_str: &str, bucket: &str) -> Self {
+    pub fn new(
+        endpoint: &str,
+        region_str: &str,
+        bucket: &str,
+        readonly: bool,
+    ) -> Self {
         let client = ObjectAccess::get_client(endpoint, region_str);
 
         ObjectAccess {
             client,
             bucket_str: bucket.to_string(),
+            readonly,
+            region_str: region_str.to_string(),
+            endpoint_str: endpoint.to_string(),
         }
     }
 
@@ -409,6 +429,7 @@ impl ObjectAccess {
     ) -> Result<PutObjectOutput, OAError<RusotoError<PutObjectError>>> {
         let len = data.len();
         let bytes = Bytes::from(data);
+        assert!(!self.readonly);
         retry(
             &format!("put {} ({} bytes)", prefixed(key), len),
             timeout,
@@ -429,7 +450,6 @@ impl ObjectAccess {
     }
 
     fn invalidate_cache(key: &str, data: &Vec<u8>) {
-        // invalidate cache.  don't hold lock across .await below
         let mut c = CACHE.lock().unwrap();
         let mykey = key.to_string();
         if c.cache.contains(&mykey) {
@@ -472,6 +492,7 @@ impl ObjectAccess {
             keys.len(),
             prefixed(&keys[0])
         );
+        assert!(!self.readonly);
         let output = retry(&msg, None, || async {
             let v: Vec<_> = keys
                 .iter()
@@ -510,5 +531,25 @@ impl ObjectAccess {
     // XXX should we split them up here?
     pub async fn delete_objects(&self, keys: &[String]) {
         while self.delete_objects_impl(keys).await {}
+    }
+
+    pub fn get_bucket(&self) -> String {
+        self.bucket_str.clone()
+    }
+
+    pub fn get_region(&self) -> String {
+        self.region_str.clone()
+    }
+
+    pub fn get_endpoint(&self) -> String {
+        self.endpoint_str.clone()
+    }
+}
+
+impl std::hash::Hash for ObjectAccess {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.bucket_str.hash(state);
+        self.region_str.hash(state);
+        self.endpoint_str.hash(state);
     }
 }
