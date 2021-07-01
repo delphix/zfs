@@ -630,11 +630,9 @@ impl Pool {
                 let sub_stream = FuturesUnordered::new();
                 for key in vec {
                     let shared_state = shared_state.clone();
-                    sub_stream.push(async move {
-                        async move {
-                            DataObjectPhys::get_from_key(&shared_state.object_access, &key).await
-                        }
-                    });
+                    sub_stream.push(future::ready(async move {
+                        DataObjectPhys::get_from_key(&shared_state.object_access, &key).await
+                    }));
                 }
                 sub_stream
             })
@@ -1364,7 +1362,7 @@ async fn reclaim_frees_object(
         let min_block = state.object_block_map.object_to_min_block(object);
         let next_block = state.object_block_map.object_to_next_block(object);
         let my_shared_state = shared_state.clone();
-        stream.push(async move {
+        stream.push(future::ready(async move {
             let mut phys =
                 DataObjectPhys::get(&my_shared_state.object_access, my_shared_state.guid, object)
                     .await
@@ -1429,8 +1427,8 @@ async fn reclaim_frees_object(
                 assert_eq!(phys.blocks_size, new_object_size);
             }
 
-            future::ready(phys)
-        });
+            phys
+        }));
     }
     let new_phys = stream
         .buffered(10)

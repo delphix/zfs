@@ -2,6 +2,7 @@ use crate::pool::PoolSharedState;
 use crate::{base_types::*, object_access::ObjectAccess};
 use anyhow::{Context, Result};
 use async_stream::stream;
+use futures::future;
 use futures::future::join_all;
 use futures::stream::{FuturesOrdered, StreamExt};
 use futures_core::Stream;
@@ -258,13 +259,11 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         for chunk in first_chunk..self.num_flushed_chunks {
             let shared_state = self.shared_state.clone();
             let n = self.name.clone();
-            stream.push(async move {
-                async move {
-                    ObjectBasedLogChunk::get(&shared_state.object_access, &n, generation, chunk)
-                        .await
-                        .unwrap()
-                }
-            });
+            stream.push(future::ready(async move {
+                ObjectBasedLogChunk::get(&shared_state.object_access, &n, generation, chunk)
+                    .await
+                    .unwrap()
+            }));
         }
         // Note: buffered() is needed because rust-s3 creates one connection for
         // each request, rather than using a connection pool. If we created 1000
