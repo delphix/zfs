@@ -2,6 +2,7 @@ use crate::base_types::*;
 use crate::object_access::ObjectAccess;
 use crate::object_based_log::*;
 use crate::object_block_map::ObjectBlockMap;
+use crate::object_block_map::StorageObjectLogEntry;
 use crate::zettacache::ZettaCache;
 use anyhow::{Context, Result};
 use core::future::Future;
@@ -96,19 +97,6 @@ struct DataObjectPhys {
     blocks: HashMap<BlockID, ByteBuf>,
 }
 impl OnDisk for DataObjectPhys {}
-
-#[derive(Debug, Serialize, Deserialize, Copy, Clone)]
-enum StorageObjectLogEntry {
-    Alloc {
-        object: ObjectID,
-        min_block: BlockID,
-    },
-    Free {
-        object: ObjectID,
-    },
-}
-impl OnDisk for StorageObjectLogEntry {}
-impl ObjectBasedLogEntry for StorageObjectLogEntry {}
 
 #[derive(Debug, Serialize, Deserialize, Copy, Clone)]
 enum ObjectSizeLogEntry {
@@ -292,6 +280,7 @@ struct PoolSyncingState {
     // Note: some objects may contain additional (adjacent) blocks, if they have
     // been consolidated but this fact is not yet represented in the log.  A
     // consolidated object won't be removed until after the log reflects that.
+    // XXX put this in its own type (in object_block_map.rs?)
     storage_object_log: ObjectBasedLog<StorageObjectLogEntry>,
 
     // Note: the object_size_log may not have the most up-to-date size info for
@@ -447,17 +436,22 @@ impl Pool {
             guid: pool_phys.guid,
             name: pool_phys.name.clone(),
         });
+
+        // load block -> object mapping
+        let storage_object_log = ObjectBasedLog::open_by_phys(
+            shared_state.clone(),
+            &format!("zfs/{}/StorageObjectLog", pool_phys.guid),
+            &phys.storage_object_log,
+        );
+        let object_block_map = ObjectBlockMap::load(&storage_object_log, phys.next_block).await;
+
         let pool = Pool {
             state: Arc::new(PoolState {
                 shared_state: shared_state.clone(),
                 syncing_state: std::sync::Mutex::new(Some(PoolSyncingState {
                     last_txg: phys.txg,
                     syncing_txg: None,
-                    storage_object_log: ObjectBasedLog::open_by_phys(
-                        shared_state.clone(),
-                        &format!("zfs/{}/StorageObjectLog", pool_phys.guid),
-                        &phys.storage_object_log,
-                    ),
+                    storage_object_log,
                     object_size_log: ObjectBasedLog::open_by_phys(
                         shared_state.clone(),
                         &format!("zfs/{}/ObjectSizeLog", pool_phys.guid),
@@ -477,7 +471,7 @@ impl Pool {
                     pending_flushes: BTreeSet::new(),
                 })),
                 zettacache: cache,
-                object_block_map: ObjectBlockMap::new(),
+                object_block_map,
             }),
         };
 
@@ -489,43 +483,6 @@ impl Pool {
         syncing_state.storage_object_log.recover().await;
         syncing_state.object_size_log.recover().await;
         syncing_state.pending_frees_log.recover().await;
-
-        // load block -> object mapping
-        let begin = Instant::now();
-        let mut num_alloc_entries: u64 = 0;
-        let mut num_free_entries: u64 = 0;
-        syncing_state
-            .storage_object_log
-            .iterate()
-            .for_each(|ent| {
-                match ent {
-                    StorageObjectLogEntry::Alloc {
-                        object,
-                        min_block: first_possible_block,
-                    } => {
-                        pool.state
-                            .object_block_map
-                            .insert(object, first_possible_block);
-                        num_alloc_entries += 1;
-                    }
-                    StorageObjectLogEntry::Free { object } => {
-                        pool.state.object_block_map.remove(object);
-                        num_free_entries += 1;
-                    }
-                }
-
-                future::ready(())
-            })
-            .await;
-        info!(
-            "loaded mapping from {} objects with {} allocs and {} frees in {}ms",
-            syncing_state.storage_object_log.num_chunks,
-            num_alloc_entries,
-            num_free_entries,
-            begin.elapsed().as_millis()
-        );
-
-        pool.state.object_block_map.verify();
 
         assert_eq!(
             pool.state.object_block_map.len() as u64,
@@ -552,16 +509,20 @@ impl Pool {
                 guid,
                 name: phys.name,
             });
+
+            let storage_object_log = ObjectBasedLog::create(
+                shared_state.clone(),
+                &format!("zfs/{}/StorageObjectLog", guid),
+            );
+            let object_block_map = ObjectBlockMap::load(&storage_object_log, BlockID(0)).await;
+
             let pool = Pool {
                 state: Arc::new(PoolState {
                     shared_state: shared_state.clone(),
                     syncing_state: std::sync::Mutex::new(Some(PoolSyncingState {
                         last_txg: TXG(0),
                         syncing_txg: None,
-                        storage_object_log: ObjectBasedLog::create(
-                            shared_state.clone(),
-                            &format!("zfs/{}/StorageObjectLog", guid),
-                        ),
+                        storage_object_log,
                         object_size_log: ObjectBasedLog::create(
                             shared_state.clone(),
                             &format!("zfs/{}/ObjectSizeLog", guid),
@@ -579,7 +540,7 @@ impl Pool {
                         pending_flushes: BTreeSet::new(),
                     })),
                     zettacache: cache,
-                    object_block_map: ObjectBlockMap::new(),
+                    object_block_map,
                 }),
             };
 
@@ -962,11 +923,13 @@ impl Pool {
         assert_eq!(phys.guid, state.shared_state.guid);
         assert_eq!(phys.min_txg, txg);
         assert_eq!(phys.max_txg, txg);
-        assert_ge!(object, state.object_block_map.last_object().next());
+        assert_gt!(object, state.object_block_map.last_object());
         syncing_state.stats.objects_count += 1;
         syncing_state.stats.blocks_bytes += phys.blocks_size as u64;
         syncing_state.stats.blocks_count += phys.blocks.len() as u64;
-        state.object_block_map.insert(object, phys.min_block);
+        state
+            .object_block_map
+            .insert(object, phys.min_block, phys.next_block);
         syncing_state.storage_object_log.append(
             txg,
             StorageObjectLogEntry::Alloc {
