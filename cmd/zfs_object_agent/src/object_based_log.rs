@@ -2,7 +2,6 @@ use crate::pool::PoolSharedState;
 use crate::{base_types::*, object_access::ObjectAccess};
 use anyhow::{Context, Result};
 use async_stream::stream;
-use futures::future;
 use futures::future::join_all;
 use futures::stream::{FuturesOrdered, StreamExt};
 use futures_core::Stream;
@@ -235,37 +234,6 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         self.num_entries = 0;
     }
 
-    pub async fn read(&self) -> Vec<T> {
-        let mut stream = FuturesOrdered::new();
-        for chunk in 0..self.num_chunks {
-            let fut = ObjectBasedLogChunk::get(
-                &self.shared_state.object_access,
-                &self.name,
-                self.generation,
-                chunk,
-            );
-            stream.push(fut);
-        }
-        let mut entries = Vec::new();
-        // XXX may need to use stream.buffered() so we don't have too many outstanding fd's / connections
-        // XXX or retire this in favor of the iterate() interface
-        stream
-            .for_each(|res| {
-                let mut chunk = res.unwrap();
-                debug!(
-                    "appending {} entries of chunk {}",
-                    chunk.entries.len(),
-                    chunk.chunk
-                );
-                entries.append(&mut chunk.entries);
-                future::ready(())
-            })
-            .await;
-
-        debug!("got {} entries total", entries.len());
-        entries
-    }
-
     /// Iterates the on-disk state; panics if there are pending changes.
     pub fn iterate(&self) -> impl Stream<Item = T> {
         assert_eq!(self.num_flushed_chunks, self.num_chunks);
@@ -291,11 +259,11 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
             let shared_state = self.shared_state.clone();
             let n = self.name.clone();
             stream.push(async move {
-                future::ready(
+                async move {
                     ObjectBasedLogChunk::get(&shared_state.object_access, &n, generation, chunk)
                         .await
-                        .unwrap(),
-                )
+                        .unwrap()
+                }
             });
         }
         // Note: buffered() is needed because rust-s3 creates one connection for

@@ -631,9 +631,9 @@ impl Pool {
                 for key in vec {
                     let shared_state = shared_state.clone();
                     sub_stream.push(async move {
-                        future::ready(
-                            DataObjectPhys::get_from_key(&shared_state.object_access, &key).await,
-                        )
+                        async move {
+                            DataObjectPhys::get_from_key(&shared_state.object_access, &key).await
+                        }
                     });
                 }
                 sub_stream
