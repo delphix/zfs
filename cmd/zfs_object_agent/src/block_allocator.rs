@@ -61,10 +61,8 @@ impl BlockAllocator {
         }
         self.allocating.clear();
 
-        self.space_map.flush().await;
-
         BlockAllocatorPhys {
-            allocatable: self.space_map.get_phys(),
+            allocatable: self.space_map.flush().await,
         }
     }
 

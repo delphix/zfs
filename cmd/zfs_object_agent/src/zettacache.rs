@@ -5,6 +5,7 @@ use crate::block_allocator::BlockAllocatorPhys;
 use crate::block_based_log::*;
 use crate::extent_allocator::ExtentAllocator;
 use crate::extent_allocator::ExtentAllocatorPhys;
+use crate::index::*;
 use anyhow::Result;
 use futures::future;
 use futures::stream::*;
@@ -92,24 +93,6 @@ impl ZettaCheckpointPhys {
     */
 }
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
-
-struct IndexKey {
-    guid: PoolGUID,
-    block: BlockID,
-}
-
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
-struct IndexValue {
-    location: DiskLocation,
-    // XXX remove this and figure out based on which slab it's in?  However,
-    // currently we need to return the right buffer size to the kernel, and it
-    // isn't passing us the expected read size.  So we need to change some
-    // interfaces to make that work right.
-    size: usize,
-    atime: Atime,
-}
-
 #[derive(Debug, Clone, Copy)]
 enum PendingChange {
     Insert(IndexValue),
@@ -155,14 +138,6 @@ async fn lock_non_send<T>(lock: &tokio::sync::Mutex<T>) -> NonSendMutexGuard<'_,
 }
 
 #[derive(Debug, Serialize, Deserialize, Copy, Clone)]
-struct IndexEntry {
-    key: IndexKey,
-    value: IndexValue,
-}
-impl OnDisk for IndexEntry {}
-impl BlockBasedLogEntry for IndexEntry {}
-
-#[derive(Debug, Serialize, Deserialize, Copy, Clone)]
 struct ChunkSummaryEntry {
     offset: LogOffset,
     first_key: IndexKey,
@@ -179,12 +154,12 @@ impl OnDisk for OperationLogEntry {}
 impl BlockBasedLogEntry for OperationLogEntry {}
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
-struct AtimeHistogramPhys {
+pub struct AtimeHistogramPhys {
     histogram: Vec<u64>,
 }
 
 impl AtimeHistogramPhys {
-    fn insert(&mut self, atime: Atime) {
+    pub fn insert(&mut self, atime: Atime) {
         let atime_usize = atime.0 as usize;
         if atime_usize >= self.histogram.len() {
             self.histogram.resize(atime_usize + 1, 0);
@@ -192,54 +167,13 @@ impl AtimeHistogramPhys {
         self.histogram[atime_usize] += 1;
     }
 
-    fn remove(&mut self, atime: Atime) {
+    pub fn remove(&mut self, atime: Atime) {
         let atime_usize = atime.0 as usize;
         self.histogram[atime_usize] -= 1;
     }
 
-    fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.histogram.clear();
-    }
-}
-
-struct ZettaCacheIndex {
-    atime_histogram: AtimeHistogramPhys,
-    log: BlockBasedLogWithSummary<IndexEntry>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Default)]
-struct ZettaCacheIndexPhys {
-    atime_histogram: AtimeHistogramPhys,
-    log: BlockBasedLogWithSummaryPhys,
-}
-
-impl ZettaCacheIndex {
-    async fn open(
-        block_access: Arc<BlockAccess>,
-        extent_allocator: Arc<ExtentAllocator>,
-        phys: ZettaCacheIndexPhys,
-    ) -> Self {
-        Self {
-            atime_histogram: phys.atime_histogram,
-            log: BlockBasedLogWithSummary::open(block_access, extent_allocator, phys.log).await,
-        }
-    }
-
-    fn get_phys(&self) -> ZettaCacheIndexPhys {
-        ZettaCacheIndexPhys {
-            atime_histogram: self.atime_histogram.clone(),
-            log: self.log.get_phys(),
-        }
-    }
-
-    fn append(&mut self, entry: IndexEntry) {
-        self.atime_histogram.insert(entry.value.atime);
-        self.log.append(entry);
-    }
-
-    fn clear(&mut self) {
-        self.atime_histogram.clear();
-        self.log.clear();
     }
 }
 
@@ -905,14 +839,14 @@ impl ZettaCacheState {
         self.outstanding_writes.clear();
 
         if self.pending_changes.len() > MAX_PENDING_CHANGES {
-            index.log.flush().await;
+            index.flush().await;
             let new_index = self.merge_pending_changes(index).await;
             index.clear();
             *index = new_index;
         }
 
-        future::join3(
-            index.log.flush(),
+        let (index_phys, chunk_summary_phys, operation_log_phys) = future::join3(
+            index.flush(),
             self.chunk_summary.flush(),
             self.operation_log.flush(),
         )
@@ -921,9 +855,9 @@ impl ZettaCacheState {
         let checkpoint = ZettaCheckpointPhys {
             generation: self.super_phys.last_checkpoint_id.next(),
             extent_allocator: self.extent_allocator.get_phys(),
-            index: index.get_phys(),
-            chunk_summary: self.chunk_summary.get_phys(),
-            operation_log: self.operation_log.get_phys(),
+            index: index_phys,
+            chunk_summary: chunk_summary_phys,
+            operation_log: operation_log_phys,
             last_atime: self.atime,
             block_allocator: self.block_allocator.flush().await,
         };
@@ -1104,7 +1038,7 @@ impl ZettaCacheState {
         );
 
         // Note: the caller is about to flush as well, but we want to count the time in the below info!
-        new_index.log.flush().await;
+        new_index.flush().await;
 
         debug!("new histogram: {:#?}", new_index.atime_histogram);
         assert_eq!(

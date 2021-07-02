@@ -86,13 +86,9 @@ impl SpaceMap {
             .append(SpaceMapEntry::Free(SpaceMapExtent { offset, size }));
     }
 
-    pub async fn flush(&mut self) {
-        self.log.flush().await;
-    }
-
-    pub fn get_phys(&self) -> SpaceMapPhys {
+    pub async fn flush(&mut self) -> SpaceMapPhys {
         SpaceMapPhys {
-            log: self.log.get_phys(),
+            log: self.log.flush().await,
             coverage: self.coverage,
         }
     }

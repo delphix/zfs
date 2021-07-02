@@ -94,8 +94,8 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
         }
     }
 
-    pub fn get_phys(&self) -> BlockBasedLogPhys {
-        assert!(self.pending_entries.is_empty());
+    pub async fn flush(&mut self) -> BlockBasedLogPhys {
+        self.flush_impl(|_, _, _| {}).await;
         self.phys.clone()
     }
 
@@ -111,10 +111,6 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
     pub fn append(&mut self, entry: T) {
         self.pending_entries.push(entry);
         // XXX if too many pending, initiate flush?
-    }
-
-    pub async fn flush(&mut self) {
-        self.flush_impl(|_, _, _| {}).await
     }
 
     async fn flush_impl<F>(&mut self, mut new_chunk_fn: F)
@@ -284,27 +280,7 @@ impl<T: BlockBasedLogEntry> BlockBasedLogWithSummary<T> {
         }
     }
 
-    pub fn get_phys(&self) -> BlockBasedLogWithSummaryPhys {
-        BlockBasedLogWithSummaryPhys {
-            this: self.this.get_phys(),
-            chunk_summary: self.chunk_summary.get_phys(),
-        }
-    }
-
-    pub fn len(&self) -> u64 {
-        self.this.len()
-    }
-
-    /// Size of the on-disk representation
-    pub fn num_bytes(&self) -> u64 {
-        self.this.num_bytes() + self.chunk_summary.num_bytes()
-    }
-
-    pub fn append(&mut self, entry: T) {
-        self.this.append(entry)
-    }
-
-    pub async fn flush(&mut self) {
+    pub async fn flush(&mut self) -> BlockBasedLogWithSummaryPhys {
         let chunks = &mut self.chunks;
         let chunk_summary = &mut self.chunk_summary;
         self.this
@@ -323,7 +299,23 @@ impl<T: BlockBasedLogEntry> BlockBasedLogWithSummary<T> {
         // for the i/o to complete.  Then we could be writing to disk both
         // "this" and the summary at the same time.
 
-        self.chunk_summary.flush().await;
+        BlockBasedLogWithSummaryPhys {
+            this: self.this.flush().await,
+            chunk_summary: self.chunk_summary.flush().await,
+        }
+    }
+
+    pub fn len(&self) -> u64 {
+        self.this.len()
+    }
+
+    /// Size of the on-disk representation
+    pub fn num_bytes(&self) -> u64 {
+        self.this.num_bytes() + self.chunk_summary.num_bytes()
+    }
+
+    pub fn append(&mut self, entry: T) {
+        self.this.append(entry)
     }
 
     pub fn clear(&mut self) {
