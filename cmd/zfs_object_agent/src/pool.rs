@@ -32,6 +32,7 @@ const FREE_LOWWATER_PCT: f64 = 9.0;
 // don't bother freeing unless there are at least this number of free blocks
 const FREE_MIN_BLOCKS: u64 = 1000;
 const MAX_BYTES_PER_OBJECT: u32 = 1024 * 1024;
+const ONE_MIB: u64 = 1_048_576;
 
 // minimum number of chunks before we consider condensing
 const LOG_CONDENSE_MIN_CHUNKS: usize = 30;
@@ -1455,19 +1456,19 @@ fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState
         return;
     }
 
-    // XXX change this to be based on bytes, once those stats are working?
     // XXX make this tunable?
-    if syncing_state.stats.pending_frees_count
-        < (syncing_state.stats.blocks_count as f64 * FREE_HIGHWATER_PCT / 100f64) as u64
+    if syncing_state.stats.pending_frees_bytes
+        < (syncing_state.stats.blocks_bytes as f64 * FREE_HIGHWATER_PCT / 100f64) as u64
         || syncing_state.stats.pending_frees_count < FREE_MIN_BLOCKS
     {
         return;
     }
     info!(
-        "reclaim: {:?} starting; pending_frees_count={} blocks_count={}",
+        "reclaim: {:?} starting; pending_frees_bytes={}Mib, blocks_bytes={}Mib, {} free blocks pending",
         syncing_state.syncing_txg.unwrap(),
-        syncing_state.stats.pending_frees_count,
-        syncing_state.stats.blocks_count,
+        syncing_state.stats.pending_frees_bytes / ONE_MIB,
+        syncing_state.stats.blocks_bytes / ONE_MIB,
+        syncing_state.stats.pending_frees_count
     );
 
     // Note: the object size stream may or may not include entries added this
@@ -1477,8 +1478,8 @@ fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState
 
     let (object_size_log_stream, sizes_remainder) = syncing_state.object_size_log.iter_most();
 
-    let required_frees = syncing_state.stats.pending_frees_count
-        - (syncing_state.stats.blocks_count as f64 * FREE_LOWWATER_PCT / 100f64) as u64;
+    let required_free_bytes = syncing_state.stats.pending_frees_bytes
+        - (syncing_state.stats.blocks_bytes as f64 * FREE_LOWWATER_PCT / 100f64) as u64;
 
     let (sender, receiver) = oneshot::channel();
     syncing_state.reclaim_done = Some(receiver);
@@ -1575,7 +1576,7 @@ fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState
                 let _permit = sem2.acquire().await.unwrap();
                 reclaim_frees_object(state2, objects_to_consolidate).await
             }));
-            if freed_blocks_count > required_frees {
+            if freed_blocks_bytes > required_free_bytes {
                 break;
             }
         }
@@ -1589,9 +1590,9 @@ fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState
             "reclaim: rewrote {} objects in {:.1}sec, freeing {} MiB from {} blocks ({:.1}MiB/s)",
             num_handles,
             begin.elapsed().as_secs_f64(),
-            freed_blocks_bytes / 1024 / 1024,
+            freed_blocks_bytes / ONE_MIB,
             freed_blocks_count,
-            ((freed_blocks_bytes as f64 / 1024f64 / 1024f64) / begin.elapsed().as_secs_f64()),
+            ((freed_blocks_bytes as f64 / ONE_MIB as f64) / begin.elapsed().as_secs_f64()),
         );
 
         let r = sender.send(Box::new(move |syncing_state| {
