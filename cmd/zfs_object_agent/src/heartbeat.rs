@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr},
     sync::{Arc, Weak},
     time::{Duration, SystemTime},
 };
@@ -9,7 +8,7 @@ use anyhow::Context;
 use lazy_static::lazy_static;
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
-use tokio::time::sleep;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::object_access::{OAError, ObjectAccess};
@@ -21,7 +20,6 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 pub struct HeartbeatPhys {
     pub timestamp: SystemTime,
     pub hostname: String,
-    pub addr: IpAddr,
     pub lease_duration: Duration,
     pub id: Uuid,
 }
@@ -68,22 +66,15 @@ struct HeartbeatImpl {
     bucket: String,
 }
 pub struct HeartbeatGuard {
-    key: HeartbeatImpl,
-}
-
-impl Drop for HeartbeatGuard {
-    fn drop(&mut self) {
-        let mut heartbeats = HEARTBEAT.lock().unwrap();
-        heartbeats.remove(&self.key);
-    }
+    _key: Arc<HeartbeatImpl>,
 }
 
 lazy_static! {
-    static ref HEARTBEAT: Arc<std::sync::Mutex<HashMap<HeartbeatImpl, Weak<HeartbeatGuard>>>> =
+    static ref HEARTBEAT: Arc<std::sync::Mutex<HashMap<HeartbeatImpl, Weak<HeartbeatImpl>>>> =
         Default::default();
 }
 
-pub fn start_heartbeat(object_access: ObjectAccess, id: Uuid) -> Arc<HeartbeatGuard> {
+pub async fn start_heartbeat(object_access: ObjectAccess, id: Uuid) -> HeartbeatGuard {
     let key = HeartbeatImpl {
         endpoint: object_access.get_endpoint(),
         region: object_access.get_region(),
@@ -94,28 +85,58 @@ pub fn start_heartbeat(object_access: ObjectAccess, id: Uuid) -> Arc<HeartbeatGu
         let mut heartbeats = HEARTBEAT.lock().unwrap();
         match heartbeats.get(&key) {
             None => {
-                guard = Arc::new(HeartbeatGuard { key: key.clone() });
-                heartbeats.insert(key.clone(), Arc::downgrade(&guard));
+                let value = Arc::new(key.clone());
+                heartbeats.insert(key.clone(), Arc::downgrade(&value));
+                guard = HeartbeatGuard { _key: value };
             }
-            Some(val) => {
-                debug!("existing references found");
-                return val.upgrade().unwrap();
+            Some(val_ref) => {
+                debug!("existing entry found");
+                match val_ref.upgrade() {
+                    Some(val) => {
+                        /*
+                         * There is an existing heartbeat with references, simply add a reference
+                         * and return.
+                         */
+                        debug!("upgrade succeeded, using existing heartbeat");
+                        return HeartbeatGuard { _key: val };
+                    }
+                    None => {
+                        /*
+                         * In this case, there is already a heartbeat thread that would terminate
+                         * on its next iteration. Replace the existing weak ref with a new one, and
+                         * let it keep running.
+                         */
+                        let value = Arc::new(key.clone());
+                        heartbeats.insert(key.clone(), Arc::downgrade(&value));
+                        return HeartbeatGuard { _key: value };
+                    }
+                }
             }
         }
     }
+    let (tx, mut rx) = mpsc::channel(1);
     tokio::spawn(async move {
         let mut last_heartbeat = HeartbeatPhys::get(&object_access, id)
             .await
-            .map_or(SystemTime::UNIX_EPOCH, |x| x.timestamp);
+            .ok()
+            .map(|x| x.timestamp);
+        if lease_timed_out(last_heartbeat) {
+            tx.send(true).await.unwrap();
+            suspend_all_pools("lease timeout");
+            return;
+        }
         info!("Starting heartbeat with id {}", id);
+        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
+            interval.tick().await;
             let existing;
             {
                 let mut heartbeats = HEARTBEAT.lock().unwrap();
-                existing = !heartbeats.get(&key).is_none();
+                let value = heartbeats.get(&key);
+                existing = value.unwrap().upgrade().is_some();
                 if !existing {
-                    info!("Stopping heartbeat with id {}", id);
                     heartbeats.remove(&key);
+                    info!("Stopping heartbeat with id {}", id);
                 }
             }
             if !existing {
@@ -125,28 +146,42 @@ pub fn start_heartbeat(object_access: ObjectAccess, id: Uuid) -> Arc<HeartbeatGu
             let heartbeat = HeartbeatPhys {
                 timestamp: SystemTime::now(),
                 hostname: hostname::get().unwrap().into_string().unwrap(),
-                addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), // test
                 lease_duration: LEASE_DURATION,
                 id,
             };
             let result = heartbeat
                 .put_timeout(&object_access, Some(Duration::from_secs(2)))
                 .await;
-            if last_heartbeat != SystemTime::UNIX_EPOCH
-                && SystemTime::now()
-                    .duration_since(last_heartbeat)
-                    .map_or(false, |dur| dur > LEASE_DURATION)
-            {
+            if lease_timed_out(last_heartbeat) {
+                if last_heartbeat.is_none() {
+                    tx.send(true).await.unwrap();
+                }
                 suspend_all_pools("lease timeout");
-                break;
+                return;
             }
-            if let Ok(_) = result {
-                last_heartbeat = heartbeat.timestamp;
+            if result.is_ok() {
+                if last_heartbeat.is_none() {
+                    tx.send(true).await.unwrap();
+                }
+                last_heartbeat = Some(heartbeat.timestamp);
             }
-            sleep(HEARTBEAT_INTERVAL).await;
         }
     });
+    rx.recv().await;
+    rx.close();
     guard
+}
+
+fn lease_timed_out(last_heartbeat: Option<SystemTime>) -> bool {
+    if let Some(time) = last_heartbeat {
+        if SystemTime::now()
+            .duration_since(time)
+            .map_or(false, |dur| dur > LEASE_DURATION)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn suspend_all_pools(cause: &str) {

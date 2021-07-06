@@ -434,7 +434,7 @@ agent_io_block_free(nvlist_t *nv)
 }
 
 void
-object_store_restart_agent(vdev_t *vd)
+object_store_stop_agent(vdev_t *vd)
 {
 	vdev_object_store_t *vos = vd->vdev_tsd;
 	if (vos->vos_sock == INVALID_SOCKET)
@@ -446,7 +446,7 @@ object_store_restart_agent(vdev_t *vd)
 	 * socket is ready. Otherwise, we block here since the agent
 	 * might be in recovery.
 	 */
-	zfs_dbgmsg("restart_agent()");
+	zfs_dbgmsg("stop_agent()");
 	zfs_object_store_wait(vos, VOS_SOCK_OPEN);
 
 	nvlist_t *nv = fnvlist_alloc();
@@ -1248,7 +1248,7 @@ vdev_object_store_close(vdev_t *vd)
 	vos->vos_agent_thread_exit = B_TRUE;
 
 	mutex_enter(&vos->vos_sock_lock);
-	object_store_restart_agent(vd);
+	object_store_stop_agent(vd);
 	mutex_exit(&vos->vos_sock_lock);
 
 	vos->vos_vdev = NULL;

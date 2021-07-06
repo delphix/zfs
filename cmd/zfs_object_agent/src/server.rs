@@ -16,8 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     cmp::max,
     fs::File,
-    io::{Read, Write},
-    net::{IpAddr, Ipv4Addr},
+    io::Write,
     path::Path,
     sync::Arc,
     time::{Instant, SystemTime},
@@ -200,10 +199,8 @@ impl Server {
                         let name = nvl.lookup_string("name").unwrap();
                         let object_access = Self::get_object_access(nvl.as_ref());
                         server.readonly = false;
-                        if !server.readonly {
-                            _heartbeat_guard =
-                                heartbeat::start_heartbeat(object_access.clone(), id);
-                        }
+                        _heartbeat_guard =
+                            heartbeat::start_heartbeat(object_access.clone(), id).await;
 
                         server
                             .create_pool(&object_access, guid, name.to_str().unwrap())
@@ -217,7 +214,7 @@ impl Server {
                         server.readonly = nvl.lookup("readonly").is_ok();
                         if !server.readonly {
                             _heartbeat_guard =
-                                heartbeat::start_heartbeat(object_access.clone(), id);
+                                heartbeat::start_heartbeat(object_access.clone(), id).await;
                         }
                         server
                             .open_pool(
@@ -225,7 +222,7 @@ impl Server {
                                 guid,
                                 id,
                                 server.readonly,
-                                cache.as_ref().cloned()),
+                                cache.as_ref().cloned(),
                             )
                             .await;
                     }
@@ -394,7 +391,7 @@ impl Server {
         Self::send_response(&self.output, resp).await;
     }
 
-    async fn claim_pool(
+    async fn try_claim_pool(
         &self,
         object_access: &ObjectAccess,
         guid: PoolGUID,
@@ -472,7 +469,6 @@ impl Server {
                     .unwrap_or(HeartbeatPhys {
                         timestamp: SystemTime::now(),
                         hostname: "unknown".to_string(),
-                        addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                         lease_duration: LEASE_DURATION,
                         id: final_owner.owner,
                     }),
@@ -494,33 +490,46 @@ impl Server {
         Self::send_response(&self.output, nvl).await;
     }
 
-    /// initiate pool opening.  Responds when pool is open
-    async fn open_pool(
+    async fn claim_pool(
         &mut self,
         object_access: &ObjectAccess,
         guid: PoolGuid,
         id: Uuid,
-        readonly: bool,
-        cache: Option<ZettaCache>,
-    ) {
-        let (pool, phys_opt, next_block) = Pool::open(object_access, guid, cache).await;
-        while readonly == false {
-            match self.claim_pool(object_access, guid, id).await {
+    ) -> Option<NvList> {
+        loop {
+            match self.try_claim_pool(object_access, guid, id).await {
                 OwnResult::Success => {
-                    break;
+                    return None;
                 }
                 OwnResult::Failure(heartbeat) => {
                     let mut nvl = NvList::new_unique_names();
                     nvl.insert("Type", "pool open failed").unwrap();
                     nvl.insert("cause", "MMP").unwrap();
                     nvl.insert("hostname", heartbeat.hostname.as_str()).unwrap();
-                    debug!("sending response: {:?}", nvl);
-                    Self::send_response(&self.output, nvl).await;
-                    return;
+                    return Some(nvl);
                 }
                 OwnResult::Retry => {
                     continue;
                 }
+            }
+        }
+    }
+
+    /// initiate pool opening.  Responds when pool is open
+    async fn open_pool(
+        &mut self,
+        object_access: &ObjectAccess,
+        guid: PoolGUID,
+        id: Uuid,
+        readonly: bool,
+        cache: Option<ZettaCache>,
+    ) {
+        let (pool, phys_opt, next_block) = Pool::open(object_access, guid, cache).await;
+        if !readonly {
+            if let Some(nvl) = self.claim_pool(object_access, guid, id).await {
+                debug!("sending response: {:?}", nvl);
+                Self::send_response(&self.output, nvl).await;
+                return;
             }
         }
         self.pool = Some(Arc::new(pool));
@@ -664,16 +673,16 @@ pub async fn do_server(socket_dir: &str, cache_path: Option<&str>) {
     let id_path_name = format!("{}/zfs_agent_id", socket_dir);
     let id_path = Path::new(&id_path_name);
 
-    let id = match File::open(id_path) {
+    let id = match tokio::fs::File::open(id_path).await {
         Ok(mut f) => {
-            let mut bytes = [0; 36];
-            assert!(f.read(&mut bytes).unwrap() == 36);
+            let mut bytes = Vec::new();
+            assert!(f.read_to_end(&mut bytes).await.unwrap() == uuid::adapter::Hyphenated::LENGTH);
             Uuid::parse_str(std::str::from_utf8(&bytes).unwrap()).unwrap()
         }
         Err(_) => {
             let mut file = File::create(id_path).unwrap();
             let uuid = Uuid::new_v4();
-            let mut buf = [0; 36];
+            let mut buf = [0; uuid::adapter::Hyphenated::LENGTH];
             uuid.to_hyphenated().encode_lower(&mut buf);
             file.write_all(&buf).unwrap();
             uuid

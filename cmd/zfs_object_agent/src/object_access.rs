@@ -187,12 +187,7 @@ impl ObjectAccess {
         }
     }
 
-    pub fn new(
-        endpoint: &str,
-        region_str: &str,
-        bucket: &str,
-        readonly: bool,
-    ) -> Self {
+    pub fn new(endpoint: &str, region_str: &str, bucket: &str, readonly: bool) -> Self {
         let client = ObjectAccess::get_client(endpoint, region_str);
 
         ObjectAccess {
@@ -543,13 +538,5 @@ impl ObjectAccess {
 
     pub fn get_endpoint(&self) -> String {
         self.endpoint_str.clone()
-    }
-}
-
-impl std::hash::Hash for ObjectAccess {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.bucket_str.hash(state);
-        self.region_str.hash(state);
-        self.endpoint_str.hash(state);
     }
 }
