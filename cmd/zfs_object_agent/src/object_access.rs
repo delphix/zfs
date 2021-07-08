@@ -49,6 +49,7 @@ pub fn prefixed(key: &str) -> String {
 }
 
 #[derive(Debug)]
+#[allow(clippy::upper_case_acronyms)]
 enum OAError<E>
 where
     E: core::fmt::Debug + core::fmt::Display + std::error::Error,
@@ -117,11 +118,9 @@ where
     let result = match timeout_opt {
         Some(timeout) => match tokio::time::timeout(timeout, retry_impl(msg, f)).await {
             Err(e) => Err(OAError::TimeoutError(e)),
-            Ok(res2) => res2.map_err(|e| OAError::RequestError(e)),
+            Ok(res2) => res2.map_err(OAError::RequestError),
         },
-        None => retry_impl(msg, f)
-            .await
-            .map_err(|e| OAError::RequestError(e)),
+        None => retry_impl(msg, f).await.map_err(OAError::RequestError),
     };
     let elapsed = begin.elapsed();
     debug!("{}: returned in {}ms", msg, elapsed.as_millis());

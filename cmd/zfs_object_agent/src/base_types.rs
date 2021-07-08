@@ -10,48 +10,48 @@ use std::ops::Add;
 pub trait OnDisk: Serialize + DeserializeOwned {}
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
-pub struct TXG(pub u64);
-impl OnDisk for TXG {}
-impl Display for TXG {
+pub struct Txg(pub u64);
+impl OnDisk for Txg {}
+impl Display for Txg {
     fn fmt(&self, f: &mut Formatter) -> Result {
         write!(f, "{:020}", self.0)
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
-pub struct PoolGUID(pub u64);
-impl OnDisk for PoolGUID {}
-impl Display for PoolGUID {
+pub struct PoolGuid(pub u64);
+impl OnDisk for PoolGuid {}
+impl Display for PoolGuid {
     fn fmt(&self, f: &mut Formatter) -> Result {
         write!(f, "{:020}", self.0)
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
-pub struct ObjectID(pub u64);
-impl OnDisk for ObjectID {}
-impl Display for ObjectID {
+pub struct ObjectId(pub u64);
+impl OnDisk for ObjectId {}
+impl Display for ObjectId {
     fn fmt(&self, f: &mut Formatter) -> Result {
         write!(f, "{:020}", self.0)
     }
 }
-impl ObjectID {
-    pub fn next(&self) -> ObjectID {
-        ObjectID(self.0 + 1)
+impl ObjectId {
+    pub fn next(&self) -> ObjectId {
+        ObjectId(self.0 + 1)
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
-pub struct BlockID(pub u64);
-impl OnDisk for BlockID {}
-impl Display for BlockID {
+pub struct BlockId(pub u64);
+impl OnDisk for BlockId {}
+impl Display for BlockId {
     fn fmt(&self, f: &mut Formatter) -> Result {
         write!(f, "{}", self.0)
     }
 }
-impl BlockID {
-    pub fn next(&self) -> BlockID {
-        BlockID(self.0 + 1)
+impl BlockId {
+    pub fn next(&self) -> BlockId {
+        BlockId(self.0 + 1)
     }
 }
 
@@ -95,10 +95,10 @@ impl Extent {
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
-pub struct CheckpointID(pub u64);
-impl CheckpointID {
-    pub fn next(&self) -> CheckpointID {
-        CheckpointID(self.0 + 1)
+pub struct CheckpointId(pub u64);
+impl CheckpointId {
+    pub fn next(&self) -> CheckpointId {
+        CheckpointId(self.0 + 1)
     }
 }
 

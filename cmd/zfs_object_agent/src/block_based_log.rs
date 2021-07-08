@@ -34,7 +34,7 @@ pub struct BlockBasedLogPhys {
     // we can do random reads on the Index (unless the ChunkSummary points
     // directly to the on-disk location)
     extents: BTreeMap<LogOffset, Extent>, // offset -> disk_location, size
-    next_chunk: ChunkID,
+    next_chunk: ChunkId,
     next_chunk_offset: LogOffset, // logical byte offset of next chunk to write
     num_entries: u64,
 }
@@ -71,7 +71,7 @@ pub struct BlockBasedLogWithSummary<T: BlockBasedLogEntry> {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct BlockBasedLogChunk<T: BlockBasedLogEntry> {
-    id: ChunkID,
+    id: ChunkId,
     offset: LogOffset,
     #[serde(bound(deserialize = "Vec<T>: DeserializeOwned"))]
     entries: Vec<T>,
@@ -103,6 +103,10 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
         self.phys.num_entries + self.pending_entries.len() as u64
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.phys.num_entries == 0 && self.pending_entries.is_empty()
+    }
+
     /// Size of the on-disk representation
     pub fn num_bytes(&self) -> u64 {
         self.phys.next_chunk_offset.0
@@ -115,7 +119,7 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
 
     async fn flush_impl<F>(&mut self, mut new_chunk_fn: F)
     where
-        F: FnMut(ChunkID, LogOffset, T),
+        F: FnMut(ChunkId, LogOffset, T),
     {
         if self.pending_entries.is_empty() {
             return;
@@ -214,7 +218,7 @@ impl<T: BlockBasedLogEntry> BlockBasedLog<T> {
         let next_chunk_offset = self.phys.next_chunk_offset;
         stream! {
             let mut num_entries = 0;
-            let mut chunk_id = ChunkID(0);
+            let mut chunk_id = ChunkId(0);
             for (offset, extent) in phys.extents.iter() {
                 // XXX Probably want to do smaller i/os than the entire extent
                 // (which is up to 128MB).  Also want to issue a few in
@@ -285,7 +289,7 @@ impl<T: BlockBasedLogEntry> BlockBasedLogWithSummary<T> {
         let chunk_summary = &mut self.chunk_summary;
         self.this
             .flush_impl(|chunk_id, offset, first_entry| {
-                assert_eq!(ChunkID(chunks.len() as u64), chunk_id);
+                assert_eq!(ChunkId(chunks.len() as u64), chunk_id);
                 let entry = BlockBasedLogChunkSummaryEntry {
                     offset,
                     first_entry,
@@ -298,15 +302,21 @@ impl<T: BlockBasedLogEntry> BlockBasedLogWithSummary<T> {
         // all the "real" work and then returned a future that would just wait
         // for the i/o to complete.  Then we could be writing to disk both
         // "this" and the summary at the same time.
+        let new_this = self.this.flush().await;
+        let new_chunk_summary = self.chunk_summary.flush().await;
 
         BlockBasedLogWithSummaryPhys {
-            this: self.this.flush().await,
-            chunk_summary: self.chunk_summary.flush().await,
+            this: new_this,
+            chunk_summary: new_chunk_summary,
         }
     }
 
     pub fn len(&self) -> u64 {
         self.this.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.this.is_empty()
     }
 
     /// Size of the on-disk representation
@@ -352,7 +362,7 @@ impl<T: BlockBasedLogEntry> BlockBasedLogWithSummary<T> {
         B: Ord + Debug,
         F: FnMut(&T) -> B,
     {
-        assert_eq!(ChunkID(self.chunks.len() as u64), self.this.phys.next_chunk);
+        assert_eq!(ChunkId(self.chunks.len() as u64), self.this.phys.next_chunk);
         // XXX would be nice to also store last entry in the log, so that if we
         // look for something after it, we can return None without reading the
         // last chunk.
@@ -375,7 +385,7 @@ impl<T: BlockBasedLogEntry> BlockBasedLogWithSummary<T> {
         let chunk_bytes = self.this.block_access.read_raw(chunk_extent).await;
         let (chunk, _consumed): (BlockBasedLogChunk<T>, usize) =
             self.this.block_access.chunk_from_raw(&chunk_bytes).unwrap();
-        assert_eq!(chunk.id, ChunkID(chunk_id as u64));
+        assert_eq!(chunk.id, ChunkId(chunk_id as u64));
         // XXX can we assert that we are looking in the right chunk?
         // XXX I think we'd want to the chunk to have the next chunk's first key as well
         match chunk.entries.binary_search_by_key(key, f) {
@@ -435,9 +445,9 @@ impl Sub<LogOffset> for LogOffset {
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
-pub struct ChunkID(u64);
-impl ChunkID {
-    pub fn next(&self) -> ChunkID {
-        ChunkID(self.0 + 1)
+pub struct ChunkId(u64);
+impl ChunkId {
+    pub fn next(&self) -> ChunkId {
+        ChunkId(self.0 + 1)
     }
 }

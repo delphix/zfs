@@ -41,21 +41,21 @@ const LOG_CONDENSE_MULTIPLE: usize = 5;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct PoolPhys {
-    guid: PoolGUID, // redundant with key, for verification
+    guid: PoolGuid, // redundant with key, for verification
     name: String,
-    last_txg: TXG,
+    last_txg: Txg,
 }
 impl OnDisk for PoolPhys {}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct UberblockPhys {
-    guid: PoolGUID,   // redundant with key, for verification
-    txg: TXG,         // redundant with key, for verification
+    guid: PoolGuid,   // redundant with key, for verification
+    txg: Txg,         // redundant with key, for verification
     date: SystemTime, // for debugging
     storage_object_log: ObjectBasedLogPhys,
     pending_frees_log: ObjectBasedLogPhys,
     object_size_log: ObjectBasedLogPhys,
-    next_block: BlockID, // next BlockID that can be allocated
+    next_block: BlockId, // next BlockID that can be allocated
     stats: PoolStatsPhys,
     zfs_uberblock: TerseVec<u8>,
     zfs_config: TerseVec<u8>,
@@ -83,31 +83,31 @@ impl OnDisk for PoolStatsPhys {}
 
 #[derive(Serialize, Deserialize, Debug)]
 struct DataObjectPhys {
-    guid: PoolGUID,      // redundant with key, for verification
-    object: ObjectID,    // redundant with key, for verification
+    guid: PoolGuid,      // redundant with key, for verification
+    object: ObjectId,    // redundant with key, for verification
     blocks_size: u32,    // sum of blocks.values().len()
-    min_block: BlockID,  // inclusive (all blocks are >= min_block)
-    next_block: BlockID, // exclusive (all blocks are < next_block)
+    min_block: BlockId,  // inclusive (all blocks are >= min_block)
+    next_block: BlockId, // exclusive (all blocks are < next_block)
 
     // Note: if this object was rewritten to consolidate adjacent objects, the
     // blocks in this object may have been originally written over a range of
     // TXG's.
-    min_txg: TXG,
-    max_txg: TXG, // inclusive
+    min_txg: Txg,
+    max_txg: Txg, // inclusive
 
-    blocks: HashMap<BlockID, ByteBuf>,
+    blocks: HashMap<BlockId, ByteBuf>,
 }
 impl OnDisk for DataObjectPhys {}
 
 #[derive(Debug, Serialize, Deserialize, Copy, Clone)]
 enum ObjectSizeLogEntry {
     Exists {
-        object: ObjectID,
+        object: ObjectId,
         num_blocks: u32,
         num_bytes: u32, // bytes in blocks; does not include Agent metadata
     },
     Freed {
-        object: ObjectID,
+        object: ObjectId,
     },
 }
 impl OnDisk for ObjectSizeLogEntry {}
@@ -115,7 +115,7 @@ impl ObjectBasedLogEntry for ObjectSizeLogEntry {}
 
 #[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq)]
 struct PendingFreesLogEntry {
-    block: BlockID,
+    block: BlockId,
     size: u32, // in bytes
 }
 impl OnDisk for PendingFreesLogEntry {}
@@ -126,15 +126,15 @@ impl ObjectBasedLogEntry for PendingFreesLogEntry {}
  */
 
 impl PoolPhys {
-    fn key(guid: PoolGUID) -> String {
+    fn key(guid: PoolGuid) -> String {
         format!("zfs/{}/super", guid)
     }
 
-    async fn exists(object_access: &ObjectAccess, guid: PoolGUID) -> bool {
+    async fn exists(object_access: &ObjectAccess, guid: PoolGuid) -> bool {
         object_access.object_exists(&Self::key(guid)).await
     }
 
-    async fn get(object_access: &ObjectAccess, guid: PoolGUID) -> Result<Self> {
+    async fn get(object_access: &ObjectAccess, guid: PoolGuid) -> Result<Self> {
         let key = Self::key(guid);
         let buf = object_access.get_object(&key).await?;
         let this: Self = serde_json::from_slice(&buf)
@@ -152,7 +152,7 @@ impl PoolPhys {
 }
 
 impl UberblockPhys {
-    fn key(guid: PoolGUID, txg: TXG) -> String {
+    fn key(guid: PoolGuid, txg: Txg) -> String {
         format!("zfs/{}/txg/{}", guid, txg)
     }
 
@@ -164,7 +164,7 @@ impl UberblockPhys {
         &self.zfs_config.0
     }
 
-    async fn get(object_access: &ObjectAccess, guid: PoolGUID, txg: TXG) -> Result<Self> {
+    async fn get(object_access: &ObjectAccess, guid: PoolGuid, txg: Txg) -> Result<Self> {
         let key = Self::key(guid, txg);
         let buf = object_access.get_object(&key).await?;
         let this: Self = serde_json::from_slice(&buf)
@@ -187,7 +187,7 @@ impl UberblockPhys {
 const NUM_DATA_PREFIXES: i32 = 64;
 
 impl DataObjectPhys {
-    fn key(guid: PoolGUID, object: ObjectID) -> String {
+    fn key(guid: PoolGuid, object: ObjectId) -> String {
         format!(
             "zfs/{}/data/{:03}/{}",
             guid,
@@ -197,7 +197,7 @@ impl DataObjectPhys {
     }
 
     // Could change this to return an Iterator
-    fn prefixes(guid: PoolGUID) -> Vec<String> {
+    fn prefixes(guid: PoolGuid) -> Vec<String> {
         let mut vec = Vec::new();
         for x in 0..NUM_DATA_PREFIXES {
             vec.push(format!("zfs/{}/data/{:03}/", guid, x));
@@ -218,7 +218,7 @@ impl DataObjectPhys {
         }
     }
 
-    async fn get(object_access: &ObjectAccess, guid: PoolGUID, obj: ObjectID) -> Result<Self> {
+    async fn get(object_access: &ObjectAccess, guid: PoolGuid, obj: ObjectId) -> Result<Self> {
         let this = Self::get_from_key(object_access, &Self::key(guid, obj)).await?;
         assert_eq!(this.guid, guid);
         assert_eq!(this.object, obj);
@@ -294,17 +294,17 @@ struct PoolSyncingState {
     pending_frees_log: ObjectBasedLog<PendingFreesLogEntry>,
 
     pending_object: PendingObjectState,
-    pending_unordered_writes: HashMap<BlockID, (ByteBuf, oneshot::Sender<()>)>,
-    pub last_txg: TXG,
-    pub syncing_txg: Option<TXG>,
+    pending_unordered_writes: HashMap<BlockId, (ByteBuf, oneshot::Sender<()>)>,
+    pub last_txg: Txg,
+    pub syncing_txg: Option<Txg>,
     stats: PoolStatsPhys,
     reclaim_done: Option<oneshot::Receiver<SyncTask>>,
     // Protects objects that are being overwritten for sync-to-convergence
-    rewriting_objects: HashMap<ObjectID, Arc<tokio::sync::Mutex<()>>>,
+    rewriting_objects: HashMap<ObjectId, Arc<tokio::sync::Mutex<()>>>,
     // objects to delete at the end of this txg
-    objects_to_delete: Vec<ObjectID>,
+    objects_to_delete: Vec<ObjectId>,
     // Flush immediately once we have one of these blocks (and all previous blocks)
-    pending_flushes: BTreeSet<BlockID>,
+    pending_flushes: BTreeSet<BlockId>,
 }
 
 type SyncTask =
@@ -313,7 +313,7 @@ type SyncTask =
 #[derive(Debug)]
 enum PendingObjectState {
     Pending(DataObjectPhys, Vec<oneshot::Sender<()>>), // available to write
-    NotPending(BlockID), // not available to write; this is the next blockID to use
+    NotPending(BlockId), // not available to write; this is the next blockID to use
 }
 
 impl PendingObjectState {
@@ -338,14 +338,14 @@ impl PendingObjectState {
         }
     }
 
-    fn next_block(&self) -> BlockID {
+    fn next_block(&self) -> BlockId {
         match self {
             PendingObjectState::Pending(phys, _) => phys.next_block,
             PendingObjectState::NotPending(next_block) => *next_block,
         }
     }
 
-    fn new_pending(guid: PoolGUID, object: ObjectID, next_block: BlockID, txg: TXG) -> Self {
+    fn new_pending(guid: PoolGuid, object: ObjectId, next_block: BlockId, txg: Txg) -> Self {
         PendingObjectState::Pending(
             DataObjectPhys {
                 guid,
@@ -369,12 +369,12 @@ impl PendingObjectState {
 #[derive(Clone)]
 pub struct PoolSharedState {
     pub object_access: ObjectAccess,
-    pub guid: PoolGUID,
+    pub guid: PoolGuid,
     pub name: String,
 }
 
 impl PoolSyncingState {
-    fn next_block(&self) -> BlockID {
+    fn next_block(&self) -> BlockId {
         self.pending_object.next_block()
     }
 
@@ -400,11 +400,11 @@ impl PoolState {
 }
 
 impl Pool {
-    pub async fn exists(object_access: &ObjectAccess, guid: PoolGUID) -> bool {
+    pub async fn exists(object_access: &ObjectAccess, guid: PoolGuid) -> bool {
         PoolPhys::exists(object_access, guid).await
     }
 
-    pub async fn get_config(object_access: &ObjectAccess, guid: PoolGUID) -> Result<NvList> {
+    pub async fn get_config(object_access: &ObjectAccess, guid: PoolGuid) -> Result<NvList> {
         let pool_phys = PoolPhys::get(object_access, guid).await?;
         let uberblock_phys =
             UberblockPhys::get(object_access, pool_phys.guid, pool_phys.last_txg).await?;
@@ -412,11 +412,11 @@ impl Pool {
         Ok(nvl)
     }
 
-    pub async fn create(object_access: &ObjectAccess, name: &str, guid: PoolGUID) {
+    pub async fn create(object_access: &ObjectAccess, name: &str, guid: PoolGuid) {
         let phys = PoolPhys {
             guid,
             name: name.to_string(),
-            last_txg: TXG(0),
+            last_txg: Txg(0),
         };
         // XXX make sure it doesn't already exist
         phys.put(object_access).await;
@@ -425,9 +425,9 @@ impl Pool {
     async fn open_from_txg(
         object_access: &ObjectAccess,
         pool_phys: &PoolPhys,
-        txg: TXG,
+        txg: Txg,
         cache: Option<ZettaCache>,
-    ) -> (Pool, Option<UberblockPhys>, BlockID) {
+    ) -> (Pool, Option<UberblockPhys>, BlockId) {
         let phys = UberblockPhys::get(object_access, pool_phys.guid, txg)
             .await
             .unwrap();
@@ -500,9 +500,9 @@ impl Pool {
 
     pub async fn open(
         object_access: &ObjectAccess,
-        guid: PoolGUID,
+        guid: PoolGuid,
         cache: Option<ZettaCache>,
-    ) -> (Pool, Option<UberblockPhys>, BlockID) {
+    ) -> (Pool, Option<UberblockPhys>, BlockId) {
         let phys = PoolPhys::get(object_access, guid).await.unwrap();
         if phys.last_txg.0 == 0 {
             let shared_state = Arc::new(PoolSharedState {
@@ -515,13 +515,13 @@ impl Pool {
                 shared_state.clone(),
                 &format!("zfs/{}/StorageObjectLog", guid),
             );
-            let object_block_map = ObjectBlockMap::load(&storage_object_log, BlockID(0)).await;
+            let object_block_map = ObjectBlockMap::load(&storage_object_log, BlockId(0)).await;
 
             let pool = Pool {
                 state: Arc::new(PoolState {
                     shared_state: shared_state.clone(),
                     syncing_state: std::sync::Mutex::new(Some(PoolSyncingState {
-                        last_txg: TXG(0),
+                        last_txg: Txg(0),
                         syncing_txg: None,
                         storage_object_log,
                         object_size_log: ObjectBasedLog::create(
@@ -532,7 +532,7 @@ impl Pool {
                             shared_state.clone(),
                             &format!("zfs/{}/PendingFreesLog", guid),
                         ),
-                        pending_object: PendingObjectState::NotPending(BlockID(0)),
+                        pending_object: PendingObjectState::NotPending(BlockId(0)),
                         pending_unordered_writes: Default::default(),
                         stats: Default::default(),
                         reclaim_done: None,
@@ -554,7 +554,7 @@ impl Pool {
         }
     }
 
-    pub fn resume_txg(&self, txg: TXG) {
+    pub fn resume_txg(&self, txg: Txg) {
         // The syncing_state is only held while a txg is open (begun).  It's not
         // allowed to call begin_txg() while a txg is already open, so the lock
         // must not be held.
@@ -572,8 +572,8 @@ impl Pool {
     async fn get_recovered_objects(
         state: &Arc<PoolState>,
         shared_state: &Arc<PoolSharedState>,
-        txg: TXG,
-    ) -> BTreeMap<ObjectID, DataObjectPhys> {
+        txg: Txg,
+    ) -> BTreeMap<ObjectId, DataObjectPhys> {
         let begin = Instant::now();
         let last_obj = state.object_block_map.last_object();
         let list_stream = FuturesUnordered::new();
@@ -632,7 +632,7 @@ impl Pool {
         let recovered_objects = Self::get_recovered_objects(state, shared_state, txg).await;
 
         self.state.with_syncing_state(|syncing_state| {
-            let ordered_writes: BTreeSet<BlockID> = syncing_state
+            let ordered_writes: BTreeSet<BlockId> = syncing_state
                 .pending_unordered_writes
                 .keys()
                 .copied()
@@ -734,7 +734,7 @@ impl Pool {
         })
     }
 
-    pub fn begin_txg(&self, txg: TXG) {
+    pub fn begin_txg(&self, txg: Txg) {
         self.state.with_syncing_state(|syncing_state| {
             // XXX change this to return an error to the client
             assert!(syncing_state.syncing_txg.is_none());
@@ -889,7 +889,7 @@ impl Pool {
     // soon.
     // Basically, as soon as we have this blockID and all the previous ones,
     // start writing that pending object immediately.
-    pub fn initiate_flush(&self, block: BlockID) {
+    pub fn initiate_flush(&self, block: BlockId) {
         self.state.with_syncing_state(|syncing_state| {
             // XXX because called when server times out waiting for request
             if syncing_state.syncing_txg.is_none() {
@@ -989,7 +989,7 @@ impl Pool {
     fn do_overwrite_impl(
         state: &PoolState,
         syncing_state: &mut PoolSyncingState,
-        id: BlockID,
+        id: BlockId,
         data: Vec<u8>,
     ) -> oneshot::Receiver<()> {
         let object = state.object_block_map.block_to_object(id);
@@ -1065,7 +1065,7 @@ impl Pool {
         Self::check_pending_flushes(state, syncing_state);
     }
 
-    pub fn write_block(&self, block: BlockID, data: Vec<u8>) -> impl Future<Output = ()> {
+    pub fn write_block(&self, block: BlockId, data: Vec<u8>) -> impl Future<Output = ()> {
         let receiver = self.state.with_syncing_state(|syncing_state| {
             // XXX change to return error
             assert!(syncing_state.syncing_txg.is_some());
@@ -1095,7 +1095,7 @@ impl Pool {
         }
     }
 
-    pub async fn read_block(&self, block: BlockID) -> Vec<u8> {
+    pub async fn read_block(&self, block: BlockId) -> Vec<u8> {
         // check in ZettaCache
         if let Some(cache) = &self.state.zettacache {
             if let Some(v) = cache.lookup(self.state.shared_state.guid, block).await {
@@ -1133,7 +1133,7 @@ impl Pool {
         v
     }
 
-    pub fn free_block(&self, block: BlockID, size: u32) {
+    pub fn free_block(&self, block: BlockId, size: u32) {
         // the syncing_state is only held from the thread that owns the Pool
         // (i.e. this thread) and from end_txg(). It's not allowed to call this
         // function while in the middle of an end_txg(), so the lock must not be
@@ -1150,7 +1150,7 @@ impl Pool {
 
 fn log_new_sizes(
     syncing_state: &mut PoolSyncingState,
-    rewritten_object_sizes: Vec<(ObjectID, u32)>,
+    rewritten_object_sizes: Vec<(ObjectId, u32)>,
 ) {
     let txg = syncing_state.syncing_txg.unwrap();
     for (object, size) in rewritten_object_sizes {
@@ -1169,7 +1169,7 @@ fn log_new_sizes(
 fn log_deleted_objects(
     state: Arc<PoolState>,
     syncing_state: &mut PoolSyncingState,
-    deleted_objects: Vec<ObjectID>,
+    deleted_objects: Vec<ObjectId>,
 ) {
     let txg = syncing_state.syncing_txg.unwrap();
     let begin = Instant::now();
@@ -1237,8 +1237,8 @@ async fn build_new_frees<'a, I>(
 
 async fn get_object_sizes(
     object_size_log_stream: impl Stream<Item = ObjectSizeLogEntry>,
-) -> BTreeMap<ObjectID, u32> {
-    let mut object_sizes: BTreeMap<ObjectID, u32> = BTreeMap::new();
+) -> BTreeMap<ObjectId, u32> {
+    let mut object_sizes: BTreeMap<ObjectId, u32> = BTreeMap::new();
     let begin = Instant::now();
     object_size_log_stream
         .for_each(|ent| {
@@ -1270,13 +1270,13 @@ async fn get_object_sizes(
 async fn get_frees_per_obj(
     state: &PoolState,
     pending_frees_log_stream: impl Stream<Item = PendingFreesLogEntry>,
-) -> HashMap<ObjectID, Vec<PendingFreesLogEntry>> {
+) -> HashMap<ObjectId, Vec<PendingFreesLogEntry>> {
     // XXX The Vecs will grow by doubling, thus wasting ~1/4 of the
     // memory used by it.  It would be better if we gathered the
     // BlockID's into a single big Vec with the exact required size,
     // then in-place sort, and then have this map to a slice of the one
     // big Vec.
-    let mut frees_per_obj: HashMap<ObjectID, Vec<PendingFreesLogEntry>> = HashMap::new();
+    let mut frees_per_obj: HashMap<ObjectId, Vec<PendingFreesLogEntry>> = HashMap::new();
     let mut count: u64 = 0;
     let begin = Instant::now();
     pending_frees_log_stream
@@ -1299,8 +1299,8 @@ async fn get_frees_per_obj(
 
 async fn reclaim_frees_object(
     state: Arc<PoolState>,
-    objects: Vec<(ObjectID, u32, Vec<PendingFreesLogEntry>)>,
-) -> (ObjectID, u32) {
+    objects: Vec<(ObjectId, u32, Vec<PendingFreesLogEntry>)>,
+) -> (ObjectId, u32) {
     let first_object = objects[0].0;
     let shared_state = state.shared_state.clone();
     debug!(
@@ -1491,7 +1491,7 @@ fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState
         // sort objects by number of free blocks
         // XXX should be based on free space (bytes)?  And perhaps objects that
         // will be entirely freed should always be processed?
-        let mut objects_by_frees: BTreeSet<(usize, ObjectID)> = BTreeSet::new();
+        let mut objects_by_frees: BTreeSet<(usize, ObjectId)> = BTreeSet::new();
         for (obj, hs) in frees_per_object.iter() {
             // MAX-len because we want to sort by which has the most to
             // free, (high to low) and then by object ID (low to high)
@@ -1507,9 +1507,9 @@ fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState
         let mut join_handles = Vec::new();
         let mut freed_blocks_count: u64 = 0;
         let mut freed_blocks_bytes: u64 = 0;
-        let mut rewritten_object_sizes: Vec<(ObjectID, u32)> = Vec::new();
-        let mut deleted_objects: Vec<ObjectID> = Vec::new();
-        let mut writing: HashSet<ObjectID> = HashSet::new();
+        let mut rewritten_object_sizes: Vec<(ObjectId, u32)> = Vec::new();
+        let mut deleted_objects: Vec<ObjectId> = Vec::new();
+        let mut writing: HashSet<ObjectId> = HashSet::new();
         let outstanding = Arc::new(tokio::sync::Semaphore::new(30));
         for (_, object) in objects_by_frees {
             if !frees_per_object.contains_key(&object) {
@@ -1517,7 +1517,7 @@ fn try_reclaim_frees(state: Arc<PoolState>, syncing_state: &mut PoolSyncingState
                 continue;
             }
             // XXX limit amount of outstanding get/put requests?
-            let mut objects_to_consolidate: Vec<(ObjectID, u32, Vec<PendingFreesLogEntry>)> =
+            let mut objects_to_consolidate: Vec<(ObjectId, u32, Vec<PendingFreesLogEntry>)> =
                 Vec::new();
             let mut new_size: u32 = 0;
             assert!(object_sizes.contains_key(&object));
@@ -1665,7 +1665,7 @@ async fn try_condense_object_log(state: Arc<PoolState>, syncing_state: &mut Pool
 
 async fn try_condense_object_sizes(
     syncing_state: &mut PoolSyncingState,
-    object_sizes: BTreeMap<ObjectID, u32>,
+    object_sizes: BTreeMap<ObjectId, u32>,
     remainder: ObjectBasedLogRemainder,
 ) {
     // XXX change this to be based on bytes, once those stats are working?

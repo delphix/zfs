@@ -37,7 +37,7 @@ const MAX_PENDING_CHANGES: usize = 100_000; // XXX should be based on RAM usage,
 struct ZettaSuperBlockPhys {
     checkpoint_ring_buffer_size: u32,
     slab_size: u32,
-    last_checkpoint_id: CheckpointID,
+    last_checkpoint_id: CheckpointId,
     last_checkpoint_extent: Extent,
     // XXX put sector size in here too and verify it matches what the disk says now?
     // XXX put disk size in here so we can detect expansion?
@@ -68,7 +68,7 @@ impl ZettaSuperBlockPhys {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ZettaCheckpointPhys {
-    generation: CheckpointID,
+    generation: CheckpointId,
     extent_allocator: ExtentAllocatorPhys,
     block_allocator: BlockAllocatorPhys,
     //last_valid_data_offset: u64, // XXX move to BlockAllocatorPhys
@@ -211,7 +211,7 @@ impl ZettaCache {
                 + (DEFAULT_METADATA_SIZE_PCT / 100.0 * block_access.size() as f64) as u64,
         );
         let checkpoint = ZettaCheckpointPhys {
-            generation: CheckpointID(0),
+            generation: CheckpointId(0),
             extent_allocator: ExtentAllocatorPhys {
                 first_valid_offset: metadata_start as u64,
                 last_valid_offset: data_start as u64,
@@ -245,7 +245,7 @@ impl ZettaCache {
                 },
                 size: checkpoint_size,
             },
-            last_checkpoint_id: CheckpointID(0),
+            last_checkpoint_id: CheckpointId(0),
         };
         phys.write(&block_access).await;
     }
@@ -474,7 +474,7 @@ impl ZettaCache {
     #[measure(InFlight)]
     #[measure(Throughput)]
     #[measure(HitCount)]
-    pub async fn lookup(&self, guid: PoolGUID, block: BlockID) -> Option<Vec<u8>> {
+    pub async fn lookup(&self, guid: PoolGuid, block: BlockId) -> Option<Vec<u8>> {
         // We want to hold the index lock over the whole operation so that the index can't change after we get the value from it.
         // Lock ordering requres that we lock the index before locking the state.
         let index = self.index.read().await;
@@ -523,7 +523,7 @@ impl ZettaCache {
             None => {
                 // key not in index
                 self.cache_miss_after_index_read(&key);
-                return None;
+                None
             }
             Some(entry) => {
                 // read data from location indicated by index
@@ -538,11 +538,11 @@ impl ZettaCache {
                 match read_data_fut.await {
                     Some(vec) => {
                         self.cache_hit_after_index_read(&key);
-                        return Some(vec);
+                        Some(vec)
                     }
                     None => {
                         self.cache_miss_after_index_read(&key);
-                        return None;
+                        None
                     }
                 }
             }
@@ -553,7 +553,7 @@ impl ZettaCache {
     #[measure(InFlight)]
     #[measure(Throughput)]
     #[measure(HitCount)]
-    pub async fn insert(&self, guid: PoolGUID, block: BlockID, buf: Vec<u8>) {
+    pub async fn insert(&self, guid: PoolGuid, block: BlockId, buf: Vec<u8>) {
         let mut state = self.state.lock().await;
         state.insert(guid, block, buf);
     }
@@ -722,7 +722,7 @@ impl ZettaCacheState {
 
     /// Insert this block to the cache, if space and performance parameters
     /// allow.  It may be a recent cache miss, or a recently-written block.
-    fn insert(&mut self, guid: PoolGUID, block: BlockID, buf: Vec<u8>) {
+    fn insert(&mut self, guid: PoolGuid, block: BlockId, buf: Vec<u8>) {
         let buf_size = buf.len();
         let aligned_size = self.block_access.round_up_to_sector(buf.len());
 

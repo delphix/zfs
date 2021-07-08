@@ -32,10 +32,10 @@ pub struct ObjectBasedLogPhys {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ObjectBasedLogChunk<T: ObjectBasedLogEntry> {
-    guid: PoolGUID,
+    guid: PoolGuid,
     generation: u64,
     chunk: u64,
-    txg: TXG,
+    txg: Txg,
     #[serde(bound(deserialize = "Vec<T>: DeserializeOwned"))]
     entries: Vec<T>,
 }
@@ -180,7 +180,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         }
     }
 
-    pub fn append(&mut self, txg: TXG, entry: T) {
+    pub fn append(&mut self, txg: Txg, entry: T) {
         assert!(self.recovered);
         // XXX assert that txg is the same as the txg for the other pending entries?
         self.pending_entries.push(entry);
@@ -190,7 +190,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         }
     }
 
-    pub fn initiate_flush(&mut self, txg: TXG) {
+    pub fn initiate_flush(&mut self, txg: Txg) {
         assert!(self.recovered);
 
         let chunk = ObjectBasedLogChunk {
@@ -216,7 +216,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         assert!(self.pending_entries.is_empty());
     }
 
-    pub async fn flush(&mut self, txg: TXG) {
+    pub async fn flush(&mut self, txg: Txg) {
         if !self.pending_entries.is_empty() {
             self.initiate_flush(txg);
         }
@@ -228,7 +228,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
         self.num_flushed_chunks = self.num_chunks;
     }
 
-    pub async fn clear(&mut self, txg: TXG) {
+    pub async fn clear(&mut self, txg: Txg) {
         self.flush(txg).await;
         self.generation += 1;
         self.num_chunks = 0;
@@ -295,7 +295,7 @@ impl<T: ObjectBasedLogEntry> ObjectBasedLog<T> {
     /// (async) for any pending changes to be flushed.
     pub async fn iter_remainder(
         &mut self,
-        txg: TXG,
+        txg: Txg,
         first_chunk: ObjectBasedLogRemainder,
     ) -> impl Stream<Item = T> {
         self.flush(txg).await;

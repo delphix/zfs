@@ -16,11 +16,11 @@ use std::time::Instant;
 // XXX make this private and make methods for everything that uses it
 pub enum StorageObjectLogEntry {
     Alloc {
-        object: ObjectID,
-        min_block: BlockID,
+        object: ObjectId,
+        min_block: BlockId,
     },
     Free {
-        object: ObjectID,
+        object: ObjectId,
     },
 }
 impl OnDisk for StorageObjectLogEntry {}
@@ -34,23 +34,23 @@ pub struct ObjectBlockMap {
 #[derive(Debug)]
 struct ObjectBlockMapState {
     map: BTreeSet<ObjectBlockMapEntry>,
-    next_block: BlockID,
+    next_block: BlockId,
 }
 
 #[derive(Debug, Ord, PartialOrd, PartialEq, Eq, Copy, Clone)]
 pub struct ObjectBlockMapEntry {
-    pub object: ObjectID,
-    pub block: BlockID,
+    pub object: ObjectId,
+    pub block: BlockId,
 }
 
-impl Borrow<ObjectID> for ObjectBlockMapEntry {
-    fn borrow(&self) -> &ObjectID {
+impl Borrow<ObjectId> for ObjectBlockMapEntry {
+    fn borrow(&self) -> &ObjectId {
         &self.object
     }
 }
 
-impl Borrow<BlockID> for ObjectBlockMapEntry {
-    fn borrow(&self) -> &BlockID {
+impl Borrow<BlockId> for ObjectBlockMapEntry {
+    fn borrow(&self) -> &BlockId {
         &self.block
     }
 }
@@ -58,7 +58,7 @@ impl Borrow<BlockID> for ObjectBlockMapEntry {
 impl ObjectBlockMap {
     pub async fn load(
         storage_object_log: &ObjectBasedLog<StorageObjectLogEntry>,
-        next_block: BlockID,
+        next_block: BlockId,
     ) -> Self {
         let begin = Instant::now();
         let mut num_alloc_entries: u64 = 0;
@@ -110,8 +110,8 @@ impl ObjectBlockMap {
     // any order, and without specifying the next_block
     pub fn insert_setup(
         map: &mut BTreeSet<ObjectBlockMapEntry>,
-        object: ObjectID,
-        first_block: BlockID,
+        object: ObjectId,
+        first_block: BlockId,
     ) {
         // verify that this block is between the existing entries blocks
         let prev_ent_opt = map.range((Unbounded, Excluded(object))).next_back();
@@ -131,7 +131,7 @@ impl ObjectBlockMap {
         });
     }
 
-    pub fn insert(&self, object: ObjectID, first_block: BlockID, next_block: BlockID) {
+    pub fn insert(&self, object: ObjectId, first_block: BlockId, next_block: BlockId) {
         // verify that this object and block are after the last
         let mut state = self.state.write().unwrap();
         assert_lt!(first_block, next_block);
@@ -149,13 +149,13 @@ impl ObjectBlockMap {
         state.next_block = next_block;
     }
 
-    pub fn remove(&self, object: ObjectID) {
+    pub fn remove(&self, object: ObjectId) {
         let mut state = self.state.write().unwrap();
         let removed = state.map.remove(&object);
         assert!(removed);
     }
 
-    pub fn block_to_object(&self, block: BlockID) -> ObjectID {
+    pub fn block_to_object(&self, block: BlockId) -> ObjectId {
         let state = self.state.read().unwrap();
         state
             .map
@@ -165,12 +165,12 @@ impl ObjectBlockMap {
             .object
     }
 
-    pub fn object_to_min_block(&self, object: ObjectID) -> BlockID {
+    pub fn object_to_min_block(&self, object: ObjectId) -> BlockId {
         let state = self.state.read().unwrap();
         state.map.get(&object).unwrap().block
     }
 
-    pub fn object_to_next_block(&self, object: ObjectID) -> BlockID {
+    pub fn object_to_next_block(&self, object: ObjectId) -> BlockId {
         let state = self.state.read().unwrap();
 
         // The "next block" (i.e. the first BlockID that's not valid in this
@@ -182,15 +182,15 @@ impl ObjectBlockMap {
         }
     }
 
-    pub fn last_object(&self) -> ObjectID {
+    pub fn last_object(&self) -> ObjectId {
         let state = self.state.read().unwrap();
         state
             .map
             .iter()
             .next_back()
             .unwrap_or(&ObjectBlockMapEntry {
-                object: ObjectID(0),
-                block: BlockID(0),
+                object: ObjectId(0),
+                block: BlockId(0),
             })
             .object
     }
@@ -198,6 +198,11 @@ impl ObjectBlockMap {
     pub fn len(&self) -> usize {
         let state = self.state.read().unwrap();
         state.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        let state = self.state.read().unwrap();
+        state.map.is_empty()
     }
 
     pub fn for_each<CB>(&self, mut f: CB)

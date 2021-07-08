@@ -171,7 +171,7 @@ async fn do_create() -> Result<(), Box<dyn Error>> {
     let region = REGION;
     let bucket_name = BUCKET_NAME;
     let pool_name = POOL_NAME;
-    let guid = PoolGUID(POOL_GUID);
+    let guid = PoolGuid(POOL_GUID);
 
     client
         .create_pool(
@@ -190,7 +190,7 @@ async fn do_create() -> Result<(), Box<dyn Error>> {
 }
 
 async fn do_write() -> Result<(), Box<dyn Error>> {
-    let guid = PoolGUID(1234);
+    let guid = PoolGuid(1234);
     let (mut client, next_txg, mut next_block) = setup_client(guid).await;
 
     let begin = Instant::now();
@@ -210,7 +210,7 @@ async fn do_write() -> Result<(), Box<dyn Error>> {
         //println!("requesting write of {}B", len);
         client.write_block(guid, next_block, &data).await;
         //println!("writing {}B to {:?}...", len, id);
-        next_block = BlockID(next_block.0 + 1);
+        next_block = BlockId(next_block.0 + 1);
     }
     client.flush_writes(guid).await;
     client.get_responses_join(task).await;
@@ -223,7 +223,7 @@ async fn do_write() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn setup_client(guid: PoolGUID) -> (Client, TXG, BlockID) {
+async fn setup_client(guid: PoolGuid) -> (Client, Txg, BlockId) {
     let mut client = Client::connect().await;
 
     let bucket_name = BUCKET_NAME;
@@ -246,14 +246,14 @@ async fn setup_client(guid: PoolGUID) -> (Client, TXG, BlockID) {
         .await;
 
     let nvl = client.get_next_response().await;
-    let txg = TXG(nvl.lookup_uint64("next txg").unwrap());
-    let block = BlockID(nvl.lookup_uint64("next block").unwrap());
+    let txg = Txg(nvl.lookup_uint64("next txg").unwrap());
+    let block = BlockId(nvl.lookup_uint64("next block").unwrap());
 
     (client, txg, block)
 }
 
 async fn do_read() -> Result<(), Box<dyn Error>> {
-    let guid = PoolGUID(1234);
+    let guid = PoolGuid(1234);
     let (mut client, _, _) = setup_client(guid).await;
 
     let max = 1000;
@@ -263,7 +263,7 @@ async fn do_read() -> Result<(), Box<dyn Error>> {
     let task = client.get_responses_initiate(n);
 
     for _ in 0..n {
-        let id = BlockID((thread_rng().gen::<u64>() + 1) % max);
+        let id = BlockId((thread_rng().gen::<u64>() + 1) % max);
         client.read_block(guid, id).await;
     }
 
@@ -275,13 +275,13 @@ async fn do_read() -> Result<(), Box<dyn Error>> {
 }
 
 async fn do_free() -> Result<(), Box<dyn Error>> {
-    let guid = PoolGUID(1234);
+    let guid = PoolGuid(1234);
     let (mut client, mut next_txg, mut next_block) = setup_client(guid).await;
 
     // write some blocks, which we will then free some of
 
     client.begin_txg(guid, next_txg).await;
-    next_txg = TXG(next_txg.0 + 1);
+    next_txg = Txg(next_txg.0 + 1);
 
     let num_writes: usize = 10000;
     let task = client.get_responses_initiate(num_writes);
@@ -298,7 +298,7 @@ async fn do_free() -> Result<(), Box<dyn Error>> {
         client.write_block(guid, next_block, &data).await;
         //println!("writing {}B to {:?}...", len, id);
         ids.push(next_block);
-        next_block = BlockID(next_block.0 + 1);
+        next_block = BlockId(next_block.0 + 1);
     }
     client.flush_writes(guid).await;
     client.get_responses_join(task).await;
@@ -365,7 +365,7 @@ async fn print_super(
     let split: Vec<&str> = pool_key.rsplitn(3, '/').collect();
     let guid_str: &str = split[1];
     if let Ok(guid64) = str::parse::<u64>(guid_str) {
-        let guid = PoolGUID(guid64);
+        let guid = PoolGuid(guid64);
         match Pool::get_config(&object_access, guid).await {
             Ok(pool_config) => {
                 let name = pool_config.lookup_string("name").unwrap();

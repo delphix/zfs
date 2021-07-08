@@ -5,6 +5,8 @@ use crate::zettacache::ZettaCache;
 use log::*;
 use nvpair::{NvData, NvEncoding, NvList, NvListRef};
 use rusoto_s3::S3;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::{cmp::max, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -18,9 +20,9 @@ pub struct Server {
     output: Arc<tokio::sync::Mutex<OwnedWriteHalf>>,
     // Pool is Some once we get a "open pool" request
     pool: Option<Arc<Pool>>,
-    num_outstanding_writes: Arc<std::sync::Mutex<usize>>,
+    num_outstanding_writes: Arc<AtomicUsize>,
     // XXX make Option?
-    max_blockid: BlockID, // Maximum blockID that we've received a write for
+    max_blockid: BlockId, // Maximum blockID that we've received a write for
 }
 
 impl Server {
@@ -49,8 +51,8 @@ impl Server {
             input: r,
             output: Arc::new(Mutex::new(w)),
             pool: None,
-            num_outstanding_writes: Arc::new(std::sync::Mutex::new(0)),
-            max_blockid: BlockID(0),
+            num_outstanding_writes: Arc::new(AtomicUsize::new(0)),
+            max_blockid: BlockId(0),
         };
         tokio::spawn(async move {
             loop {
@@ -81,8 +83,8 @@ impl Server {
             input: r,
             output: Arc::new(Mutex::new(w)),
             pool: None,
-            num_outstanding_writes: Arc::new(std::sync::Mutex::new(0)),
-            max_blockid: BlockID(0),
+            num_outstanding_writes: Arc::new(AtomicUsize::new(0)),
+            max_blockid: BlockId(0),
         };
         tokio::spawn(async move {
             loop {
@@ -100,7 +102,7 @@ impl Server {
                         // XXX we should also be able to time out and flush even
                         // if we are getting lots of reads.
                         if server.pool.is_some()
-                            && *server.num_outstanding_writes.lock().unwrap() > 0
+                            && server.num_outstanding_writes.load(Ordering::Acquire) > 0
                         {
                             trace!("timeout; flushing writes");
                             server.flush_writes();
@@ -122,7 +124,7 @@ impl Server {
                     "create pool" => {
                         // XXX nvl includes credentials; need to redact?
                         info!("got request: {:?}", nvl);
-                        let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
+                        let guid = PoolGuid(nvl.lookup_uint64("GUID").unwrap());
                         let name = nvl.lookup_string("name").unwrap();
                         let object_access = Self::get_object_access(nvl.as_ref());
                         server
@@ -132,7 +134,7 @@ impl Server {
                     "open pool" => {
                         // XXX nvl includes credentials; need to redact?
                         info!("got request: {:?}", nvl);
-                        let guid = PoolGUID(nvl.lookup_uint64("GUID").unwrap());
+                        let guid = PoolGuid(nvl.lookup_uint64("GUID").unwrap());
                         let object_access = Self::get_object_access(nvl.as_ref());
                         server
                             .open_pool(&object_access, guid, cache.as_ref().cloned())
@@ -140,12 +142,12 @@ impl Server {
                     }
                     "begin txg" => {
                         debug!("got request: {:?}", nvl);
-                        let txg = TXG(nvl.lookup_uint64("TXG").unwrap());
+                        let txg = Txg(nvl.lookup_uint64("TXG").unwrap());
                         server.begin_txg(txg);
                     }
                     "resume txg" => {
                         info!("got request: {:?}", nvl);
-                        let txg = TXG(nvl.lookup_uint64("TXG").unwrap());
+                        let txg = Txg(nvl.lookup_uint64("TXG").unwrap());
                         server.resume_txg(txg);
                     }
                     "resume complete" => {
@@ -171,7 +173,7 @@ impl Server {
                         }
                     }
                     "write block" => {
-                        let block = BlockID(nvl.lookup_uint64("block").unwrap());
+                        let block = BlockId(nvl.lookup_uint64("block").unwrap());
                         let data = nvl.lookup("data").unwrap().data();
                         let id = nvl.lookup_uint64("request_id").unwrap();
                         if let NvData::Uint8Array(slice) = data {
@@ -188,13 +190,13 @@ impl Server {
                     }
                     "free block" => {
                         trace!("got request: {:?}", nvl);
-                        let block = BlockID(nvl.lookup_uint64("block").unwrap());
+                        let block = BlockId(nvl.lookup_uint64("block").unwrap());
                         let size = nvl.lookup_uint64("size").unwrap();
                         server.free_block(block, size as u32);
                     }
                     "read block" => {
                         trace!("got request: {:?}", nvl);
-                        let block = BlockID(nvl.lookup_uint64("block").unwrap());
+                        let block = BlockId(nvl.lookup_uint64("block").unwrap());
                         let id = nvl.lookup_uint64("request_id").unwrap();
                         server.read_block(block, id);
                     }
@@ -255,11 +257,11 @@ impl Server {
         for buck in buckets {
             let object_access = ObjectAccess::from_client(client, buck.as_str());
             if let Ok(guid) = nvl.lookup_uint64("guid") {
-                if !Pool::exists(&object_access, PoolGUID(guid)).await {
+                if !Pool::exists(&object_access, PoolGuid(guid)).await {
                     client = object_access.release_client();
                     continue;
                 }
-                let pool_config = Pool::get_config(&object_access, PoolGUID(guid)).await;
+                let pool_config = Pool::get_config(&object_access, PoolGuid(guid)).await;
                 if pool_config.is_err() {
                     client = object_access.release_client();
                     continue;
@@ -275,7 +277,7 @@ impl Server {
                 let split: Vec<&str> = prefix.rsplitn(3, '/').collect();
                 let guid_str: &str = split[1];
                 if let Ok(guid64) = str::parse::<u64>(guid_str) {
-                    let guid = PoolGUID(guid64);
+                    let guid = PoolGuid(guid64);
                     // XXX do this in parallel for all guids?
                     match Pool::get_config(&object_access, guid).await {
                         Ok(pool_config) => resp.insert(guid_str, pool_config.as_ref()).unwrap(),
@@ -291,7 +293,7 @@ impl Server {
         Self::send_response(&self.output, resp).await;
     }
 
-    async fn create_pool(&mut self, object_access: &ObjectAccess, guid: PoolGUID, name: &str) {
+    async fn create_pool(&mut self, object_access: &ObjectAccess, guid: PoolGuid, name: &str) {
         Pool::create(object_access, name, guid).await;
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "pool create done").unwrap();
@@ -304,7 +306,7 @@ impl Server {
     async fn open_pool(
         &mut self,
         object_access: &ObjectAccess,
-        guid: PoolGUID,
+        guid: PoolGuid,
         cache: Option<ZettaCache>,
     ) {
         let (pool, phys_opt, next_block) = Pool::open(object_access, guid, cache).await;
@@ -324,13 +326,13 @@ impl Server {
     }
 
     // no response
-    fn begin_txg(&mut self, txg: TXG) {
+    fn begin_txg(&mut self, txg: Txg) {
         let pool = self.pool.as_ref().unwrap().clone();
         pool.begin_txg(txg);
     }
 
     // no response
-    fn resume_txg(&mut self, txg: TXG) {
+    fn resume_txg(&mut self, txg: Txg) {
         let pool = self.pool.as_ref().unwrap().clone();
         pool.resume_txg(txg);
     }
@@ -356,7 +358,7 @@ impl Server {
         let output = self.output.clone();
         // client should have already flushed all writes
         // XXX change to an error return
-        assert_eq!(*self.num_outstanding_writes.lock().unwrap(), 0);
+        assert_eq!(self.num_outstanding_writes.load(Ordering::Acquire), 0);
         tokio::spawn(async move {
             let stats = pool.end_txg(uberblock, config).await;
             let mut nvl = NvList::new_unique_names();
@@ -375,23 +377,17 @@ impl Server {
 
     /// queue write, sends response when completed (persistent).  Does not block.
     /// completion may not happen until flush_pool() is called
-    fn write_block(&mut self, block: BlockID, data: Vec<u8>, request_id: u64) {
+    fn write_block(&mut self, block: BlockId, data: Vec<u8>, request_id: u64) {
         self.max_blockid = max(block, self.max_blockid);
         let pool = self.pool.as_ref().unwrap().clone();
         let output = self.output.clone();
-        let now = self.num_outstanding_writes.clone();
-        let mut count = now.lock().unwrap();
-        *count += 1;
-        drop(count);
+        self.num_outstanding_writes.fetch_add(1, Ordering::Release);
         // Need to write_block() before spawning, so that the Pool knows what's been written before resume_complete()
         let fut = pool.write_block(block, data);
+        let now = self.num_outstanding_writes.clone();
         tokio::spawn(async move {
             fut.await;
-            // Note: {braces} needed so that lock is dropped before the .await
-            {
-                let mut count = now.lock().unwrap();
-                *count -= 1;
-            }
+            now.fetch_sub(1, Ordering::Release);
             let mut nvl = NvList::new_unique_names();
             nvl.insert("Type", "write done").unwrap();
             nvl.insert("block", &block.0).unwrap();
@@ -402,13 +398,13 @@ impl Server {
     }
 
     /// initiate free.  No response.  Does not block.  Completes when the current txg is ended.
-    fn free_block(&mut self, block: BlockID, size: u32) {
+    fn free_block(&mut self, block: BlockId, size: u32) {
         let pool = self.pool.as_ref().unwrap().clone();
         pool.free_block(block, size);
     }
 
     /// initiate read, sends response when completed.  Does not block.
-    fn read_block(&mut self, block: BlockID, request_id: u64) {
+    fn read_block(&mut self, block: BlockId, request_id: u64) {
         let pool = self.pool.as_ref().unwrap().clone();
         let output = self.output.clone();
         tokio::spawn(async move {

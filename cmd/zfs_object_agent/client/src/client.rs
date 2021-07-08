@@ -73,7 +73,7 @@ impl Client {
         region: &str,
         endpoint: &str,
         bucket_name: &str,
-        guid: PoolGUID,
+        guid: PoolGuid,
         name: &str,
     ) {
         let mut nvl = NvList::new_unique_names();
@@ -97,7 +97,7 @@ impl Client {
         region: &str,
         endpoint: &str,
         bucket_name: &str,
-        guid: PoolGUID,
+        guid: PoolGuid,
     ) {
         let mut nvl = NvList::new_unique_names();
         let credentials = Self::get_credential_string(aws_key_id, secret_key);
@@ -111,7 +111,7 @@ impl Client {
         self.send_request(nvl.as_ref()).await;
     }
 
-    pub async fn read_block(&mut self, guid: PoolGUID, block: BlockID) {
+    pub async fn read_block(&mut self, guid: PoolGuid, block: BlockId) {
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "read block").unwrap();
         nvl.insert("GUID", &guid.0).unwrap();
@@ -120,7 +120,7 @@ impl Client {
         self.send_request(nvl.as_ref()).await;
     }
 
-    pub async fn write_block(&mut self, guid: PoolGUID, block: BlockID, data: &[u8]) {
+    pub async fn write_block(&mut self, guid: PoolGuid, block: BlockId, data: &[u8]) {
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "write block").unwrap();
         nvl.insert("GUID", &guid.0).unwrap();
@@ -129,7 +129,7 @@ impl Client {
         self.send_request(nvl.as_ref()).await;
     }
 
-    pub async fn free_block(&mut self, guid: PoolGUID, block: BlockID) {
+    pub async fn free_block(&mut self, guid: PoolGuid, block: BlockId) {
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "free block").unwrap();
         nvl.insert("GUID", &guid.0).unwrap();
@@ -137,7 +137,7 @@ impl Client {
         self.send_request(nvl.as_ref()).await;
     }
 
-    pub async fn begin_txg(&mut self, guid: PoolGUID, txg: TXG) {
+    pub async fn begin_txg(&mut self, guid: PoolGuid, txg: Txg) {
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "begin txg").unwrap();
         nvl.insert("GUID", &guid.0).unwrap();
@@ -145,7 +145,7 @@ impl Client {
         self.send_request(nvl.as_ref()).await;
     }
 
-    pub async fn end_txg(&mut self, guid: PoolGUID, uberblock: &[u8]) {
+    pub async fn end_txg(&mut self, guid: PoolGuid, uberblock: &[u8]) {
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "end txg").unwrap();
         nvl.insert("GUID", &guid.0).unwrap();
@@ -153,7 +153,7 @@ impl Client {
         self.send_request(nvl.as_ref()).await;
     }
 
-    pub async fn flush_writes(&mut self, guid: PoolGUID) {
+    pub async fn flush_writes(&mut self, guid: PoolGuid) {
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "flush writes").unwrap();
         nvl.insert("GUID", &guid.0).unwrap();

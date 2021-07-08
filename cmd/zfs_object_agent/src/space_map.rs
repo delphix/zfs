@@ -53,7 +53,7 @@ impl SpaceMap {
         phys: SpaceMapPhys,
     ) -> SpaceMap {
         SpaceMap {
-            log: BlockBasedLog::open(block_access.clone(), extent_allocator.clone(), phys.log),
+            log: BlockBasedLog::open(block_access, extent_allocator, phys.log),
             coverage: phys.coverage,
         }
     }

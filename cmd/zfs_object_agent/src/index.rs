@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
 pub struct IndexKey {
-    pub guid: PoolGUID,
-    pub block: BlockID,
+    pub guid: PoolGuid,
+    pub block: BlockId,
 }
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
