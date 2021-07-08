@@ -2798,9 +2798,16 @@ metaslab_fini(metaslab_t *msp)
 	 * subtracted.
 	 */
 	if (!msp->ms_new) {
+		int64_t allocated;
+		if (vdev_is_object_based(vd)) {
+			// object-based vdevs have a single placeholder metaslab
+			ASSERT0(msp->ms_id);
+			allocated = vd->vdev_stat.vs_alloc;
+		} else {
+			allocated = metaslab_allocated_space(msp);
+		}
 		metaslab_space_update(vd, mg->mg_class,
-		    -metaslab_allocated_space(msp), 0, -msp->ms_size);
-
+		    -allocated, 0, -msp->ms_size);
 	}
 	space_map_close(msp->ms_sm);
 	msp->ms_sm = NULL;
