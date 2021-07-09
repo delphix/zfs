@@ -1,4 +1,5 @@
 use crate::base_types::*;
+use crate::heartbeat::HeartbeatGuard;
 use crate::object_access::ObjectAccess;
 use crate::object_based_log::*;
 use crate::object_block_map::ObjectBlockMap;
@@ -273,6 +274,7 @@ pub struct PoolState {
     object_block_map: ObjectBlockMap,
     zettacache: Option<ZettaCache>,
     pub shared_state: Arc<PoolSharedState>,
+    _heartbeat_guard: Option<HeartbeatGuard>, // Used for RAII
 }
 
 /// state that's modified while syncing a txg
@@ -427,6 +429,7 @@ impl Pool {
         pool_phys: &PoolPhys,
         txg: Txg,
         cache: Option<ZettaCache>,
+        heartbeat_guard: Option<HeartbeatGuard>,
     ) -> (Pool, Option<UberblockPhys>, BlockId) {
         let phys = UberblockPhys::get(object_access, pool_phys.guid, txg)
             .await
@@ -473,6 +476,7 @@ impl Pool {
                 })),
                 zettacache: cache,
                 object_block_map,
+                _heartbeat_guard: heartbeat_guard,
             }),
         };
 
@@ -502,6 +506,7 @@ impl Pool {
         object_access: &ObjectAccess,
         guid: PoolGuid,
         cache: Option<ZettaCache>,
+        heartbeat_guard: Option<HeartbeatGuard>,
     ) -> (Pool, Option<UberblockPhys>, BlockId) {
         let phys = PoolPhys::get(object_access, guid).await.unwrap();
         if phys.last_txg.0 == 0 {
@@ -542,6 +547,7 @@ impl Pool {
                     })),
                     zettacache: cache,
                     object_block_map,
+                    _heartbeat_guard: heartbeat_guard,
                 }),
             };
 
@@ -550,7 +556,7 @@ impl Pool {
                 .with_syncing_state(|syncing_state| syncing_state.next_block());
             (pool, None, next_block)
         } else {
-            Pool::open_from_txg(object_access, &phys, phys.last_txg, cache).await
+            Pool::open_from_txg(object_access, &phys, phys.last_txg, cache, heartbeat_guard).await
         }
     }
 

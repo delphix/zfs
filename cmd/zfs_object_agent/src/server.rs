@@ -8,11 +8,9 @@ use anyhow::Context;
 use log::*;
 use nvpair::{NvData, NvEncoding, NvList, NvListRef};
 use rusoto_s3::S3;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::{cmp::max, sync::Arc};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use serde::{Deserialize, Serialize};
 use std::{
     cmp::max,
     fs::File,
@@ -21,15 +19,13 @@ use std::{
     sync::Arc,
     time::{Instant, SystemTime},
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixListener;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
+use tokio::time::sleep;
 use tokio::time::Duration;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    time::sleep,
-};
 use uuid::Uuid;
 const CLAIM_DURATION: Duration = Duration::from_secs(2);
 
@@ -41,16 +37,16 @@ enum OwnResult {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 struct PoolOwnerPhys {
-    id: PoolGUID,
+    id: PoolGuid,
     owner: Uuid,
 }
 
 impl PoolOwnerPhys {
-    fn key(id: PoolGUID) -> String {
+    fn key(id: PoolGuid) -> String {
         format!("zfs/{}/owner", id.to_string())
     }
 
-    async fn get(object_access: &ObjectAccess, id: PoolGUID) -> anyhow::Result<Self> {
+    async fn get(object_access: &ObjectAccess, id: PoolGuid) -> anyhow::Result<Self> {
         let key = Self::key(id);
         let buf = object_access.get_object_impl(&key, None).await?;
         let this: Self = serde_json::from_slice(&buf)
@@ -75,7 +71,7 @@ impl PoolOwnerPhys {
             .await
     }
 
-    async fn delete(object_access: &ObjectAccess, id: PoolGUID) {
+    async fn delete(object_access: &ObjectAccess, id: PoolGuid) {
         object_access.delete_object(&Self::key(id)).await;
     }
 }
@@ -155,8 +151,6 @@ impl Server {
             readonly: true,
         };
         tokio::spawn(async move {
-            // Used for RAII
-            let mut _heartbeat_guard;
             loop {
                 let nvl = match tokio::time::timeout(
                     Duration::from_millis(100),
@@ -199,8 +193,6 @@ impl Server {
                         let name = nvl.lookup_string("name").unwrap();
                         let object_access = Self::get_object_access(nvl.as_ref());
                         server.readonly = false;
-                        _heartbeat_guard =
-                            heartbeat::start_heartbeat(object_access.clone(), id).await;
 
                         server
                             .create_pool(&object_access, guid, name.to_str().unwrap())
@@ -212,10 +204,6 @@ impl Server {
                         let guid = PoolGuid(nvl.lookup_uint64("GUID").unwrap());
                         let object_access = Self::get_object_access(nvl.as_ref());
                         server.readonly = nvl.lookup("readonly").is_ok();
-                        if !server.readonly {
-                            _heartbeat_guard =
-                                heartbeat::start_heartbeat(object_access.clone(), id).await;
-                        }
                         server
                             .open_pool(
                                 &object_access,
@@ -394,7 +382,7 @@ impl Server {
     async fn try_claim_pool(
         &self,
         object_access: &ObjectAccess,
-        guid: PoolGUID,
+        guid: PoolGuid,
         id: Uuid,
     ) -> OwnResult {
         let start = Instant::now();
@@ -477,7 +465,7 @@ impl Server {
         return OwnResult::Success;
     }
 
-    async fn unclaim_pool(&self, object_access: &ObjectAccess, guid: PoolGUID) {
+    async fn unclaim_pool(&self, object_access: &ObjectAccess, guid: PoolGuid) {
         PoolOwnerPhys::delete(object_access, guid).await;
     }
 
@@ -519,12 +507,22 @@ impl Server {
     async fn open_pool(
         &mut self,
         object_access: &ObjectAccess,
-        guid: PoolGUID,
+        guid: PoolGuid,
         id: Uuid,
         readonly: bool,
         cache: Option<ZettaCache>,
     ) {
-        let (pool, phys_opt, next_block) = Pool::open(object_access, guid, cache).await;
+        let (pool, phys_opt, next_block) = Pool::open(
+            object_access,
+            guid,
+            cache,
+            if !readonly {
+                Some(heartbeat::start_heartbeat(object_access.clone(), id).await)
+            } else {
+                None
+            },
+        )
+        .await;
         if !readonly {
             if let Some(nvl) = self.claim_pool(object_access, guid, id).await {
                 debug!("sending response: {:?}", nvl);
