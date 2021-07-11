@@ -1,5 +1,5 @@
 use crate::base_types::*;
-use crate::connection::Connection;
+use crate::connection::Server;
 use crate::object_access::ObjectAccess;
 use crate::pool::*;
 use crate::zettacache::ZettaCache;
@@ -8,18 +8,43 @@ use futures::Future;
 use log::*;
 use nvpair::{NvData, NvList, NvListRef};
 use rusoto_s3::S3;
+use std::cmp::max;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
-use std::{cmp::max, sync::Arc};
-use tokio::net::UnixListener;
-use tokio::net::UnixStream;
+use tokio::time::sleep;
 
+struct KernelServerState {
+    cache: Option<ZettaCache>,
+}
+
+impl KernelServerState {
+    fn connection_handler(&self) -> KernelConnectionState {
+        KernelConnectionState {
+            cache: self.cache.as_ref().cloned(),
+            ..Default::default()
+        }
+    }
+
+    fn start(socket_dir: &str, cache: Option<ZettaCache>) {
+        let socket_path = format!("{}/zfs_kernel_socket", socket_dir);
+        let mut server = Server::new(
+            &socket_path,
+            KernelServerState { cache },
+            Box::new(Self::connection_handler),
+        );
+
+        KernelConnectionState::register(&mut server);
+        server.start();
+    }
+}
+
+#[derive(Default)]
 struct KernelConnectionState {
     pool: Option<Arc<Pool>>,
     num_outstanding_writes: Arc<AtomicUsize>,
-    // XXX make Option?
-    max_blockid: BlockId, // Maximum blockID that we've received a write for
+    max_blockid: Option<BlockId>, // Maximum blockID that we've received a write for
     cache: Option<ZettaCache>,
 }
 
@@ -124,7 +149,9 @@ impl KernelConnectionState {
     fn flush_writes(&mut self, nvl: NvList) -> impl Future<Output = Option<NvList>> {
         trace!("got request: {:?}", nvl);
         let pool = self.pool.as_ref().unwrap();
-        pool.initiate_flush(self.max_blockid);
+        if let Some(max_blockid) = self.max_blockid {
+            pool.initiate_flush(max_blockid);
+        }
         future::ready(None)
     }
 
@@ -181,7 +208,11 @@ impl KernelConnectionState {
                 slice.len()
             );
 
-            self.max_blockid = max(block, self.max_blockid);
+            self.max_blockid = Some(match self.max_blockid {
+                Some(max_blockid) => max(block, max_blockid),
+                None => block,
+            });
+
             let pool = self.pool.as_ref().unwrap().clone();
             self.num_outstanding_writes.fetch_add(1, Ordering::Release);
             // Need to write_block() before spawning, so that the Pool knows what's been written before resume_complete()
@@ -240,51 +271,53 @@ impl KernelConnectionState {
     fn timeout(&mut self) {
         if let Some(pool) = &self.pool {
             if self.num_outstanding_writes.load(Ordering::Acquire) > 0 {
-                trace!("timeout; flushing writes");
-                pool.initiate_flush(self.max_blockid);
+                if let Some(max_blockid) = self.max_blockid {
+                    trace!("timeout; flushing writes");
+                    pool.initiate_flush(max_blockid);
+                }
             }
         }
     }
 
-    fn start(stream: UnixStream, cache: Option<ZettaCache>) {
-        let mut connection = Connection::new(
-            stream,
-            KernelConnectionState {
-                pool: None,
-                num_outstanding_writes: Default::default(),
-                max_blockid: BlockId(0),
-                cache,
-            },
-        );
+    fn register(server: &mut Server<KernelServerState, KernelConnectionState>) {
+        server.register_serial_handler("create pool", Box::new(Self::create_pool));
+        server.register_serial_handler("open pool", Box::new(Self::open_pool));
+        server.register_serial_handler("resume complete", Box::new(Self::resume_complete));
 
-        connection
-            .register_serial_handler("create pool", Box::new(KernelConnectionState::create_pool));
-        connection.register_serial_handler("open pool", Box::new(KernelConnectionState::open_pool));
-        connection.register_serial_handler(
-            "resume complete",
-            Box::new(KernelConnectionState::resume_complete),
-        );
+        server.register_timeout_handler(Duration::from_millis(100), Box::new(Self::timeout));
 
-        connection.register_timeout_handler(
-            Duration::from_millis(100),
-            Box::new(KernelConnectionState::timeout),
-        );
-
-        connection.register_handler("begin txg", Box::new(KernelConnectionState::begin_txg));
-        connection.register_handler("resume txg", Box::new(KernelConnectionState::resume_txg));
-        connection.register_handler(
-            "flush writes",
-            Box::new(KernelConnectionState::flush_writes),
-        );
-        connection.register_handler("end txg", Box::new(KernelConnectionState::end_txg));
-        connection.register_handler("write block", Box::new(KernelConnectionState::write_block));
-        connection.register_handler("free block", Box::new(KernelConnectionState::free_block));
-        connection.register_handler("read block", Box::new(KernelConnectionState::read_block));
-
-        connection.start();
+        server.register_handler("begin txg", Box::new(Self::begin_txg));
+        server.register_handler("resume txg", Box::new(Self::resume_txg));
+        server.register_handler("flush writes", Box::new(Self::flush_writes));
+        server.register_handler("end txg", Box::new(Self::end_txg));
+        server.register_handler("write block", Box::new(Self::write_block));
+        server.register_handler("free block", Box::new(Self::free_block));
+        server.register_handler("read block", Box::new(Self::read_block));
     }
 }
 
+struct UserServerState {}
+
+impl UserServerState {
+    fn connection_handler(&self) -> UserConnectionState {
+        UserConnectionState {}
+    }
+
+    fn start(socket_dir: &str) {
+        let socket_path = format!("{}/zfs_user_socket", socket_dir);
+        let mut server = Server::new(
+            &socket_path,
+            UserServerState {},
+            Box::new(Self::connection_handler),
+        );
+
+        UserConnectionState::register(&mut server);
+
+        server.start();
+    }
+}
+
+#[derive(Default)]
 struct UserConnectionState {}
 
 impl UserConnectionState {
@@ -352,107 +385,23 @@ impl UserConnectionState {
         debug!("sending response: {:?}", resp);
         Some(resp)
     }
-}
 
-struct Server {}
-
-impl Server {
-    pub fn ustart(stream: UnixStream) {
-        let mut connection = Connection::new(stream, UserConnectionState {});
-
-        connection.register_handler("get pools", Box::new(UserConnectionState::get_pools));
-        connection.start();
+    fn register(server: &mut Server<UserServerState, UserConnectionState>) {
+        server.register_handler("get pools", Box::new(Self::get_pools));
     }
-
-    pub fn start(connection: UnixStream, cache: Option<ZettaCache>) {
-        KernelConnectionState::start(connection, cache);
-        // XXX remove all below
-        /*
-        tokio::spawn(async move {
-            loop {
-                let nvl = match tokio::time::timeout(
-                    Duration::from_millis(100),
-                    Self::get_next_request(&mut server.input),
-                )
-                .await
-                {
-                    Err(_) => {
-                        // timed out. Note that we can not call flush_writes()
-                        // while in the middle of a end_txg(). So we only do it
-                        // while there are writes in progress, which can't be
-                        // the case during an end_txg().
-                        // XXX we should also be able to time out and flush even
-                        // if we are getting lots of reads.
-                        if server.pool.is_some()
-                            && server.num_outstanding_writes.load(Ordering::Acquire) > 0
-                        {
-                            trace!("timeout; flushing writes");
-                            server.flush_writes();
-                        }
-                        continue;
-                    }
-                    Ok(getreq_result) => match getreq_result {
-                        Err(_) => {
-                            info!(
-                                "got error reading from kernel connection: {:?}",
-                                getreq_result
-                            );
-                            return;
-                        }
-                        Ok(mynvl) => mynvl,
-                    },
-                };
-            }
-        });
-        */
-    }
-}
-
-fn create_listener(path: String) -> UnixListener {
-    let _ = std::fs::remove_file(&path);
-    info!("Listening on: {}", path);
-    UnixListener::bind(&path).unwrap()
 }
 
 pub async fn do_server(socket_dir: &str, cache_path: Option<&str>) {
-    let ksocket_name = format!("{}/zfs_kernel_socket", socket_dir);
-    let usocket_name = format!("{}/zfs_user_socket", socket_dir);
-
-    let klistener = create_listener(ksocket_name.clone());
-    let ulistener = create_listener(usocket_name.clone());
-
-    let ujh = tokio::spawn(async move {
-        loop {
-            match ulistener.accept().await {
-                Ok((socket, _)) => {
-                    info!("accepted connection on {}", usocket_name);
-                    self::Server::ustart(socket);
-                }
-                Err(e) => {
-                    warn!("accept() on {} failed: {}", usocket_name, e);
-                }
-            }
-        }
-    });
+    UserServerState::start(socket_dir);
 
     let cache = match cache_path {
         Some(path) => Some(ZettaCache::open(path).await),
         None => None,
     };
-    let kjh = tokio::spawn(async move {
-        loop {
-            match klistener.accept().await {
-                Ok((socket, _)) => {
-                    info!("accepted connection on {}", ksocket_name);
-                    self::Server::start(socket, cache.as_ref().cloned());
-                }
-                Err(e) => {
-                    warn!("accept() on {} failed: {}", ksocket_name, e);
-                }
-            }
-        }
-    });
+    KernelServerState::start(socket_dir, cache);
 
-    ujh.await.unwrap();
-    kjh.await.unwrap();
+    // keep the process from exiting
+    loop {
+        sleep(Duration::from_secs(60)).await;
+    }
 }

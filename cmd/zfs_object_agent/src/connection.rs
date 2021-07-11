@@ -7,15 +7,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
-pub struct Connection<S> {
-    state: S,
-    timeout: Option<(Duration, Box<dyn TimeoutHandler<S>>)>,
-    handlers: HashMap<String, HandlerEnum<S>>,
-    input: OwnedReadHalf,
-    output: Arc<Mutex<OwnedWriteHalf>>,
+pub struct Server<Ss, Cs> {
+    socket_path: String,
+    state: Ss,
+    connection_handler: Box<ConnectionHandler<Ss, Cs>>,
+    timeout: Option<(Duration, Box<TimeoutHandler<Cs>>)>,
+    handlers: HashMap<String, HandlerEnum<Cs>>,
 }
 
 enum HandlerEnum<S> {
@@ -31,18 +31,6 @@ pub trait Handler<S>: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Option<NvList>> + Send>>;
 }
 
-pub trait SerialHandler<S>: Send + Sync + 'static {
-    fn invoke(
-        &self,
-        state: S,
-        request: NvList,
-    ) -> Pin<Box<dyn Future<Output = (S, Option<NvList>)> + Send>>;
-}
-
-pub trait TimeoutHandler<S>: Send + Sync + 'static {
-    fn invoke(&self, state: &mut S);
-}
-
 impl<F: Send + Sync + 'static, Fut, S: Send> Handler<S> for F
 where
     F: Fn(&mut S, NvList) -> Fut,
@@ -53,17 +41,16 @@ where
         state: &mut S,
         request: NvList,
     ) -> Pin<Box<dyn Future<Output = Option<NvList>> + Send + 'static>> {
-        Box::pin((self)(state, request))
+        Box::pin(self(state, request))
     }
 }
 
-impl<F: Send + Sync + 'static, S: Send> TimeoutHandler<S> for F
-where
-    F: Fn(&mut S),
-{
-    fn invoke(&self, state: &mut S) {
-        (self)(state)
-    }
+pub trait SerialHandler<S>: Send + Sync + 'static {
+    fn invoke(
+        &self,
+        state: S,
+        request: NvList,
+    ) -> Pin<Box<dyn Future<Output = (S, Option<NvList>)> + Send>>;
 }
 
 impl<F: Send + Sync + 'static, Fut, S: Send> SerialHandler<S> for F
@@ -76,24 +63,45 @@ where
         state: S,
         request: NvList,
     ) -> Pin<Box<(dyn Future<Output = (S, Option<NvList>)> + Send + 'static)>> {
-        Box::pin((self)(state, request))
+        Box::pin(self(state, request))
     }
 }
 
-impl<S: Send + 'static> Connection<S> {
-    pub fn new(stream: UnixStream, state: S) -> Connection<S> {
-        let (input, output) = stream.into_split();
-        Connection {
-            input,
-            output: Arc::new(Mutex::new(output)),
+/*
+pub trait TimeoutHandler<S>: Send + Sync + 'static {
+    fn invoke(&self, state: &mut S);
+}
+
+impl<F: Send + Sync + 'static, S: Send> TimeoutHandler<S> for F
+where
+    F: Fn(&mut S),
+{
+    fn invoke(&self, state: &mut S) {
+        self(state)
+    }
+}
+*/
+
+type TimeoutHandler<S> = dyn Fn(&mut S) + Send + Sync + 'static;
+type ConnectionHandler<Svr, State> = dyn Fn(&Svr) -> State + Send + Sync + 'static;
+
+impl<Ss: Send + Sync + 'static, Cs: Send + Sync + 'static> Server<Ss, Cs> {
+    pub fn new(
+        socket_path: &str,
+        state: Ss,
+        connection_handler: Box<ConnectionHandler<Ss, Cs>>,
+    ) -> Server<Ss, Cs> {
+        Server {
+            socket_path: socket_path.to_owned(),
             state,
+            connection_handler,
             timeout: None,
             handlers: Default::default(),
         }
     }
 
     /// Regular, concurrent operations.  The server runs the handler's future in a new task.
-    pub fn register_handler(&mut self, request_type: &str, handler: Box<dyn Handler<S>>) {
+    pub fn register_handler(&mut self, request_type: &str, handler: Box<dyn Handler<Cs>>) {
         self.handlers
             .insert(request_type.to_owned(), HandlerEnum::Concurrent(handler));
     }
@@ -101,7 +109,7 @@ impl<S: Send + 'static> Connection<S> {
     pub fn register_timeout_handler(
         &mut self,
         timeout: Duration,
-        handler: Box<dyn TimeoutHandler<S>>,
+        handler: Box<TimeoutHandler<Cs>>,
     ) {
         self.timeout = Some((timeout, handler));
     }
@@ -111,15 +119,36 @@ impl<S: Send + 'static> Connection<S> {
     pub fn register_serial_handler(
         &mut self,
         request_type: &str,
-        handler: Box<dyn SerialHandler<S>>,
+        handler: Box<dyn SerialHandler<Cs>>,
     ) {
         self.handlers
             .insert(request_type.to_owned(), HandlerEnum::Serial(handler));
     }
 
-    async fn get_next_request(&mut self) -> tokio::io::Result<NvList> {
+    pub fn start(self) {
+        let arc = Arc::new(self);
+        info!("Listening on: {}", arc.socket_path);
+        let _ = std::fs::remove_file(&arc.socket_path);
+        let listener = UnixListener::bind(&arc.socket_path).unwrap();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        info!("accepted connection on {}", arc.socket_path);
+                        let connection_state = (arc.connection_handler)(&arc.state);
+                        Self::start_connection(arc.clone(), stream, connection_state);
+                    }
+                    Err(e) => {
+                        warn!("accept() on {} failed: {}", arc.socket_path, e);
+                    }
+                }
+            }
+        });
+    }
+
+    async fn get_next_request(input: &mut OwnedReadHalf) -> tokio::io::Result<NvList> {
         // XXX kernel sends this as host byte order
-        let len64 = self.input.read_u64_le().await?;
+        let len64 = input.read_u64_le().await?;
         //println!("got request len: {}", len64);
         if len64 > 20_000_000 {
             // max zfs block size is 16MB
@@ -131,7 +160,7 @@ impl<S: Send + 'static> Connection<S> {
         // to do that using read_buf(), treating the Vec as a BufMut, but will
         // require multiple calls to do the equivalent of read_exact().
         v.resize(len64 as usize, 0);
-        self.input.read_exact(v.as_mut()).await?;
+        input.read_exact(v.as_mut()).await?;
         let nvl = NvList::try_unpack(v.as_ref()).unwrap();
         Ok(nvl)
     }
@@ -148,11 +177,14 @@ impl<S: Send + 'static> Connection<S> {
         w.write_all(buf.as_slice()).await.unwrap();
     }
 
-    pub fn start(mut self) {
+    fn start_connection(server: Arc<Server<Ss, Cs>>, stream: UnixStream, mut state: Cs) {
+        let (mut input, output) = stream.into_split();
+        let output = Arc::new(Mutex::new(output));
+
         tokio::spawn(async move {
             loop {
                 /*
-                let nvl = match self.get_next_request().await {
+                let nvl = match conn.get_next_request().await {
                     Err(e) => {
                         info!("got error reading from connection: {:?}", e);
                         return;
@@ -160,20 +192,22 @@ impl<S: Send + 'static> Connection<S> {
                     Ok(nvl) => nvl,
                 };
                 */
-                let result = match &self.timeout {
+                let result = match &server.timeout {
                     Some((duration, _handler)) => {
-                        match tokio::time::timeout(*duration, self.get_next_request()).await {
+                        match tokio::time::timeout(*duration, Self::get_next_request(&mut input))
+                            .await
+                        {
                             Ok(result) => result,
                             Err(_) => {
                                 // timed out.
-                                // ugh so icky but we can't hold a ref to the handler across self.get_next_request()
-                                self.timeout.as_ref().unwrap().1.invoke(&mut self.state);
-                                //handler.invoke(&mut self.state);
+                                // ugh so icky but we can't hold a ref to the handler across conn.get_next_request()
+                                server.timeout.as_ref().unwrap().1(&mut state);
+                                //handler.invoke(&mut conn.state);
                                 continue;
                             }
                         }
                     }
-                    None => self.get_next_request().await,
+                    None => Self::get_next_request(&mut input).await,
                 };
                 let nvl = match result {
                     Ok(nvl) => nvl,
@@ -185,18 +219,17 @@ impl<S: Send + 'static> Connection<S> {
 
                 let request_type_cstr = nvl.lookup_string("Type").unwrap();
                 let request_type = request_type_cstr.to_str().unwrap();
-                match self.handlers.get(request_type) {
+                match server.handlers.get(request_type) {
                     Some(HandlerEnum::Serial(handler)) => {
-                        let fut = handler.invoke(self.state, nvl);
-                        let (state, response_opt) = fut.await;
+                        let (new_state, response_opt) = handler.invoke(state, nvl).await;
                         if let Some(response) = response_opt {
-                            Self::send_response(&self.output, response).await;
+                            Self::send_response(&output, response).await;
                         }
-                        self.state = state;
+                        state = new_state;
                     }
                     Some(HandlerEnum::Concurrent(handler)) => {
-                        let fut = handler.invoke(&mut self.state, nvl);
-                        let output = self.output.clone();
+                        let fut = handler.invoke(&mut state, nvl);
+                        let output = output.clone();
                         tokio::spawn(async move {
                             if let Some(response) = fut.await {
                                 Self::send_response(&output, response).await;
