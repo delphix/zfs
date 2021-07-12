@@ -3497,13 +3497,6 @@ zio_object_allocate_and_issue(zio_t *zio)
 	 */
 	zio->io_pipeline &= ~ZIO_STAGE_VDEV_IO_START;
 
-	/*
-	 * Lock ensures we allocate the next block ID and send it up to the
-	 * agent before any more allocations happen.  This way we fulfill the
-	 * write ordering constraint (write requests must be in order of
-	 * increasing block IDs).
-	 */
-	mutex_enter(&mc->mc_object_store_lock);
 	spa_config_enter(spa, SCL_ALLOC|SCL_ZIO, FTAG, RW_READER);
 
 	ASSERT3U(zio->io_prop.zp_copies, ==, 1);
@@ -3538,7 +3531,6 @@ zio_object_allocate_and_issue(zio_t *zio)
 	zfs_dbgmsg("zio=%px completed io_start (off=%llu, next=%px)",
 	    zio, DVA_GET_OFFSET(&bp->blk_dva[0]), next_zio);
 #endif
-	mutex_exit(&mc->mc_object_store_lock);
 	return (zio);
 }
 

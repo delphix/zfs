@@ -465,6 +465,7 @@ struct zio {
 	metaslab_class_t *io_metaslab_class;	/* dva throttle class */
 
 	uint64_t	io_offset;
+	boolean_t	io_offset_match;
 	hrtime_t	io_timestamp;	/* submitted at */
 	hrtime_t	io_queued_timestamp;
 	hrtime_t	io_target_timestamp;

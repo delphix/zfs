@@ -176,6 +176,7 @@ impl Server {
                         let block = BlockId(nvl.lookup_uint64("block").unwrap());
                         let data = nvl.lookup("data").unwrap().data();
                         let id = nvl.lookup_uint64("request_id").unwrap();
+                        let token = nvl.lookup_uint64("token").unwrap();
                         if let NvData::Uint8Array(slice) = data {
                             trace!(
                                 "got write request id={}: {:?} len={}",
@@ -183,7 +184,7 @@ impl Server {
                                 block,
                                 slice.len()
                             );
-                            server.write_block(block, slice.to_vec(), id);
+                            server.write_block(block, slice.to_vec(), id, token);
                         } else {
                             panic!("data not expected type")
                         }
@@ -198,7 +199,8 @@ impl Server {
                         trace!("got request: {:?}", nvl);
                         let block = BlockId(nvl.lookup_uint64("block").unwrap());
                         let id = nvl.lookup_uint64("request_id").unwrap();
-                        server.read_block(block, id);
+                        let token = nvl.lookup_uint64("token").unwrap();
+                        server.read_block(block, id, token);
                     }
                     other => {
                         panic!("bad type {:?} in request {:?}", other, nvl);
@@ -377,7 +379,7 @@ impl Server {
 
     /// queue write, sends response when completed (persistent).  Does not block.
     /// completion may not happen until flush_pool() is called
-    fn write_block(&mut self, block: BlockId, data: Vec<u8>, request_id: u64) {
+    fn write_block(&mut self, block: BlockId, data: Vec<u8>, request_id: u64, token: u64) {
         self.max_blockid = max(block, self.max_blockid);
         let pool = self.pool.as_ref().unwrap().clone();
         let output = self.output.clone();
@@ -392,6 +394,7 @@ impl Server {
             nvl.insert("Type", "write done").unwrap();
             nvl.insert("block", &block.0).unwrap();
             nvl.insert("request_id", &request_id).unwrap();
+            nvl.insert("token", &token).unwrap();
             trace!("sending response: {:?}", nvl);
             Self::send_response(&output, nvl).await;
         });
@@ -404,7 +407,7 @@ impl Server {
     }
 
     /// initiate read, sends response when completed.  Does not block.
-    fn read_block(&mut self, block: BlockId, request_id: u64) {
+    fn read_block(&mut self, block: BlockId, request_id: u64, token: u64) {
         let pool = self.pool.as_ref().unwrap().clone();
         let output = self.output.clone();
         tokio::spawn(async move {
@@ -413,6 +416,7 @@ impl Server {
             nvl.insert("Type", "read done").unwrap();
             nvl.insert("block", &block.0).unwrap();
             nvl.insert("request_id", &request_id).unwrap();
+            nvl.insert("token", &token).unwrap();
             nvl.insert("data", data.as_slice()).unwrap();
             trace!(
                 "sending read done response: block={} req={} data=[{} bytes]",

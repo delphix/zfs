@@ -246,6 +246,14 @@ vdev_queue_offset_compare(const void *x1, const void *x2)
 	if (likely(cmp))
 		return (cmp);
 
+	/*
+	 * If the zio we are trying to find is requesting
+	 * an exact offset match then return once TREE_CMP finds
+	 * the offset.
+	 */
+	if (z1->io_offset_match || z2->io_offset_match)
+		return (cmp);
+
 	return (TREE_PCMP(z1, z2));
 }
 
@@ -541,7 +549,7 @@ vdev_queue_is_interactive(zio_priority_t p)
 	}
 }
 
-static void
+void
 vdev_queue_pending_add(vdev_queue_t *vq, zio_t *zio)
 {
 	ASSERT(MUTEX_HELD(&vq->vq_lock));
@@ -556,7 +564,7 @@ vdev_queue_pending_add(vdev_queue_t *vq, zio_t *zio)
 	avl_add(&vq->vq_active_tree, zio);
 }
 
-static void
+void
 vdev_queue_pending_remove(vdev_queue_t *vq, zio_t *zio)
 {
 	ASSERT(MUTEX_HELD(&vq->vq_lock));
@@ -823,6 +831,7 @@ vdev_queue_io_to_issue(vdev_queue_t *vq)
 
 again:
 	ASSERT(MUTEX_HELD(&vq->vq_lock));
+	VERIFY(!vdev_is_object_based(vq->vq_vdev));
 
 	p = vdev_queue_class_to_issue(vq);
 
@@ -941,6 +950,7 @@ vdev_queue_io_done(zio_t *zio)
 	vq->vq_io_delta_ts = zio->io_delta = now - zio->io_timestamp;
 
 	mutex_enter(&vq->vq_lock);
+	VERIFY(!vdev_is_object_based(vq->vq_vdev));
 	vdev_queue_pending_remove(vq, zio);
 
 	while ((nio = vdev_queue_io_to_issue(vq)) != NULL) {
