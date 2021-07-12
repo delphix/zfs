@@ -1,4 +1,6 @@
-use futures::Future;
+use anyhow::anyhow;
+use anyhow::Result;
+use futures::{future, Future, FutureExt};
 use log::*;
 use nvpair::{NvEncoding, NvList};
 use std::collections::HashMap;
@@ -8,8 +10,10 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
+// Ss: ServerState (consumer's state associated with the server)
+// Cs: ConnectionState (consumer's state associated with the connection)
 pub struct Server<Ss, Cs> {
     socket_path: String,
     state: Ss,
@@ -18,94 +22,61 @@ pub struct Server<Ss, Cs> {
     handlers: HashMap<String, HandlerEnum<Cs>>,
 }
 
-enum HandlerEnum<S> {
-    Serial(Box<dyn SerialHandler<S>>),
-    Concurrent(Box<dyn Handler<S>>),
+enum HandlerEnum<Cs> {
+    Serial(Box<SerialHandler<Cs>>),
+    Concurrent(Box<Handler<Cs>>),
 }
 
-pub trait Handler<S>: Send + Sync + 'static {
-    fn invoke(
-        &self,
-        state: &mut S,
-        request: NvList,
-    ) -> Pin<Box<dyn Future<Output = Option<NvList>> + Send>>;
-}
+type TimeoutHandler<Cs> = dyn Fn(&mut Cs) + Send + Sync;
 
-impl<F: Send + Sync + 'static, Fut, S: Send> Handler<S> for F
-where
-    F: Fn(&mut S, NvList) -> Fut,
-    Fut: Future<Output = Option<NvList>> + Send + 'static,
-{
-    fn invoke(
-        &self,
-        state: &mut S,
-        request: NvList,
-    ) -> Pin<Box<dyn Future<Output = Option<NvList>> + Send + 'static>> {
-        Box::pin(self(state, request))
-    }
-}
+type ConnectionHandler<Ss, Cs> = dyn Fn(&Ss) -> Cs + Send + Sync;
 
-pub trait SerialHandler<S>: Send + Sync + 'static {
-    fn invoke(
-        &self,
-        state: S,
-        request: NvList,
-    ) -> Pin<Box<dyn Future<Output = (S, Option<NvList>)> + Send>>;
-}
+pub type HandlerReturn = Result<Pin<Box<dyn Future<Output = Result<Option<NvList>>> + Send>>>;
+type Handler<Cs> = dyn Fn(&mut Cs, NvList) -> HandlerReturn + Send + Sync;
 
-impl<F: Send + Sync + 'static, Fut, S: Send> SerialHandler<S> for F
-where
-    F: Fn(S, NvList) -> Fut,
-    Fut: Future<Output = (S, Option<NvList>)> + Send + 'static,
-{
-    fn invoke(
-        &self,
-        state: S,
-        request: NvList,
-    ) -> Pin<Box<(dyn Future<Output = (S, Option<NvList>)> + Send + 'static)>> {
-        Box::pin(self(state, request))
-    }
-}
-
-/*
-pub trait TimeoutHandler<S>: Send + Sync + 'static {
-    fn invoke(&self, state: &mut S);
-}
-
-impl<F: Send + Sync + 'static, S: Send> TimeoutHandler<S> for F
-where
-    F: Fn(&mut S),
-{
-    fn invoke(&self, state: &mut S) {
-        self(state)
-    }
-}
-*/
-
-type TimeoutHandler<S> = dyn Fn(&mut S) + Send + Sync + 'static;
-type ConnectionHandler<Svr, State> = dyn Fn(&Svr) -> State + Send + Sync + 'static;
+pub type SerialHandlerReturn<Cs> = Pin<Box<dyn Future<Output = (Cs, Option<NvList>)> + Send>>;
+type SerialHandler<Cs> = dyn Fn(Cs, NvList) -> SerialHandlerReturn<Cs> + Send + Sync;
 
 impl<Ss: Send + Sync + 'static, Cs: Send + Sync + 'static> Server<Ss, Cs> {
+    /// The connection_handler will be called when a new connection is
+    /// established.  It is passed the server_state (Ss) and returns a
+    /// connection_state (Cs), which is passed to each of the Handlers.
     pub fn new(
         socket_path: &str,
-        state: Ss,
+        server_state: Ss,
         connection_handler: Box<ConnectionHandler<Ss, Cs>>,
     ) -> Server<Ss, Cs> {
         Server {
             socket_path: socket_path.to_owned(),
-            state,
+            state: server_state,
             connection_handler,
             timeout: None,
             handlers: Default::default(),
         }
     }
 
-    /// Regular, concurrent operations.  The server runs the handler's future in a new task.
-    pub fn register_handler(&mut self, request_type: &str, handler: Box<dyn Handler<Cs>>) {
+    /// Register a function to be called for a regular, concurrent operation.
+    /// When a connection receives a request with "Type" = request_type, the
+    /// Handler will be called.  The Handler returns a Future, which the server
+    /// will run in a new task.  If either the Handler or its returned Future
+    /// return an Err, the connection will be closed.  This should primarily be
+    /// used when the request is invalid.
+    ////
+    /// Note that since the Handler takes `&mut Cs` (a mutable reference to the
+    /// connection state), the Handler can mutate the state, but the Future
+    /// which it returns can not (it's run in the background while we are
+    /// handling other requests).  If you need to manipulate the connection
+    /// state from async code, consider using register_serial_handler() instead.
+    pub fn register_handler(&mut self, request_type: &str, handler: Box<Handler<Cs>>) {
         self.handlers
             .insert(request_type.to_owned(), HandlerEnum::Concurrent(handler));
     }
 
+    /// Register a function to be called when a request hasn't been received
+    /// recently.
+    /// XXX This shouldn't really be necessary.  Once the kernel sends "flush
+    /// writes" properly (when zio_wait() is called), we should be able to get
+    /// rid of this.
     pub fn register_timeout_handler(
         &mut self,
         timeout: Duration,
@@ -114,17 +85,21 @@ impl<Ss: Send + Sync + 'static, Cs: Send + Sync + 'static> Server<Ss, Cs> {
         self.timeout = Some((timeout, handler));
     }
 
-    /// For serial operations.  The server awaits for the serial handler's
-    /// future to complete before processing the next operation.
-    pub fn register_serial_handler(
-        &mut self,
-        request_type: &str,
-        handler: Box<dyn SerialHandler<Cs>>,
-    ) {
+    /// Register a function to be called for a "serial" operation.  The server
+    /// awaits for the returned future to complete before processing the next
+    /// operation.  This should only be used for operations that don't need to
+    /// be processed concurrently with other operations.  Note that the
+    /// SerialHandler is passed ownership of the connection state, and it
+    /// returns ownership of the connection state back to the server code.  This
+    /// is especially useful if you need to manipulate the connection state from
+    /// async code.
+    pub fn register_serial_handler(&mut self, request_type: &str, handler: Box<SerialHandler<Cs>>) {
         self.handlers
             .insert(request_type.to_owned(), HandlerEnum::Serial(handler));
     }
 
+    /// Start the server by creating a new unix-domain socket and spawning a new
+    /// task which will accept connections on it.
     pub fn start(self) {
         let arc = Arc::new(self);
         info!("Listening on: {}", arc.socket_path);
@@ -136,7 +111,14 @@ impl<Ss: Send + Sync + 'static, Cs: Send + Sync + 'static> Server<Ss, Cs> {
                     Ok((stream, _)) => {
                         info!("accepted connection on {}", arc.socket_path);
                         let connection_state = (arc.connection_handler)(&arc.state);
-                        Self::start_connection(arc.clone(), stream, connection_state);
+                        let server = arc.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                Self::start_connection(server, stream, connection_state).await
+                            {
+                                error!("closing connection due to error: {:?}", e);
+                            }
+                        });
                     }
                     Err(e) => {
                         warn!("accept() on {} failed: {}", arc.socket_path, e);
@@ -177,70 +159,71 @@ impl<Ss: Send + Sync + 'static, Cs: Send + Sync + 'static> Server<Ss, Cs> {
         w.write_all(buf.as_slice()).await.unwrap();
     }
 
-    fn start_connection(server: Arc<Server<Ss, Cs>>, stream: UnixStream, mut state: Cs) {
-        let (mut input, output) = stream.into_split();
-        let output = Arc::new(Mutex::new(output));
+    async fn start_connection(
+        server: Arc<Server<Ss, Cs>>,
+        stream: UnixStream,
+        mut state: Cs,
+    ) -> Result<()> {
+        let (mut input, output_raw) = stream.into_split();
+        let output = Arc::new(Mutex::new(output_raw));
 
-        tokio::spawn(async move {
-            loop {
-                /*
-                let nvl = match conn.get_next_request().await {
-                    Err(e) => {
-                        info!("got error reading from connection: {:?}", e);
-                        return;
-                    }
-                    Ok(nvl) => nvl,
-                };
-                */
-                let result = match &server.timeout {
-                    Some((duration, _handler)) => {
-                        match tokio::time::timeout(*duration, Self::get_next_request(&mut input))
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => {
-                                // timed out.
-                                // ugh so icky but we can't hold a ref to the handler across conn.get_next_request()
-                                server.timeout.as_ref().unwrap().1(&mut state);
-                                //handler.invoke(&mut conn.state);
-                                continue;
-                            }
+        let (error_tx, mut error_rx) = mpsc::channel(1);
+        loop {
+            if let Some(e) = error_rx.recv().now_or_never() {
+                // an async (spawned) task produced an error
+                return Err(e.unwrap());
+            }
+            let nvl = match &server.timeout {
+                Some((duration, timeout_handler)) => {
+                    match tokio::time::timeout(*duration, Self::get_next_request(&mut input)).await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            // timed out.
+                            timeout_handler(&mut state);
+                            continue;
                         }
-                    }
-                    None => Self::get_next_request(&mut input).await,
-                };
-                let nvl = match result {
-                    Ok(nvl) => nvl,
-                    Err(e) => {
-                        info!("got error reading from connection: {:?}", e);
-                        return;
-                    }
-                };
-
-                let request_type_cstr = nvl.lookup_string("Type").unwrap();
-                let request_type = request_type_cstr.to_str().unwrap();
-                match server.handlers.get(request_type) {
-                    Some(HandlerEnum::Serial(handler)) => {
-                        let (new_state, response_opt) = handler.invoke(state, nvl).await;
-                        if let Some(response) = response_opt {
-                            Self::send_response(&output, response).await;
-                        }
-                        state = new_state;
-                    }
-                    Some(HandlerEnum::Concurrent(handler)) => {
-                        let fut = handler.invoke(&mut state, nvl);
-                        let output = output.clone();
-                        tokio::spawn(async move {
-                            if let Some(response) = fut.await {
-                                Self::send_response(&output, response).await;
-                            }
-                        });
-                    }
-                    None => {
-                        panic!("bad type {:?} in request {:?}", request_type, nvl);
                     }
                 }
+                None => Self::get_next_request(&mut input).await,
+            }?;
+
+            let request_type_cstr = nvl.lookup_string("Type")?;
+            let request_type = request_type_cstr.to_str()?;
+            match server.handlers.get(request_type) {
+                Some(HandlerEnum::Serial(handler)) => {
+                    let (new_state, response_opt) = handler(state, nvl).await;
+                    if let Some(response) = response_opt {
+                        Self::send_response(&output, response).await;
+                    }
+                    state = new_state;
+                }
+                Some(HandlerEnum::Concurrent(handler)) => {
+                    let fut = handler(&mut state, nvl)?;
+                    let output = output.clone();
+                    let my_error_tx = error_tx.clone();
+                    tokio::spawn(async move {
+                        match fut.await {
+                            Ok(Some(response)) => {
+                                Self::send_response(&output, response).await;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                my_error_tx.send(e).await.unwrap();
+                            }
+                        }
+                    });
+                }
+                None => {
+                    return Err(anyhow!("bad type {:?} in request {:?}", request_type, nvl));
+                }
             }
-        });
+        }
     }
+}
+
+/// Helper function to produce the value that should be returned from a handler
+/// that does not need to do any async work.
+pub fn handler_return_ok(response: Option<NvList>) -> HandlerReturn {
+    Ok(Box::pin(future::ready(Ok(response))))
 }

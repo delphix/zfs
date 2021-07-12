@@ -1,10 +1,13 @@
 use crate::base_types::*;
 use crate::object_access::ObjectAccess;
 use crate::pool::*;
+use crate::server::handler_return_ok;
+use crate::server::HandlerReturn;
+use crate::server::SerialHandlerReturn;
 use crate::server::Server;
 use crate::zettacache::ZettaCache;
-use futures::future;
-use futures::Future;
+use anyhow::anyhow;
+use anyhow::Result;
 use log::*;
 use nvpair::{NvData, NvList, NvListRef};
 use std::cmp::max;
@@ -47,15 +50,15 @@ struct KernelConnectionState {
 }
 
 impl KernelConnectionState {
-    fn get_object_access(nvl: &NvListRef) -> ObjectAccess {
-        let bucket_name = nvl.lookup_string("bucket").unwrap();
-        let region_str = nvl.lookup_string("region").unwrap();
-        let endpoint = nvl.lookup_string("endpoint").unwrap();
-        ObjectAccess::new(
+    fn get_object_access(nvl: &NvListRef) -> Result<ObjectAccess> {
+        let bucket_name = nvl.lookup_string("bucket")?;
+        let region_str = nvl.lookup_string("region")?;
+        let endpoint = nvl.lookup_string("endpoint")?;
+        Ok(ObjectAccess::new(
             endpoint.to_str().unwrap(),
             region_str.to_str().unwrap(),
             bucket_name.to_str().unwrap(),
-        )
+        ))
     }
 
     async fn create_pool_impl(object_access: &ObjectAccess, guid: PoolGuid, name: &str) -> NvList {
@@ -67,16 +70,16 @@ impl KernelConnectionState {
         nvl
     }
 
-    fn create_pool(self, nvl: NvList) -> impl Future<Output = (Self, Option<NvList>)> {
+    fn create_pool(self, nvl: NvList) -> SerialHandlerReturn<Self> {
         info!("got request: {:?}", nvl);
         let guid = PoolGuid(nvl.lookup_uint64("GUID").unwrap());
         let name = nvl.lookup_string("name").unwrap();
-        let object_access = Self::get_object_access(nvl.as_ref());
-        async move {
+        let object_access = Self::get_object_access(nvl.as_ref()).unwrap();
+        Box::pin(async move {
             let response =
                 Self::create_pool_impl(&object_access, guid, name.to_str().unwrap()).await;
             (self, Some(response))
-        }
+        })
     }
 
     async fn open_pool_impl(
@@ -100,61 +103,63 @@ impl KernelConnectionState {
         (pool, nvl)
     }
 
-    fn open_pool(mut self, nvl: NvList) -> impl Future<Output = (Self, Option<NvList>)> {
+    fn open_pool(mut self, nvl: NvList) -> SerialHandlerReturn<Self> {
         info!("got request: {:?}", nvl);
         let guid = PoolGuid(nvl.lookup_uint64("GUID").unwrap());
-        let object_access = Self::get_object_access(nvl.as_ref());
+        let object_access = Self::get_object_access(nvl.as_ref()).unwrap();
         let cache = self.cache.as_ref().cloned();
-        async move {
+        Box::pin(async move {
             let (pool, response) = Self::open_pool_impl(&object_access, guid, cache).await;
             self.pool = Some(Arc::new(pool));
             (self, Some(response))
-        }
+        })
     }
 
-    fn begin_txg(&mut self, nvl: NvList) -> impl Future<Output = Option<NvList>> {
+    fn begin_txg(&mut self, nvl: NvList) -> HandlerReturn {
         debug!("got request: {:?}", nvl);
-        let txg = Txg(nvl.lookup_uint64("TXG").unwrap());
-
-        let pool = self.pool.as_ref().unwrap();
+        let txg = Txg(nvl.lookup_uint64("TXG")?);
+        let pool = self.pool.as_ref().ok_or_else(|| anyhow!("no pool open"))?;
         pool.begin_txg(txg);
 
-        future::ready(None)
+        handler_return_ok(None)
     }
 
-    fn resume_txg(&mut self, nvl: NvList) -> impl Future<Output = Option<NvList>> {
+    fn resume_txg(&mut self, nvl: NvList) -> HandlerReturn {
         info!("got request: {:?}", nvl);
-        let txg = Txg(nvl.lookup_uint64("TXG").unwrap());
-
-        let pool = self.pool.as_ref().unwrap();
+        let txg = Txg(nvl.lookup_uint64("TXG")?);
+        let pool = self.pool.as_ref().ok_or_else(|| anyhow!("no pool open"))?;
         pool.resume_txg(txg);
 
-        future::ready(None)
+        handler_return_ok(None)
     }
 
-    fn resume_complete(self, nvl: NvList) -> impl Future<Output = (Self, Option<NvList>)> {
+    fn resume_complete(self, nvl: NvList) -> SerialHandlerReturn<Self> {
         info!("got request: {:?}", nvl);
 
         // This is .await'ed by the server's thread, so we can't see any new writes
         // come in while it's in progress.
-        async move {
+        Box::pin(async move {
             let pool = self.pool.as_ref().unwrap();
             pool.resume_complete().await;
             (self, None)
-        }
+        })
     }
 
-    fn flush_writes(&mut self, nvl: NvList) -> impl Future<Output = Option<NvList>> {
+    fn flush_writes(&mut self, nvl: NvList) -> HandlerReturn {
         trace!("got request: {:?}", nvl);
-        let pool = self.pool.as_ref().unwrap();
+        let pool = self.pool.as_ref().ok_or_else(|| anyhow!("no pool open"))?;
         if let Some(max_blockid) = self.max_blockid {
             pool.initiate_flush(max_blockid);
         }
-        future::ready(None)
+        handler_return_ok(None)
     }
 
     // sends response when completed
-    async fn end_txg_impl(pool: Arc<Pool>, uberblock: Vec<u8>, config: Vec<u8>) -> NvList {
+    async fn end_txg_impl(
+        pool: Arc<Pool>,
+        uberblock: Vec<u8>,
+        config: Vec<u8>,
+    ) -> Result<Option<NvList>> {
         let stats = pool.end_txg(uberblock, config).await;
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "end txg done").unwrap();
@@ -166,38 +171,43 @@ impl KernelConnectionState {
             .unwrap();
         nvl.insert("objects_count", &stats.objects_count).unwrap();
         debug!("sending response: {:?}", nvl);
-        nvl
+        Ok(Some(nvl))
     }
 
-    fn end_txg(&mut self, nvl: NvList) -> impl Future<Output = Option<NvList>> {
+    fn end_txg(&mut self, nvl: NvList) -> HandlerReturn {
         debug!("got request: {:?}", nvl);
 
         // client should have already flushed all writes
-        // XXX change to an error return
-        assert_eq!(self.num_outstanding_writes.load(Ordering::Acquire), 0);
+        if self.num_outstanding_writes.load(Ordering::Acquire) != 0 {
+            return Err(anyhow!("outstanding writes while trying to end txg"));
+        }
 
-        let pool = self.pool.as_ref().unwrap().clone();
-        async move {
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| anyhow!("no pool open"))?
+            .clone();
+        Ok(Box::pin(async move {
             let uberblock = nvl.lookup("uberblock").unwrap().data();
             let config = nvl.lookup("config").unwrap().data();
             if let NvData::Uint8Array(slice) = uberblock {
                 if let NvData::Uint8Array(slice2) = config {
-                    Some(Self::end_txg_impl(pool, slice.to_vec(), slice2.to_vec()).await)
+                    Self::end_txg_impl(pool, slice.to_vec(), slice2.to_vec()).await
                 } else {
                     panic!("config not expected type")
                 }
             } else {
                 panic!("uberblock not expected type")
             }
-        }
+        }))
     }
 
     /// queue write, sends response when completed (persistent).
     /// completion may not happen until flush_pool() is called
-    fn write_block(&mut self, nvl: NvList) -> impl Future<Output = Option<NvList>> {
-        let block = BlockId(nvl.lookup_uint64("block").unwrap());
-        let data = nvl.lookup("data").unwrap().data();
-        let request_id = nvl.lookup_uint64("request_id").unwrap();
+    fn write_block(&mut self, nvl: NvList) -> HandlerReturn {
+        let block = BlockId(nvl.lookup_uint64("block")?);
+        let data = nvl.lookup("data")?.data();
+        let request_id = nvl.lookup_uint64("request_id")?;
         if let NvData::Uint8Array(slice) = data {
             trace!(
                 "got write request id={}: {:?} len={}",
@@ -211,12 +221,16 @@ impl KernelConnectionState {
                 None => block,
             });
 
-            let pool = self.pool.as_ref().unwrap().clone();
+            let pool = self
+                .pool
+                .as_ref()
+                .ok_or_else(|| anyhow!("no pool open"))?
+                .clone();
             self.num_outstanding_writes.fetch_add(1, Ordering::Release);
             // Need to write_block() before spawning, so that the Pool knows what's been written before resume_complete()
             let fut = pool.write_block(block, slice.to_vec());
             let now = self.num_outstanding_writes.clone();
-            async move {
+            Ok(Box::pin(async move {
                 fut.await;
                 now.fetch_sub(1, Ordering::Release);
                 let mut nvl = NvList::new_unique_names();
@@ -224,32 +238,35 @@ impl KernelConnectionState {
                 nvl.insert("block", &block.0).unwrap();
                 nvl.insert("request_id", &request_id).unwrap();
                 trace!("sending response: {:?}", nvl);
-                //Self::send_response(&output, nvl).await;
-                Some(nvl)
-            }
+                Ok(Some(nvl))
+            }))
         } else {
-            panic!("data not expected type")
+            Err(anyhow!("data {:?} not expected type", data))
         }
     }
 
-    fn free_block(&mut self, nvl: NvList) -> impl Future<Output = Option<NvList>> {
+    fn free_block(&mut self, nvl: NvList) -> HandlerReturn {
         trace!("got request: {:?}", nvl);
-        let block = BlockId(nvl.lookup_uint64("block").unwrap());
-        let size = nvl.lookup_uint64("size").unwrap();
+        let block = BlockId(nvl.lookup_uint64("block")?);
+        let size = nvl.lookup_uint64("size")? as u32;
 
-        let pool = self.pool.as_ref().unwrap();
-        pool.free_block(block, size as u32);
+        let pool = self.pool.as_ref().ok_or_else(|| anyhow!("no pool open"))?;
+        pool.free_block(block, size);
 
-        future::ready(None)
+        handler_return_ok(None)
     }
 
-    fn read_block(&mut self, nvl: NvList) -> impl Future<Output = Option<NvList>> {
+    fn read_block(&mut self, nvl: NvList) -> HandlerReturn {
         trace!("got request: {:?}", nvl);
-        let block = BlockId(nvl.lookup_uint64("block").unwrap());
-        let request_id = nvl.lookup_uint64("request_id").unwrap();
+        let block = BlockId(nvl.lookup_uint64("block")?);
+        let request_id = nvl.lookup_uint64("request_id")?;
 
-        let pool = self.pool.as_ref().unwrap().clone();
-        async move {
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| anyhow!("no pool open"))?
+            .clone();
+        Ok(Box::pin(async move {
             let data = pool.read_block(block).await;
             let mut nvl = NvList::new_unique_names();
             nvl.insert("Type", "read done").unwrap();
@@ -262,8 +279,8 @@ impl KernelConnectionState {
                 request_id,
                 data.len()
             );
-            Some(nvl)
-        }
+            Ok(Some(nvl))
+        }))
     }
 
     fn timeout(&mut self) {
