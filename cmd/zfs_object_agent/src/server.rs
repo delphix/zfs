@@ -12,6 +12,23 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, Mutex};
 
+/*
+async fn a<T>(state: T) -> T {
+    state
+}
+
+async fn b<T>(state: &mut T) {
+    state;
+}
+
+async fn test<T: core::fmt::Debug>(mut state: T) {
+    state = a(state).await;
+    let fut = b(&mut state);
+    fut.await;
+    debug!("{:?}", state);
+}
+*/
+
 // Ss: ServerState (consumer's state associated with the server)
 // Cs: ConnectionState (consumer's state associated with the connection)
 pub struct Server<Ss, Cs> {
@@ -34,8 +51,8 @@ type ConnectionHandler<Ss, Cs> = dyn Fn(&Ss) -> Cs + Send + Sync;
 pub type HandlerReturn = Result<Pin<Box<dyn Future<Output = Result<Option<NvList>>> + Send>>>;
 type Handler<Cs> = dyn Fn(&mut Cs, NvList) -> HandlerReturn + Send + Sync;
 
-pub type SerialHandlerReturn<Cs> = Pin<Box<dyn Future<Output = (Cs, Option<NvList>)> + Send>>;
-type SerialHandler<Cs> = dyn Fn(Cs, NvList) -> SerialHandlerReturn<Cs> + Send + Sync;
+pub type SerialHandlerReturn<'a> = Pin<Box<dyn Future<Output = Option<NvList>> + Send + 'a>>;
+type SerialHandler<Cs> = dyn Fn(&mut Cs, NvList) -> SerialHandlerReturn + Send + Sync;
 
 impl<Ss: Send + Sync + 'static, Cs: Send + Sync + 'static> Server<Ss, Cs> {
     /// The connection_handler will be called when a new connection is
@@ -61,7 +78,7 @@ impl<Ss: Send + Sync + 'static, Cs: Send + Sync + 'static> Server<Ss, Cs> {
     /// will run in a new task.  If either the Handler or its returned Future
     /// return an Err, the connection will be closed.  This should primarily be
     /// used when the request is invalid.
-    ////
+    ///
     /// Note that since the Handler takes `&mut Cs` (a mutable reference to the
     /// connection state), the Handler can mutate the state, but the Future
     /// which it returns can not (it's run in the background while we are
@@ -192,11 +209,10 @@ impl<Ss: Send + Sync + 'static, Cs: Send + Sync + 'static> Server<Ss, Cs> {
             let request_type = request_type_cstr.to_str()?;
             match server.handlers.get(request_type) {
                 Some(HandlerEnum::Serial(handler)) => {
-                    let (new_state, response_opt) = handler(state, nvl).await;
+                    let response_opt = handler(&mut state, nvl).await;
                     if let Some(response) = response_opt {
                         Self::send_response(&output, response).await;
                     }
-                    state = new_state;
                 }
                 Some(HandlerEnum::Concurrent(handler)) => {
                     let fut = handler(&mut state, nvl)?;

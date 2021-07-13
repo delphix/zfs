@@ -20,6 +20,14 @@ pub struct KernelServerState {
     cache: Option<ZettaCache>,
 }
 
+#[derive(Default)]
+struct KernelConnectionState {
+    pool: Option<Arc<Pool>>,
+    num_outstanding_writes: Arc<AtomicUsize>,
+    max_blockid: Option<BlockId>, // Maximum blockID that we've received a write for
+    cache: Option<ZettaCache>,
+}
+
 impl KernelServerState {
     fn connection_handler(&self) -> KernelConnectionState {
         KernelConnectionState {
@@ -41,15 +49,24 @@ impl KernelServerState {
     }
 }
 
-#[derive(Default)]
-struct KernelConnectionState {
-    pool: Option<Arc<Pool>>,
-    num_outstanding_writes: Arc<AtomicUsize>,
-    max_blockid: Option<BlockId>, // Maximum blockID that we've received a write for
-    cache: Option<ZettaCache>,
-}
-
 impl KernelConnectionState {
+    fn register(server: &mut Server<KernelServerState, KernelConnectionState>) {
+        server.register_serial_handler("create pool", Box::new(Self::create_pool));
+        server.register_serial_handler("open pool", Box::new(Self::open_pool));
+        server.register_serial_handler("resume complete", Box::new(Self::resume_complete));
+
+        // XXX shouldn't be needed once the kernel sends "flush writes" appropriately.
+        server.register_timeout_handler(Duration::from_millis(100), Box::new(Self::timeout));
+
+        server.register_handler("begin txg", Box::new(Self::begin_txg));
+        server.register_handler("resume txg", Box::new(Self::resume_txg));
+        server.register_handler("flush writes", Box::new(Self::flush_writes));
+        server.register_handler("end txg", Box::new(Self::end_txg));
+        server.register_handler("write block", Box::new(Self::write_block));
+        server.register_handler("free block", Box::new(Self::free_block));
+        server.register_handler("read block", Box::new(Self::read_block));
+    }
+
     fn get_object_access(nvl: &NvListRef) -> Result<ObjectAccess> {
         let bucket_name = nvl.lookup_string("bucket")?;
         let region_str = nvl.lookup_string("region")?;
@@ -70,7 +87,7 @@ impl KernelConnectionState {
         nvl
     }
 
-    fn create_pool(self, nvl: NvList) -> SerialHandlerReturn<Self> {
+    fn create_pool(&mut self, nvl: NvList) -> SerialHandlerReturn {
         info!("got request: {:?}", nvl);
         let guid = PoolGuid(nvl.lookup_uint64("GUID").unwrap());
         let name = nvl.lookup_string("name").unwrap();
@@ -78,7 +95,7 @@ impl KernelConnectionState {
         Box::pin(async move {
             let response =
                 Self::create_pool_impl(&object_access, guid, name.to_str().unwrap()).await;
-            (self, Some(response))
+            Some(response)
         })
     }
 
@@ -103,7 +120,7 @@ impl KernelConnectionState {
         (pool, nvl)
     }
 
-    fn open_pool(mut self, nvl: NvList) -> SerialHandlerReturn<Self> {
+    fn open_pool(&mut self, nvl: NvList) -> SerialHandlerReturn {
         info!("got request: {:?}", nvl);
         let guid = PoolGuid(nvl.lookup_uint64("GUID").unwrap());
         let object_access = Self::get_object_access(nvl.as_ref()).unwrap();
@@ -111,7 +128,7 @@ impl KernelConnectionState {
         Box::pin(async move {
             let (pool, response) = Self::open_pool_impl(&object_access, guid, cache).await;
             self.pool = Some(Arc::new(pool));
-            (self, Some(response))
+            Some(response)
         })
     }
 
@@ -133,7 +150,7 @@ impl KernelConnectionState {
         handler_return_ok(None)
     }
 
-    fn resume_complete(self, nvl: NvList) -> SerialHandlerReturn<Self> {
+    fn resume_complete(&mut self, nvl: NvList) -> SerialHandlerReturn {
         info!("got request: {:?}", nvl);
 
         // This is .await'ed by the server's thread, so we can't see any new writes
@@ -141,7 +158,7 @@ impl KernelConnectionState {
         Box::pin(async move {
             let pool = self.pool.as_ref().unwrap();
             pool.resume_complete().await;
-            (self, None)
+            None
         })
     }
 
@@ -292,21 +309,5 @@ impl KernelConnectionState {
                 }
             }
         }
-    }
-
-    fn register(server: &mut Server<KernelServerState, KernelConnectionState>) {
-        server.register_serial_handler("create pool", Box::new(Self::create_pool));
-        server.register_serial_handler("open pool", Box::new(Self::open_pool));
-        server.register_serial_handler("resume complete", Box::new(Self::resume_complete));
-
-        server.register_timeout_handler(Duration::from_millis(100), Box::new(Self::timeout));
-
-        server.register_handler("begin txg", Box::new(Self::begin_txg));
-        server.register_handler("resume txg", Box::new(Self::resume_txg));
-        server.register_handler("flush writes", Box::new(Self::flush_writes));
-        server.register_handler("end txg", Box::new(Self::end_txg));
-        server.register_handler("write block", Box::new(Self::write_block));
-        server.register_handler("free block", Box::new(Self::free_block));
-        server.register_handler("read block", Box::new(Self::read_block));
     }
 }

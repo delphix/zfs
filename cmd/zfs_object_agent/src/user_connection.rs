@@ -9,6 +9,8 @@ use rusoto_s3::S3;
 
 pub struct UserServerState {}
 
+struct UserConnectionState {}
+
 impl UserServerState {
     fn connection_handler(&self) -> UserConnectionState {
         UserConnectionState {}
@@ -28,10 +30,11 @@ impl UserServerState {
     }
 }
 
-#[derive(Default)]
-struct UserConnectionState {}
-
 impl UserConnectionState {
+    fn register(server: &mut Server<UserServerState, UserConnectionState>) {
+        server.register_handler("get pools", Box::new(Self::get_pools));
+    }
+
     fn get_pools(&mut self, nvl: NvList) -> HandlerReturn {
         Ok(Box::pin(async move { Self::get_pools_impl(nvl).await }))
     }
@@ -97,9 +100,5 @@ impl UserConnectionState {
         }
         debug!("sending response: {:?}", response);
         Ok(Some(response))
-    }
-
-    fn register(server: &mut Server<UserServerState, UserConnectionState>) {
-        server.register_handler("get pools", Box::new(Self::get_pools));
     }
 }
