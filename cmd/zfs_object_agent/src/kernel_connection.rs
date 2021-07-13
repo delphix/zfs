@@ -78,57 +78,48 @@ impl KernelConnectionState {
         ))
     }
 
-    async fn create_pool_impl(object_access: &ObjectAccess, guid: PoolGuid, name: &str) -> NvList {
-        Pool::create(object_access, name, guid).await;
-        let mut nvl = NvList::new_unique_names();
-        nvl.insert("Type", "pool create done").unwrap();
-        nvl.insert("GUID", &guid.0).unwrap();
-        debug!("sending response: {:?}", nvl);
-        nvl
-    }
-
     fn create_pool(&mut self, nvl: NvList) -> SerialHandlerReturn {
         info!("got request: {:?}", nvl);
-        let guid = PoolGuid(nvl.lookup_uint64("GUID").unwrap());
-        let name = nvl.lookup_string("name").unwrap();
-        let object_access = Self::get_object_access(nvl.as_ref()).unwrap();
         Box::pin(async move {
-            let response =
-                Self::create_pool_impl(&object_access, guid, name.to_str().unwrap()).await;
-            Some(response)
+            let guid = PoolGuid(nvl.lookup_uint64("GUID")?);
+            let name = nvl.lookup_string("name")?;
+            let object_access = Self::get_object_access(nvl.as_ref())?;
+
+            Pool::create(&object_access, name.to_str()?, guid).await;
+            let mut response = NvList::new_unique_names();
+            response.insert("Type", "pool create done").unwrap();
+            response.insert("GUID", &guid.0).unwrap();
+
+            debug!("sending response: {:?}", response);
+            Ok(Some(response))
         })
-    }
-
-    async fn open_pool_impl(
-        object_access: &ObjectAccess,
-        guid: PoolGuid,
-        cache: Option<ZettaCache>,
-    ) -> (Pool, NvList) {
-        let (pool, phys_opt, next_block) = Pool::open(object_access, guid, cache).await;
-        //self.pool = Some(Arc::new(pool));
-        let mut nvl = NvList::new_unique_names();
-        nvl.insert("Type", "pool open done").unwrap();
-        nvl.insert("GUID", &guid.0).unwrap();
-        if let Some(phys) = phys_opt {
-            nvl.insert("uberblock", &phys.get_zfs_uberblock()[..])
-                .unwrap();
-            nvl.insert("config", &phys.get_zfs_config()[..]).unwrap();
-        }
-
-        nvl.insert("next_block", &next_block.0).unwrap();
-        debug!("sending response: {:?}", nvl);
-        (pool, nvl)
     }
 
     fn open_pool(&mut self, nvl: NvList) -> SerialHandlerReturn {
         info!("got request: {:?}", nvl);
-        let guid = PoolGuid(nvl.lookup_uint64("GUID").unwrap());
-        let object_access = Self::get_object_access(nvl.as_ref()).unwrap();
-        let cache = self.cache.as_ref().cloned();
         Box::pin(async move {
-            let (pool, response) = Self::open_pool_impl(&object_access, guid, cache).await;
+            let guid = PoolGuid(nvl.lookup_uint64("GUID")?);
+            let object_access = Self::get_object_access(nvl.as_ref())?;
+            let cache = self.cache.as_ref().cloned();
+
+            let (pool, phys_opt, next_block) = Pool::open(&object_access, guid, cache).await;
+            let mut response = NvList::new_unique_names();
+            response.insert("Type", "pool open done").unwrap();
+            response.insert("GUID", &guid.0).unwrap();
+            if let Some(phys) = phys_opt {
+                response
+                    .insert("uberblock", &phys.get_zfs_uberblock()[..])
+                    .unwrap();
+                response
+                    .insert("config", &phys.get_zfs_config()[..])
+                    .unwrap();
+            }
+
+            response.insert("next_block", &next_block.0).unwrap();
+
             self.pool = Some(Arc::new(pool));
-            Some(response)
+            debug!("sending response: {:?}", response);
+            Ok(Some(response))
         })
     }
 
@@ -156,9 +147,9 @@ impl KernelConnectionState {
         // This is .await'ed by the server's thread, so we can't see any new writes
         // come in while it's in progress.
         Box::pin(async move {
-            let pool = self.pool.as_ref().unwrap();
+            let pool = self.pool.as_ref().ok_or_else(|| anyhow!("no pool open"))?;
             pool.resume_complete().await;
-            None
+            Ok(None)
         })
     }
 

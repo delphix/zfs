@@ -12,23 +12,6 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, Mutex};
 
-/*
-async fn a<T>(state: T) -> T {
-    state
-}
-
-async fn b<T>(state: &mut T) {
-    state;
-}
-
-async fn test<T: core::fmt::Debug>(mut state: T) {
-    state = a(state).await;
-    let fut = b(&mut state);
-    fut.await;
-    debug!("{:?}", state);
-}
-*/
-
 // Ss: ServerState (consumer's state associated with the server)
 // Cs: ConnectionState (consumer's state associated with the connection)
 pub struct Server<Ss, Cs> {
@@ -51,7 +34,9 @@ type ConnectionHandler<Ss, Cs> = dyn Fn(&Ss) -> Cs + Send + Sync;
 pub type HandlerReturn = Result<Pin<Box<dyn Future<Output = Result<Option<NvList>>> + Send>>>;
 type Handler<Cs> = dyn Fn(&mut Cs, NvList) -> HandlerReturn + Send + Sync;
 
-pub type SerialHandlerReturn<'a> = Pin<Box<dyn Future<Output = Option<NvList>> + Send + 'a>>;
+// 'a indicates that the returned Future can capture the `&mut Cs` reference
+pub type SerialHandlerReturn<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<NvList>>> + Send + 'a>>;
 type SerialHandler<Cs> = dyn Fn(&mut Cs, NvList) -> SerialHandlerReturn + Send + Sync;
 
 impl<Ss: Send + Sync + 'static, Cs: Send + Sync + 'static> Server<Ss, Cs> {
@@ -105,10 +90,10 @@ impl<Ss: Send + Sync + 'static, Cs: Send + Sync + 'static> Server<Ss, Cs> {
     /// Register a function to be called for a "serial" operation.  The server
     /// awaits for the returned future to complete before processing the next
     /// operation.  This should only be used for operations that don't need to
-    /// be processed concurrently with other operations.  Note that the
-    /// SerialHandler is passed ownership of the connection state, and it
-    /// returns ownership of the connection state back to the server code.  This
-    /// is especially useful if you need to manipulate the connection state from
+    /// be processed concurrently with other operations.  Note that unlike a
+    /// regular Handler, the SerialHandler's returned Future can capture the
+    /// `&mut Cs` (which is indicated by the SerialHandlerReturn type).  This is
+    /// especially useful if you need to manipulate the connection state from
     /// async code.
     pub fn register_serial_handler(&mut self, request_type: &str, handler: Box<SerialHandler<Cs>>) {
         self.handlers
@@ -209,7 +194,7 @@ impl<Ss: Send + Sync + 'static, Cs: Send + Sync + 'static> Server<Ss, Cs> {
             let request_type = request_type_cstr.to_str()?;
             match server.handlers.get(request_type) {
                 Some(HandlerEnum::Serial(handler)) => {
-                    let response_opt = handler(&mut state, nvl).await;
+                    let response_opt = handler(&mut state, nvl).await?;
                     if let Some(response) = response_opt {
                         Self::send_response(&output, response).await;
                     }
