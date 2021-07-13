@@ -476,6 +476,8 @@ systemctl --system daemon-reload >/dev/null || true
 %{_bindir}/raidz_test
 %{_sbindir}/zgenhostid
 %{_bindir}/zvol_wait
+# Optional zfs_object_agent script
+%{_bindir}/zoa_chaos_monkey
 # Optional Python 2/3 scripts
 %{_bindir}/arc_summary
 %{_bindir}/arcstat
