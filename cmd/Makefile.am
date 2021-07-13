@@ -21,7 +21,7 @@ SHELLCHECKDIRS += zed
 endif
 
 if BUILD_RUST
-SUBDIRS += zfs_object_agent
+SUBDIRS += zfs_object_agent zfs_object_agent/scripts
 endif
 
 PHONY = cppcheck
