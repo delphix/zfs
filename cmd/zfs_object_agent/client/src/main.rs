@@ -175,8 +175,7 @@ async fn do_create() -> Result<(), Box<dyn Error>> {
 
     client
         .create_pool(
-            &aws_key_id,
-            &secret_key,
+            Client::get_credential_string(&aws_key_id, &secret_key),
             &region,
             &endpoint,
             &bucket_name,
@@ -322,7 +321,7 @@ fn get_file_as_byte_vec(filename: &str) -> Vec<u8> {
     let mut f = File::open(filename).expect("no file found");
     let metadata = fs::metadata(filename).expect("unable to read metadata");
     let mut buffer = vec![0; metadata.len() as usize];
-    f.read(&mut buffer).expect("buffer overflow");
+    f.read_exact(&mut buffer).expect("buffer overflow");
 
     buffer
 }
@@ -339,10 +338,7 @@ fn do_nvpair() {
 
     nvp.insert("new int", &5).unwrap();
 
-    let mut vec: Vec<u8> = Vec::new();
-    vec.push(1);
-    vec.push(2);
-    vec.push(3);
+    let vec: Vec<u8> = vec![1, 2, 3];
     nvp.insert("new uint8 array", vec.as_slice()).unwrap();
 
     println!("{:#?}", nvp);
@@ -403,7 +399,7 @@ async fn find_old_pools(object_access: &ObjectAccess, min_age: Duration) -> Vec<
     let mut pool_keys = object_access.collect_prefixes("zfs/").await;
 
     let aws_prefix: &String = &AWS_PREFIX;
-    if aws_prefix == "" {
+    if aws_prefix.is_empty() {
         for prefix in object_access.collect_prefixes("").await {
             pool_keys.append(
                 &mut object_access

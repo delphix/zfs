@@ -62,14 +62,13 @@ impl Client {
         self.output.write_all(buf.as_ref()).await.unwrap();
     }
 
-    fn get_credential_string(aws_key_id: &str, secret_key: &str) -> String {
-        format!("{}:{}", aws_key_id, secret_key).to_string()
+    pub fn get_credential_string(aws_key_id: &str, secret_key: &str) -> String {
+        format!("{}:{}", aws_key_id, secret_key)
     }
 
     pub async fn create_pool(
         &mut self,
-        aws_key_id: &str,
-        secret_key: &str,
+        credentials: String,
         region: &str,
         endpoint: &str,
         bucket_name: &str,
@@ -77,7 +76,6 @@ impl Client {
         name: &str,
     ) {
         let mut nvl = NvList::new_unique_names();
-        let credentials = Self::get_credential_string(aws_key_id, secret_key);
 
         nvl.insert("Type", "create pool").unwrap();
         nvl.insert("credentials", credentials.as_str()).unwrap();
