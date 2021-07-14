@@ -1254,12 +1254,12 @@ vdev_object_store_close(vdev_t *vd)
 
 	if (vd->vdev_reopening || vos == NULL)
 		return;
-	mutex_enter(&vos->vos_lock);
 
 	mutex_enter(&vos->vos_sock_lock);
 	object_store_stop_agent(vd);
 	mutex_exit(&vos->vos_sock_lock);
 
+	mutex_enter(&vos->vos_lock);
 	vos->vos_agent_thread_exit = B_TRUE;
 	vos->vos_vdev = NULL;
 	zfs_object_store_shutdown(vos);
