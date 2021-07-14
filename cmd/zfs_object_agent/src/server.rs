@@ -1,34 +1,138 @@
-use crate::base_types::*;
-use crate::object_access::ObjectAccess;
-use crate::pool::*;
-use crate::zettacache::ZettaCache;
+use anyhow::anyhow;
+use anyhow::Result;
+use futures::{future, Future, FutureExt};
 use log::*;
-use nvpair::{NvData, NvEncoding, NvList, NvListRef};
-use rusoto_s3::S3;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::{cmp::max, sync::Arc};
+use nvpair::{NvEncoding, NvList};
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::UnixListener;
-use tokio::net::UnixStream;
-use tokio::sync::Mutex;
-use tokio::time::Duration;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, Mutex};
 
-pub struct Server {
-    input: OwnedReadHalf,
-    output: Arc<tokio::sync::Mutex<OwnedWriteHalf>>,
-    // Pool is Some once we get a "open pool" request
-    pool: Option<Arc<Pool>>,
-    num_outstanding_writes: Arc<AtomicUsize>,
-    // XXX make Option?
-    max_blockid: BlockId, // Maximum blockID that we've received a write for
+// Ss: ServerState (consumer's state associated with the server)
+// Cs: ConnectionState (consumer's state associated with the connection)
+pub struct Server<Ss, Cs> {
+    socket_path: String,
+    state: Ss,
+    connection_handler: Box<ConnectionHandler<Ss, Cs>>,
+    timeout: Option<(Duration, Box<TimeoutHandler<Cs>>)>,
+    handlers: HashMap<String, HandlerEnum<Cs>>,
 }
 
-impl Server {
-    async fn get_next_request(pipe: &mut OwnedReadHalf) -> tokio::io::Result<NvList> {
+enum HandlerEnum<Cs> {
+    Serial(Box<SerialHandler<Cs>>),
+    Concurrent(Box<Handler<Cs>>),
+}
+
+type TimeoutHandler<Cs> = dyn Fn(&mut Cs) + Send + Sync;
+
+type ConnectionHandler<Ss, Cs> = dyn Fn(&Ss) -> Cs + Send + Sync;
+
+pub type HandlerReturn = Result<Pin<Box<dyn Future<Output = Result<Option<NvList>>> + Send>>>;
+type Handler<Cs> = dyn Fn(&mut Cs, NvList) -> HandlerReturn + Send + Sync;
+
+// 'a indicates that the returned Future can capture the `&mut Cs` reference
+pub type SerialHandlerReturn<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<NvList>>> + Send + 'a>>;
+type SerialHandler<Cs> = dyn Fn(&mut Cs, NvList) -> SerialHandlerReturn + Send + Sync;
+
+impl<Ss: Send + Sync + 'static, Cs: Send + Sync + 'static> Server<Ss, Cs> {
+    /// The connection_handler will be called when a new connection is
+    /// established.  It is passed the server_state (Ss) and returns a
+    /// connection_state (Cs), which is passed to each of the Handlers.
+    pub fn new(
+        socket_path: &str,
+        server_state: Ss,
+        connection_handler: Box<ConnectionHandler<Ss, Cs>>,
+    ) -> Server<Ss, Cs> {
+        Server {
+            socket_path: socket_path.to_owned(),
+            state: server_state,
+            connection_handler,
+            timeout: None,
+            handlers: Default::default(),
+        }
+    }
+
+    /// Register a function to be called for a regular, concurrent operation.
+    /// When a connection receives a request with "Type" = request_type, the
+    /// Handler will be called.  The Handler returns a Future, which the server
+    /// will run in a new task.  If either the Handler or its returned Future
+    /// return an Err, the connection will be closed.  This should primarily be
+    /// used when the request is invalid.
+    ///
+    /// Note that since the Handler takes `&mut Cs` (a mutable reference to the
+    /// connection state), the Handler can mutate the state, but the Future
+    /// which it returns can not (it's run in the background while we are
+    /// handling other requests).  If you need to manipulate the connection
+    /// state from async code, consider using register_serial_handler() instead.
+    pub fn register_handler(&mut self, request_type: &str, handler: Box<Handler<Cs>>) {
+        self.handlers
+            .insert(request_type.to_owned(), HandlerEnum::Concurrent(handler));
+    }
+
+    /// Register a function to be called when a request hasn't been received
+    /// recently.
+    /// XXX This shouldn't really be necessary.  Once the kernel sends "flush
+    /// writes" properly (when zio_wait() is called), we should be able to get
+    /// rid of this.
+    pub fn register_timeout_handler(
+        &mut self,
+        timeout: Duration,
+        handler: Box<TimeoutHandler<Cs>>,
+    ) {
+        self.timeout = Some((timeout, handler));
+    }
+
+    /// Register a function to be called for a "serial" operation.  The server
+    /// awaits for the returned future to complete before processing the next
+    /// operation.  This should only be used for operations that don't need to
+    /// be processed concurrently with other operations.  Note that unlike a
+    /// regular Handler, the SerialHandler's returned Future can capture the
+    /// `&mut Cs` (which is indicated by the SerialHandlerReturn type).  This is
+    /// especially useful if you need to manipulate the connection state from
+    /// async code.
+    pub fn register_serial_handler(&mut self, request_type: &str, handler: Box<SerialHandler<Cs>>) {
+        self.handlers
+            .insert(request_type.to_owned(), HandlerEnum::Serial(handler));
+    }
+
+    /// Start the server by creating a new unix-domain socket and spawning a new
+    /// task which will accept connections on it.
+    pub fn start(self) {
+        let arc = Arc::new(self);
+        info!("Listening on: {}", arc.socket_path);
+        let _ = std::fs::remove_file(&arc.socket_path);
+        let listener = UnixListener::bind(&arc.socket_path).unwrap();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        info!("accepted connection on {}", arc.socket_path);
+                        let connection_state = (arc.connection_handler)(&arc.state);
+                        let server = arc.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                Self::start_connection(server, stream, connection_state).await
+                            {
+                                error!("closing connection due to error: {:?}", e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        warn!("accept() on {} failed: {}", arc.socket_path, e);
+                    }
+                }
+            }
+        });
+    }
+
+    async fn get_next_request(input: &mut OwnedReadHalf) -> tokio::io::Result<NvList> {
         // XXX kernel sends this as host byte order
-        let len64 = pipe.read_u64_le().await?;
+        let len64 = input.read_u64_le().await?;
         //println!("got request len: {}", len64);
         if len64 > 20_000_000 {
             // max zfs block size is 16MB
@@ -40,172 +144,9 @@ impl Server {
         // to do that using read_buf(), treating the Vec as a BufMut, but will
         // require multiple calls to do the equivalent of read_exact().
         v.resize(len64 as usize, 0);
-        pipe.read_exact(v.as_mut()).await?;
+        input.read_exact(v.as_mut()).await?;
         let nvl = NvList::try_unpack(v.as_ref()).unwrap();
         Ok(nvl)
-    }
-
-    pub fn ustart(connection: UnixStream) {
-        let (r, w) = connection.into_split();
-        let mut server = Server {
-            input: r,
-            output: Arc::new(Mutex::new(w)),
-            pool: None,
-            num_outstanding_writes: Arc::new(AtomicUsize::new(0)),
-            max_blockid: BlockId(0),
-        };
-        tokio::spawn(async move {
-            loop {
-                let nvl = match Self::get_next_request(&mut server.input).await {
-                    Err(e) => {
-                        info!("got error reading from user connection: {:?}", e);
-                        return;
-                    }
-                    Ok(nvl) => nvl,
-                };
-                match nvl.lookup_string("Type").unwrap().to_str().unwrap() {
-                    "get pools" => {
-                        // XXX nvl includes credentials; need to redact?
-                        info!("got request: {:?}", nvl);
-                        server.get_pools(&nvl).await;
-                    }
-                    other => {
-                        panic!("bad type {:?} in request {:?}", other, nvl);
-                    }
-                }
-            }
-        });
-    }
-
-    pub fn start(connection: UnixStream, cache: Option<ZettaCache>) {
-        let (r, w) = connection.into_split();
-        let mut server = Server {
-            input: r,
-            output: Arc::new(Mutex::new(w)),
-            pool: None,
-            num_outstanding_writes: Arc::new(AtomicUsize::new(0)),
-            max_blockid: BlockId(0),
-        };
-        tokio::spawn(async move {
-            loop {
-                let nvl = match tokio::time::timeout(
-                    Duration::from_millis(100),
-                    Self::get_next_request(&mut server.input),
-                )
-                .await
-                {
-                    Err(_) => {
-                        // timed out. Note that we can not call flush_writes()
-                        // while in the middle of a end_txg(). So we only do it
-                        // while there are writes in progress, which can't be
-                        // the case during an end_txg().
-                        // XXX we should also be able to time out and flush even
-                        // if we are getting lots of reads.
-                        if server.pool.is_some()
-                            && server.num_outstanding_writes.load(Ordering::Acquire) > 0
-                        {
-                            trace!("timeout; flushing writes");
-                            server.flush_writes();
-                        }
-                        continue;
-                    }
-                    Ok(getreq_result) => match getreq_result {
-                        Err(_) => {
-                            info!(
-                                "got error reading from kernel connection: {:?}",
-                                getreq_result
-                            );
-                            return;
-                        }
-                        Ok(mynvl) => mynvl,
-                    },
-                };
-                match nvl.lookup_string("Type").unwrap().to_str().unwrap() {
-                    "create pool" => {
-                        // XXX nvl includes credentials; need to redact?
-                        info!("got request: {:?}", nvl);
-                        let guid = PoolGuid(nvl.lookup_uint64("GUID").unwrap());
-                        let name = nvl.lookup_string("name").unwrap();
-                        let object_access = Self::get_object_access(nvl.as_ref());
-                        server
-                            .create_pool(&object_access, guid, name.to_str().unwrap())
-                            .await;
-                    }
-                    "open pool" => {
-                        // XXX nvl includes credentials; need to redact?
-                        info!("got request: {:?}", nvl);
-                        let guid = PoolGuid(nvl.lookup_uint64("GUID").unwrap());
-                        let object_access = Self::get_object_access(nvl.as_ref());
-                        server
-                            .open_pool(&object_access, guid, cache.as_ref().cloned())
-                            .await;
-                    }
-                    "begin txg" => {
-                        debug!("got request: {:?}", nvl);
-                        let txg = Txg(nvl.lookup_uint64("TXG").unwrap());
-                        server.begin_txg(txg);
-                    }
-                    "resume txg" => {
-                        info!("got request: {:?}", nvl);
-                        let txg = Txg(nvl.lookup_uint64("TXG").unwrap());
-                        server.resume_txg(txg);
-                    }
-                    "resume complete" => {
-                        info!("got request: {:?}", nvl);
-                        server.resume_complete().await;
-                    }
-                    "flush writes" => {
-                        trace!("got request: {:?}", nvl);
-                        server.flush_writes();
-                    }
-                    "end txg" => {
-                        debug!("got request: {:?}", nvl);
-                        let uberblock = nvl.lookup("uberblock").unwrap().data();
-                        let config = nvl.lookup("config").unwrap().data();
-                        if let NvData::Uint8Array(slice) = uberblock {
-                            if let NvData::Uint8Array(slice2) = config {
-                                server.end_txg(slice.to_vec(), slice2.to_vec());
-                            } else {
-                                panic!("config not expected type")
-                            }
-                        } else {
-                            panic!("uberblock not expected type")
-                        }
-                    }
-                    "write block" => {
-                        let block = BlockId(nvl.lookup_uint64("block").unwrap());
-                        let data = nvl.lookup("data").unwrap().data();
-                        let id = nvl.lookup_uint64("request_id").unwrap();
-                        if let NvData::Uint8Array(slice) = data {
-                            trace!(
-                                "got write request id={}: {:?} len={}",
-                                id,
-                                block,
-                                slice.len()
-                            );
-                            server.write_block(block, slice.to_vec(), id);
-                        } else {
-                            panic!("data not expected type")
-                        }
-                    }
-                    "free block" => {
-                        trace!("got request: {:?}", nvl);
-                        let block = BlockId(nvl.lookup_uint64("block").unwrap());
-                        let size = nvl.lookup_uint64("size").unwrap();
-                        server.free_block(block, size as u32);
-                    }
-                    "read block" => {
-                        trace!("got request: {:?}", nvl);
-                        let block = BlockId(nvl.lookup_uint64("block").unwrap());
-                        let id = nvl.lookup_uint64("request_id").unwrap();
-                        server.read_block(block, id);
-                    }
-                    other => {
-                        panic!("bad type {:?} in request {:?}", other, nvl);
-                    }
-                }
-            }
-        });
     }
 
     async fn send_response(output: &Mutex<OwnedWriteHalf>, nvl: NvList) {
@@ -220,256 +161,70 @@ impl Server {
         w.write_all(buf.as_slice()).await.unwrap();
     }
 
-    fn get_object_access(nvl: &NvListRef) -> ObjectAccess {
-        let bucket_name = nvl.lookup_string("bucket").unwrap();
-        let region_str = nvl.lookup_string("region").unwrap();
-        let endpoint = nvl.lookup_string("endpoint").unwrap();
-        ObjectAccess::new(
-            endpoint.to_str().unwrap(),
-            region_str.to_str().unwrap(),
-            bucket_name.to_str().unwrap(),
-        )
-    }
+    async fn start_connection(
+        server: Arc<Server<Ss, Cs>>,
+        stream: UnixStream,
+        mut state: Cs,
+    ) -> Result<()> {
+        let (mut input, output_raw) = stream.into_split();
+        let output = Arc::new(Mutex::new(output_raw));
 
-    async fn get_pools(&mut self, nvl: &NvList) {
-        let region_str = nvl.lookup_string("region").unwrap();
-        let endpoint = nvl.lookup_string("endpoint").unwrap();
-        let mut client =
-            ObjectAccess::get_client(endpoint.to_str().unwrap(), region_str.to_str().unwrap());
-        let mut resp = NvList::new_unique_names();
-        let mut buckets = vec![];
-        if let Ok(bucket) = nvl.lookup_string("bucket") {
-            buckets.push(bucket.into_string().unwrap());
-        } else {
-            buckets.append(
-                &mut client
-                    .list_buckets()
-                    .await
-                    .unwrap()
-                    .buckets
-                    .unwrap()
-                    .into_iter()
-                    .map(|b| b.name.unwrap())
-                    .collect(),
-            );
-        }
-
-        for buck in buckets {
-            let object_access = ObjectAccess::from_client(client, buck.as_str());
-            if let Ok(guid) = nvl.lookup_uint64("guid") {
-                if !Pool::exists(&object_access, PoolGuid(guid)).await {
-                    client = object_access.release_client();
-                    continue;
-                }
-                let pool_config = Pool::get_config(&object_access, PoolGuid(guid)).await;
-                if pool_config.is_err() {
-                    client = object_access.release_client();
-                    continue;
-                }
-                resp.insert(format!("{}", guid), pool_config.unwrap().as_ref())
-                    .unwrap();
-                debug!("sending response: {:?}", resp);
-                Self::send_response(&self.output, resp).await;
-                return;
+        let (error_tx, mut error_rx) = mpsc::channel(1);
+        loop {
+            if let Some(e) = error_rx.recv().now_or_never() {
+                // an async (spawned) task produced an error
+                return Err(e.unwrap());
             }
-            for prefix in object_access.collect_prefixes("zfs/").await {
-                debug!("prefix: {}", prefix);
-                let split: Vec<&str> = prefix.rsplitn(3, '/').collect();
-                let guid_str: &str = split[1];
-                if let Ok(guid64) = str::parse::<u64>(guid_str) {
-                    let guid = PoolGuid(guid64);
-                    // XXX do this in parallel for all guids?
-                    match Pool::get_config(&object_access, guid).await {
-                        Ok(pool_config) => resp.insert(guid_str, pool_config.as_ref()).unwrap(),
-                        Err(e) => {
-                            error!("skipping {:?}: {:?}", guid, e);
+            let nvl = match &server.timeout {
+                Some((duration, timeout_handler)) => {
+                    match tokio::time::timeout(*duration, Self::get_next_request(&mut input)).await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            // timed out.
+                            timeout_handler(&mut state);
+                            continue;
                         }
                     }
                 }
+                None => Self::get_next_request(&mut input).await,
+            }?;
+
+            let request_type_cstr = nvl.lookup_string("Type")?;
+            let request_type = request_type_cstr.to_str()?;
+            match server.handlers.get(request_type) {
+                Some(HandlerEnum::Serial(handler)) => {
+                    let response_opt = handler(&mut state, nvl).await?;
+                    if let Some(response) = response_opt {
+                        Self::send_response(&output, response).await;
+                    }
+                }
+                Some(HandlerEnum::Concurrent(handler)) => {
+                    let fut = handler(&mut state, nvl)?;
+                    let output = output.clone();
+                    let my_error_tx = error_tx.clone();
+                    tokio::spawn(async move {
+                        match fut.await {
+                            Ok(Some(response)) => {
+                                Self::send_response(&output, response).await;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                my_error_tx.send(e).await.unwrap();
+                            }
+                        }
+                    });
+                }
+                None => {
+                    return Err(anyhow!("bad type {:?} in request {:?}", request_type, nvl));
+                }
             }
-            client = object_access.release_client();
         }
-        debug!("sending response: {:?}", resp);
-        Self::send_response(&self.output, resp).await;
-    }
-
-    async fn create_pool(&mut self, object_access: &ObjectAccess, guid: PoolGuid, name: &str) {
-        Pool::create(object_access, name, guid).await;
-        let mut nvl = NvList::new_unique_names();
-        nvl.insert("Type", "pool create done").unwrap();
-        nvl.insert("GUID", &guid.0).unwrap();
-        debug!("sending response: {:?}", nvl);
-        Self::send_response(&self.output, nvl).await;
-    }
-
-    /// initiate pool opening.  Responds when pool is open
-    async fn open_pool(
-        &mut self,
-        object_access: &ObjectAccess,
-        guid: PoolGuid,
-        cache: Option<ZettaCache>,
-    ) {
-        let (pool, phys_opt, next_block) = Pool::open(object_access, guid, cache).await;
-        self.pool = Some(Arc::new(pool));
-        let mut nvl = NvList::new_unique_names();
-        nvl.insert("Type", "pool open done").unwrap();
-        nvl.insert("GUID", &guid.0).unwrap();
-        if let Some(phys) = phys_opt {
-            nvl.insert("uberblock", &phys.get_zfs_uberblock()[..])
-                .unwrap();
-            nvl.insert("config", &phys.get_zfs_config()[..]).unwrap();
-        }
-
-        nvl.insert("next_block", &next_block.0).unwrap();
-        debug!("sending response: {:?}", nvl);
-        Self::send_response(&self.output, nvl).await;
-    }
-
-    // no response
-    fn begin_txg(&mut self, txg: Txg) {
-        let pool = self.pool.as_ref().unwrap().clone();
-        pool.begin_txg(txg);
-    }
-
-    // no response
-    fn resume_txg(&mut self, txg: Txg) {
-        let pool = self.pool.as_ref().unwrap().clone();
-        pool.resume_txg(txg);
-    }
-
-    // no response
-    // This is .await'ed by the server's thread, so we can't see any new writes
-    // come in while it's in progress.
-    async fn resume_complete(&mut self) {
-        let pool = self.pool.as_ref().unwrap().clone();
-        pool.resume_complete().await;
-    }
-
-    // no response
-    fn flush_writes(&mut self) {
-        let pool = self.pool.as_ref().unwrap().clone();
-        let max_blockid = self.max_blockid;
-        pool.initiate_flush(max_blockid);
-    }
-
-    // sends response when completed
-    fn end_txg(&mut self, uberblock: Vec<u8>, config: Vec<u8>) {
-        let pool = self.pool.as_ref().unwrap().clone();
-        let output = self.output.clone();
-        // client should have already flushed all writes
-        // XXX change to an error return
-        assert_eq!(self.num_outstanding_writes.load(Ordering::Acquire), 0);
-        tokio::spawn(async move {
-            let stats = pool.end_txg(uberblock, config).await;
-            let mut nvl = NvList::new_unique_names();
-            nvl.insert("Type", "end txg done").unwrap();
-            nvl.insert("blocks_count", &stats.blocks_count).unwrap();
-            nvl.insert("blocks_bytes", &stats.blocks_bytes).unwrap();
-            nvl.insert("pending_frees_count", &stats.pending_frees_count)
-                .unwrap();
-            nvl.insert("pending_frees_bytes", &stats.pending_frees_bytes)
-                .unwrap();
-            nvl.insert("objects_count", &stats.objects_count).unwrap();
-            debug!("sending response: {:?}", nvl);
-            Self::send_response(&output, nvl).await;
-        });
-    }
-
-    /// queue write, sends response when completed (persistent).  Does not block.
-    /// completion may not happen until flush_pool() is called
-    fn write_block(&mut self, block: BlockId, data: Vec<u8>, request_id: u64) {
-        self.max_blockid = max(block, self.max_blockid);
-        let pool = self.pool.as_ref().unwrap().clone();
-        let output = self.output.clone();
-        self.num_outstanding_writes.fetch_add(1, Ordering::Release);
-        // Need to write_block() before spawning, so that the Pool knows what's been written before resume_complete()
-        let fut = pool.write_block(block, data);
-        let now = self.num_outstanding_writes.clone();
-        tokio::spawn(async move {
-            fut.await;
-            now.fetch_sub(1, Ordering::Release);
-            let mut nvl = NvList::new_unique_names();
-            nvl.insert("Type", "write done").unwrap();
-            nvl.insert("block", &block.0).unwrap();
-            nvl.insert("request_id", &request_id).unwrap();
-            trace!("sending response: {:?}", nvl);
-            Self::send_response(&output, nvl).await;
-        });
-    }
-
-    /// initiate free.  No response.  Does not block.  Completes when the current txg is ended.
-    fn free_block(&mut self, block: BlockId, size: u32) {
-        let pool = self.pool.as_ref().unwrap().clone();
-        pool.free_block(block, size);
-    }
-
-    /// initiate read, sends response when completed.  Does not block.
-    fn read_block(&mut self, block: BlockId, request_id: u64) {
-        let pool = self.pool.as_ref().unwrap().clone();
-        let output = self.output.clone();
-        tokio::spawn(async move {
-            let data = pool.read_block(block).await;
-            let mut nvl = NvList::new_unique_names();
-            nvl.insert("Type", "read done").unwrap();
-            nvl.insert("block", &block.0).unwrap();
-            nvl.insert("request_id", &request_id).unwrap();
-            nvl.insert("data", data.as_slice()).unwrap();
-            trace!(
-                "sending read done response: block={} req={} data=[{} bytes]",
-                block,
-                request_id,
-                data.len()
-            );
-            Self::send_response(&output, nvl).await;
-        });
     }
 }
 
-fn create_listener(path: String) -> UnixListener {
-    let _ = std::fs::remove_file(&path);
-    info!("Listening on: {}", path);
-    UnixListener::bind(&path).unwrap()
-}
-
-pub async fn do_server(socket_dir: &str, cache_path: Option<&str>) {
-    let ksocket_name = format!("{}/zfs_kernel_socket", socket_dir);
-    let usocket_name = format!("{}/zfs_user_socket", socket_dir);
-
-    let klistener = create_listener(ksocket_name.clone());
-    let ulistener = create_listener(usocket_name.clone());
-
-    let ujh = tokio::spawn(async move {
-        loop {
-            match ulistener.accept().await {
-                Ok((socket, _)) => {
-                    info!("accepted connection on {}", usocket_name);
-                    self::Server::ustart(socket);
-                }
-                Err(e) => {
-                    warn!("accept() on {} failed: {}", usocket_name, e);
-                }
-            }
-        }
-    });
-
-    let cache = match cache_path {
-        Some(path) => Some(ZettaCache::open(path).await),
-        None => None,
-    };
-    let kjh = tokio::spawn(async move {
-        loop {
-            match klistener.accept().await {
-                Ok((socket, _)) => {
-                    info!("accepted connection on {}", ksocket_name);
-                    self::Server::start(socket, cache.as_ref().cloned());
-                }
-                Err(e) => {
-                    warn!("accept() on {} failed: {}", ksocket_name, e);
-                }
-            }
-        }
-    });
-
-    ujh.await.unwrap();
-    kjh.await.unwrap();
+/// Helper function to produce the value that should be returned from a handler
+/// that does not need to do any async work.
+pub fn handler_return_ok(response: Option<NvList>) -> HandlerReturn {
+    Ok(Box::pin(future::ready(Ok(response))))
 }

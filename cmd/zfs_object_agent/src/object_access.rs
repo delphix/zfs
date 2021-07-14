@@ -298,10 +298,7 @@ impl ObjectAccess {
         delimiter: Option<String>,
     ) -> Vec<ListObjectsV2Output> {
         let full_prefix = prefixed(prefix);
-        let full_start_after = match start_after {
-            Some(sa) => Some(prefixed(&sa)),
-            None => None,
-        };
+        let full_start_after = start_after.map(|sa| prefixed(&sa));
         let mut results = Vec::new();
         let mut continuation_token = None;
         loop {
@@ -482,9 +479,10 @@ impl ObjectAccess {
             }
 
             tokio::time::sleep(Duration::from_millis(100)).await;
-            return true;
+            true
+        } else {
+            false
         }
-        return false;
     }
 
     // XXX just have it take ObjectIdentifiers? but they would need to be

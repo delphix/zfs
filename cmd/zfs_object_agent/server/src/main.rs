@@ -1,5 +1,11 @@
+use std::time::Duration;
+
 use clap::Arg;
+use libzoa::{
+    kernel_connection::KernelServerState, user_connection::UserServerState, zettacache::ZettaCache,
+};
 use log::*;
+use tokio::time::sleep;
 
 fn setup_logging(verbosity: u64, file_name: Option<&str>) {
     let mut base_config = fern::Dispatch::new();
@@ -82,7 +88,7 @@ fn main() {
         matches.occurrences_of("verbosity"),
         matches.value_of("output-file"),
     );
-    let x = matches.value_of("cache-file");
+    let cache_path = matches.value_of("cache-file");
 
     error!(
         "Starting ZFS Object Agent.  Local timezone is {}",
@@ -118,6 +124,17 @@ fn main() {
         .build()
         .unwrap()
         .block_on(async move {
-            libzoa::server::do_server(socket_dir, x).await;
+            UserServerState::start(socket_dir);
+
+            let cache = match cache_path {
+                Some(path) => Some(ZettaCache::open(path).await),
+                None => None,
+            };
+            KernelServerState::start(socket_dir, cache);
+
+            // keep the process from exiting
+            loop {
+                sleep(Duration::from_secs(60)).await;
+            }
         });
 }
