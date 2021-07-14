@@ -836,6 +836,7 @@ agent_reader(void *arg)
 		zfs_dbgmsg("agent_reader(%px) got err %d", curthread, err);
 		return (err);
 	}
+	zfs_dbgmsg("agent_reader(%px) length: %llu", curthread, (unsigned long long)nvlist_len);
 
 	void *buf = kmem_alloc(nvlist_len, KM_SLEEP);
 	err = agent_read_all(vos, buf, nvlist_len);
@@ -844,6 +845,7 @@ agent_reader(void *arg)
 		kmem_free(buf, nvlist_len);
 		return (err);
 	}
+	zfs_dbgmsg("agent_reader(%px) got contents", curthread);
 
 	nvlist_t *nv;
 	err = nvlist_unpack(buf, nvlist_len, &nv, KM_SLEEP);

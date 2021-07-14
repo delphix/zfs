@@ -297,6 +297,7 @@ impl Server {
         let mut w = output.lock().await;
         // XXX kernel expects this as host byte order
         //println!("sending response of {} bytes", len64);
+        debug!("sending response of {} bytes", len64);
         w.write_u64_le(len64).await.unwrap();
         w.write_all(buf.as_slice()).await.unwrap();
     }
@@ -651,7 +652,9 @@ impl Server {
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "pool close done").unwrap();
         if self.readonly {
+            debug!("sending response: {:?}", nvl);
             Self::send_response(&self.output, nvl.clone()).await;
+            debug!("sent response: {:?}", nvl);
             return;
         }
         if let Some(pool) = &self.pool {
@@ -659,7 +662,9 @@ impl Server {
             self.unclaim_pool(&pool_shared_state.object_access, pool_shared_state.guid)
                 .await;
         }
+        debug!("sending response: {:?}", nvl);
         Self::send_response(&self.output, nvl.clone()).await;
+        debug!("sent response: {:?}", nvl);
     }
 }
 
