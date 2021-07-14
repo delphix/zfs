@@ -528,15 +528,19 @@ impl ObjectAccess {
         while self.delete_objects_impl(keys).await {}
     }
 
-    pub fn get_bucket(&self) -> String {
+    pub fn bucket(&self) -> String {
         self.bucket_str.clone()
     }
 
-    pub fn get_region(&self) -> String {
+    pub fn region(&self) -> String {
         self.region_str.clone()
     }
 
-    pub fn get_endpoint(&self) -> String {
+    pub fn endpoint(&self) -> String {
         self.endpoint_str.clone()
+    }
+
+    pub fn readonly(&self) -> bool {
+        self.readonly
     }
 }

@@ -977,6 +977,9 @@ agent_reader(void *arg)
 		vos->vos_serial_done[VOS_SERIAL_CLOSE_POOL] = B_TRUE;
 		cv_broadcast(&vos->vos_outstanding_cv);
 		mutex_exit(&vos->vos_outstanding_lock);
+		mutex_enter(&vos->vos_lock);
+		vos->vos_agent_thread_exit = B_TRUE;
+		mutex_exit(&vos->vos_lock);
 	} else {
 		zfs_dbgmsg("unrecognized response type!");
 	}

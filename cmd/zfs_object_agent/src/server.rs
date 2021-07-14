@@ -1,24 +1,13 @@
-use crate::heartbeat;
-use crate::heartbeat::{HeartbeatPhys, HEARTBEAT_INTERVAL, LEASE_DURATION};
+use crate::base_types::*;
 use crate::object_access::ObjectAccess;
 use crate::pool::*;
 use crate::zettacache::ZettaCache;
-use crate::{base_types::*, object_access::OAError};
-use anyhow::Context;
 use log::*;
 use nvpair::{NvData, NvEncoding, NvList, NvListRef};
 use rusoto_s3::S3;
-use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::{
-    cmp::max,
-    fs::File,
-    io::Write,
-    path::Path,
-    sync::Arc,
-    time::{Instant, SystemTime},
-};
+use std::{cmp::max, fs::File, io::Write, path::Path, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixListener;
@@ -27,54 +16,6 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tokio::time::Duration;
 use uuid::Uuid;
-const CLAIM_DURATION: Duration = Duration::from_secs(2);
-
-enum OwnResult {
-    Success,
-    Failure(HeartbeatPhys),
-    Retry,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-struct PoolOwnerPhys {
-    id: PoolGuid,
-    owner: Uuid,
-}
-
-impl PoolOwnerPhys {
-    fn key(id: PoolGuid) -> String {
-        format!("zfs/{}/owner", id.to_string())
-    }
-
-    async fn get(object_access: &ObjectAccess, id: PoolGuid) -> anyhow::Result<Self> {
-        let key = Self::key(id);
-        let buf = object_access.get_object_impl(&key, None).await?;
-        let this: Self = serde_json::from_slice(&buf)
-            .context(format!("Failed to decode contents of {}", key))?;
-        debug!("got {:#?}", this);
-        assert_eq!(this.id, id);
-        Ok(this)
-    }
-
-    async fn put_timeout(
-        &self,
-        object_access: &ObjectAccess,
-        timeout: Option<Duration>,
-    ) -> Result<
-        rusoto_s3::PutObjectOutput,
-        OAError<rusoto_core::RusotoError<rusoto_s3::PutObjectError>>,
-    > {
-        debug!("putting {:#?}", self);
-        let buf = serde_json::to_vec(&self).unwrap();
-        object_access
-            .put_object_timed(&Self::key(self.id), buf, timeout)
-            .await
-    }
-
-    async fn delete(object_access: &ObjectAccess, id: PoolGuid) {
-        object_access.delete_object(&Self::key(id)).await;
-    }
-}
 
 pub struct Server {
     input: OwnedReadHalf,
@@ -380,96 +321,6 @@ impl Server {
         Self::send_response(&self.output, resp).await;
     }
 
-    async fn try_claim_pool(
-        &self,
-        object_access: &ObjectAccess,
-        guid: PoolGuid,
-        id: Uuid,
-    ) -> OwnResult {
-        let start = Instant::now();
-        let owner_res = PoolOwnerPhys::get(object_access, guid).await;
-        let mut duration = Instant::now().duration_since(start);
-        if let Ok(owner) = owner_res {
-            info!("Owner found: {:?}", owner);
-            let heartbeat_res = HeartbeatPhys::get(object_access, owner.owner).await;
-            duration = Instant::now().duration_since(start);
-            if let Ok(heartbeat) = heartbeat_res {
-                info!("Heartbeat found: {:?}", heartbeat);
-                if owner.owner == id {
-                    info!("Self heartbeat found");
-                    return OwnResult::Success;
-                }
-                /*
-                 * We do this twice, because in the normal case we'll find an updated heartbeat within
-                 * a couple seconds. In the case where there are unexpected s3 failures or network
-                 * problems, we wait for the full duration.
-                 */
-                let short_duration = HEARTBEAT_INTERVAL * 2;
-                let long_duration = LEASE_DURATION * 2 - short_duration;
-                sleep(short_duration).await;
-                if let Ok(new_heartbeat) = HeartbeatPhys::get(object_access, owner.owner).await {
-                    if heartbeat.timestamp != new_heartbeat.timestamp {
-                        return OwnResult::Failure(new_heartbeat);
-                    }
-                }
-                sleep(long_duration).await;
-                if let Ok(new_heartbeat) = HeartbeatPhys::get(object_access, owner.owner).await {
-                    if heartbeat.timestamp != new_heartbeat.timestamp {
-                        return OwnResult::Failure(new_heartbeat);
-                    }
-                }
-                let time = Instant::now();
-                if let Ok(new_owner) = PoolOwnerPhys::get(object_access, guid).await {
-                    if new_owner.owner != owner.owner {
-                        return OwnResult::Failure(
-                            HeartbeatPhys::get(object_access, new_owner.owner)
-                                .await
-                                .unwrap(),
-                        );
-                    }
-                }
-                duration = Instant::now().duration_since(time);
-            }
-        }
-
-        if duration > CLAIM_DURATION {
-            return OwnResult::Retry;
-        }
-
-        let owner = PoolOwnerPhys {
-            id: guid,
-            owner: id,
-        };
-
-        let put_result = owner
-            .put_timeout(object_access, Some(CLAIM_DURATION - duration))
-            .await;
-
-        if let Err(OAError::TimeoutError(_)) = put_result {
-            return OwnResult::Retry;
-        }
-        sleep(CLAIM_DURATION * 3).await;
-
-        let final_owner = PoolOwnerPhys::get(object_access, guid).await.unwrap();
-        if final_owner.owner != id {
-            return OwnResult::Failure(
-                HeartbeatPhys::get(object_access, final_owner.owner)
-                    .await
-                    .unwrap_or(HeartbeatPhys {
-                        timestamp: SystemTime::now(),
-                        hostname: "unknown".to_string(),
-                        lease_duration: LEASE_DURATION,
-                        id: final_owner.owner,
-                    }),
-            );
-        }
-        return OwnResult::Success;
-    }
-
-    async fn unclaim_pool(&self, object_access: &ObjectAccess, guid: PoolGuid) {
-        PoolOwnerPhys::delete(object_access, guid).await;
-    }
-
     async fn create_pool(&mut self, object_access: &ObjectAccess, guid: PoolGuid, name: &str) {
         Pool::create(object_access, name, guid).await;
         let mut nvl = NvList::new_unique_names();
@@ -477,31 +328,6 @@ impl Server {
         nvl.insert("GUID", &guid.0).unwrap();
         debug!("sending response: {:?}", nvl);
         Self::send_response(&self.output, nvl).await;
-    }
-
-    async fn claim_pool(
-        &mut self,
-        object_access: &ObjectAccess,
-        guid: PoolGuid,
-        id: Uuid,
-    ) -> Option<NvList> {
-        loop {
-            match self.try_claim_pool(object_access, guid, id).await {
-                OwnResult::Success => {
-                    return None;
-                }
-                OwnResult::Failure(heartbeat) => {
-                    let mut nvl = NvList::new_unique_names();
-                    nvl.insert("Type", "pool open failed").unwrap();
-                    nvl.insert("cause", "MMP").unwrap();
-                    nvl.insert("hostname", heartbeat.hostname.as_str()).unwrap();
-                    return Some(nvl);
-                }
-                OwnResult::Retry => {
-                    continue;
-                }
-            }
-        }
     }
 
     /// initiate pool opening.  Responds when pool is open
@@ -513,24 +339,18 @@ impl Server {
         readonly: bool,
         cache: Option<ZettaCache>,
     ) {
-        let (pool, phys_opt, next_block) = Pool::open(
-            object_access,
-            guid,
-            cache,
-            if !readonly {
-                Some(heartbeat::start_heartbeat(object_access.clone(), id).await)
-            } else {
-                None
-            },
-        )
-        .await;
-        if !readonly {
-            if let Some(nvl) = self.claim_pool(object_access, guid, id).await {
+        let (pool, phys_opt, next_block) = match Pool::open(object_access, guid, cache, id).await {
+            Ok(x) => x,
+            Err(PoolOpenError::MmpError(hostname)) => {
+                let mut nvl = NvList::new_unique_names();
+                nvl.insert("Type", "pool open failed").unwrap();
+                nvl.insert("cause", "MMP").unwrap();
+                nvl.insert("hostname", hostname.as_str()).unwrap();
                 debug!("sending response: {:?}", nvl);
                 Self::send_response(&self.output, nvl).await;
                 return;
             }
-        }
+        };
         self.pool = Some(Arc::new(pool));
         self.readonly = readonly;
         let mut nvl = NvList::new_unique_names();
@@ -654,17 +474,13 @@ impl Server {
         if self.readonly {
             debug!("sending response: {:?}", nvl);
             Self::send_response(&self.output, nvl.clone()).await;
-            debug!("sent response: {:?}", nvl);
             return;
         }
         if let Some(pool) = &self.pool {
-            let pool_shared_state = &pool.state.shared_state;
-            self.unclaim_pool(&pool_shared_state.object_access, pool_shared_state.guid)
-                .await;
+            pool.unclaim().await;
         }
         debug!("sending response: {:?}", nvl);
         Self::send_response(&self.output, nvl.clone()).await;
-        debug!("sent response: {:?}", nvl);
         sleep(Duration::from_secs(1)).await;
     }
 }
@@ -684,7 +500,10 @@ pub async fn do_server(socket_dir: &str, cache_path: Option<&str>) {
     let id = match tokio::fs::File::open(id_path).await {
         Ok(mut f) => {
             let mut bytes = Vec::new();
-            assert!(f.read_to_end(&mut bytes).await.unwrap() == uuid::adapter::Hyphenated::LENGTH);
+            assert_eq!(
+                f.read_to_end(&mut bytes).await.unwrap(),
+                uuid::adapter::Hyphenated::LENGTH,
+            );
             Uuid::parse_str(std::str::from_utf8(&bytes).unwrap()).unwrap()
         }
         Err(_) => {
