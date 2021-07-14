@@ -97,6 +97,7 @@ typedef enum {
 	VOS_SERIAL_CREATE_POOL,
 	VOS_SERIAL_OPEN_POOL,
 	VOS_SERIAL_END_TXG,
+	VOS_SERIAL_CLOSE_POOL,
 	VOS_SERIAL_TYPES
 } vos_serial_types_t;
 
@@ -453,6 +454,7 @@ object_store_stop_agent(vdev_t *vd)
 	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_EXIT);
 	agent_request(vos, nv, FTAG);
 	fnvlist_free(nv);
+	agent_wait_serial(vos, VOS_SERIAL_CLOSE_POOL);
 }
 
 static void
@@ -967,6 +969,12 @@ agent_reader(void *arg)
 		    zio->io_offset >> SPA_MINBLOCKSHIFT);
 		fnvlist_free(nv);
 		zio_delay_interrupt(zio);
+	} else if (strcmp(type, "pool close done") == 0) {
+		mutex_enter(&vos->vos_outstanding_lock);
+		ASSERT(!vos->vos_serial_done[VOS_SERIAL_CLOSE_POOL]);
+		vos->vos_serial_done[VOS_SERIAL_CLOSE_POOL] = B_TRUE;
+		cv_broadcast(&vos->vos_outstanding_cv);
+		mutex_exit(&vos->vos_outstanding_lock);
 	} else {
 		zfs_dbgmsg("unrecognized response type!");
 	}
@@ -1245,12 +1253,12 @@ vdev_object_store_close(vdev_t *vd)
 	if (vd->vdev_reopening || vos == NULL)
 		return;
 	mutex_enter(&vos->vos_lock);
-	vos->vos_agent_thread_exit = B_TRUE;
 
 	mutex_enter(&vos->vos_sock_lock);
 	object_store_stop_agent(vd);
 	mutex_exit(&vos->vos_sock_lock);
 
+	vos->vos_agent_thread_exit = B_TRUE;
 	vos->vos_vdev = NULL;
 	zfs_object_store_shutdown(vos);
 
