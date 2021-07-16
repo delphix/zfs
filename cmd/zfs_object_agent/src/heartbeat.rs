@@ -1,17 +1,15 @@
+use crate::object_access::{OAError, ObjectAccess};
+use anyhow::Context;
+use lazy_static::lazy_static;
+use log::{debug, info};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::{Arc, Weak},
     time::{Duration, SystemTime},
 };
-
-use anyhow::Context;
-use lazy_static::lazy_static;
-use log::{debug, info};
-use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use uuid::Uuid;
-
-use crate::object_access::{OAError, ObjectAccess};
 
 pub const LEASE_DURATION: Duration = Duration::from_secs(10);
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
@@ -83,7 +81,7 @@ pub async fn start_heartbeat(object_access: ObjectAccess, id: Uuid) -> Heartbeat
         region: object_access.region(),
         bucket: object_access.bucket(),
     };
-    let (guard, notif_opt, found) = {
+    let (guard, notify_opt, found) = {
         let mut heartbeats = HEARTBEAT.lock().unwrap();
         match heartbeats.get(&key) {
             None => {
@@ -128,7 +126,7 @@ pub async fn start_heartbeat(object_access: ObjectAccess, id: Uuid) -> Heartbeat
          * progress, we wait for the init to finish before returning.
          */
         debug!("upgrade succeeded, using existing heartbeat");
-        if let Some(notify) = notif_opt {
+        if let Some(notify) = notify_opt {
             notify.notified().await;
         }
         return guard;
@@ -142,19 +140,23 @@ pub async fn start_heartbeat(object_access: ObjectAccess, id: Uuid) -> Heartbeat
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             interval.tick().await;
-            let in_use;
             {
-                let mut heartbeats = HEARTBEAT.lock().unwrap();
-                in_use = heartbeats.get(&key).unwrap().upgrade().is_some();
-                if !in_use {
-                    heartbeats.remove(&key);
-                    info!("Stopping heartbeat with id {}", id);
+                let fut_opt = {
+                    let mut heartbeats = HEARTBEAT.lock().unwrap();
+                    // We can almost use or_else here, but that doesn't let us change types.
+                    match heartbeats.get(&key).unwrap().upgrade() {
+                        None => {
+                            heartbeats.remove(&key);
+                            info!("Stopping heartbeat with id {}", id);
+                            Some(HeartbeatPhys::delete(&object_access, id))
+                        }
+                        Some(_) => None,
+                    }
+                };
+                if let Some(fut) = fut_opt {
+                    fut.await;
+                    return;
                 }
-                drop(heartbeats);
-            }
-            if !in_use {
-                HeartbeatPhys::delete(&object_access, id).await;
-                return;
             }
             let heartbeat = HeartbeatPhys {
                 timestamp: SystemTime::now(),
@@ -181,7 +183,7 @@ pub async fn start_heartbeat(object_access: ObjectAccess, id: Uuid) -> Heartbeat
             }
         }
     });
-    notif_opt.unwrap().notified().await;
+    notify_opt.unwrap().notified().await;
     guard
 }
 

@@ -649,7 +649,7 @@ agent_resume(void *arg)
 		agent_create_pool(vd, vos);
 	}
 	VERIFY0(agent_open_pool(vd, vos,
-		vdev_object_store_open_mode(spa_mode(vd->vdev_spa))));
+	    vdev_object_store_open_mode(spa_mode(vd->vdev_spa))));
 
 	mutex_enter(&vos->vos_sock_lock);
 
@@ -836,7 +836,6 @@ agent_reader(void *arg)
 		zfs_dbgmsg("agent_reader(%px) got err %d", curthread, err);
 		return (err);
 	}
-	zfs_dbgmsg("agent_reader(%px) length: %llu", curthread, (unsigned long long)nvlist_len);
 
 	void *buf = kmem_alloc(nvlist_len, KM_SLEEP);
 	err = agent_read_all(vos, buf, nvlist_len);
@@ -845,7 +844,6 @@ agent_reader(void *arg)
 		kmem_free(buf, nvlist_len);
 		return (err);
 	}
-	zfs_dbgmsg("agent_reader(%px) got contents", curthread);
 
 	nvlist_t *nv;
 	err = nvlist_unpack(buf, nvlist_len, &nv, KM_SLEEP);
@@ -930,9 +928,9 @@ agent_reader(void *arg)
 		    ZPOOL_CONFIG_MMP_HOSTNAME, fnvlist_lookup_string(nv,
 		    AGENT_HOSTNAME));
 		fnvlist_add_uint64(spa->spa_load_info,
-                    ZPOOL_CONFIG_MMP_STATE, MMP_STATE_ACTIVE);
-                fnvlist_add_uint64(spa->spa_load_info,
-                    ZPOOL_CONFIG_MMP_TXG, 0);
+		    ZPOOL_CONFIG_MMP_STATE, MMP_STATE_ACTIVE);
+		fnvlist_add_uint64(spa->spa_load_info,
+		    ZPOOL_CONFIG_MMP_TXG, 0);
 
 		mutex_enter(&vos->vos_outstanding_lock);
 		vos->vos_result = SET_ERROR(EREMOTEIO);
@@ -1075,7 +1073,7 @@ vdev_agent_thread(void *arg)
 
 	mutex_enter(&vos->vos_lock);
 	vos->vos_agent_thread = NULL;
- 	cv_broadcast(&vos->vos_cv);
+	cv_broadcast(&vos->vos_cv);
 	mutex_exit(&vos->vos_lock);
 	zfs_dbgmsg("agent thread exited");
 	thread_exit();

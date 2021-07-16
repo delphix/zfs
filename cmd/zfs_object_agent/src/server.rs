@@ -13,7 +13,6 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixListener;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
-use tokio::time::sleep;
 use tokio::time::Duration;
 use uuid::Uuid;
 
@@ -340,7 +339,6 @@ impl Server {
         cache: Option<ZettaCache>,
     ) {
         let (pool, phys_opt, next_block) = match Pool::open(object_access, guid, cache, id).await {
-            Ok(x) => x,
             Err(PoolOpenError::MmpError(hostname)) => {
                 let mut nvl = NvList::new_unique_names();
                 nvl.insert("Type", "pool open failed").unwrap();
@@ -350,6 +348,7 @@ impl Server {
                 Self::send_response(&self.output, nvl).await;
                 return;
             }
+            x => x.unwrap(),
         };
         self.pool = Some(Arc::new(pool));
         self.readonly = readonly;
@@ -473,15 +472,14 @@ impl Server {
         nvl.insert("Type", "pool close done").unwrap();
         if self.readonly {
             debug!("sending response: {:?}", nvl);
-            Self::send_response(&self.output, nvl.clone()).await;
+            Self::send_response(&self.output, nvl).await;
             return;
         }
         if let Some(pool) = &self.pool {
-            pool.unclaim().await;
+            pool.close().await;
         }
         debug!("sending response: {:?}", nvl);
-        Self::send_response(&self.output, nvl.clone()).await;
-        sleep(Duration::from_secs(1)).await;
+        Self::send_response(&self.output, nvl).await;
     }
 }
 

@@ -10,6 +10,7 @@ use crate::object_based_log::*;
 use crate::object_block_map::ObjectBlockMap;
 use crate::object_block_map::StorageObjectLogEntry;
 use crate::zettacache::ZettaCache;
+use anyhow::Error;
 use anyhow::{Context, Result};
 use core::future::Future;
 use futures::future;
@@ -95,8 +96,10 @@ impl PoolOwnerPhys {
         object_access.delete_object(&Self::key(id)).await;
     }
 }
+#[derive(Debug)]
 pub enum PoolOpenError {
     MmpError(String),
+    GetError(Error),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -567,7 +570,11 @@ impl Pool {
         cache: Option<ZettaCache>,
         id: Uuid,
     ) -> Result<(Pool, Option<UberblockPhys>, BlockId), PoolOpenError> {
-        let phys = PoolPhys::get(object_access, guid).await.unwrap();
+        let result = PoolPhys::get(object_access, guid).await;
+        if let Err(e) = result {
+            return Err(PoolOpenError::GetError(e));
+        }
+        let phys = result.unwrap();
         if phys.last_txg.0 == 0 {
             let shared_state = Arc::new(PoolSharedState {
                 object_access: object_access.clone(),
@@ -617,9 +624,7 @@ impl Pool {
             let next_block = pool
                 .state
                 .with_syncing_state(|syncing_state| syncing_state.next_block());
-            pool.claim(object_access, guid, id)
-                .await
-                .map(|_| (pool, None, next_block))
+            pool.claim(id).await.map(|_| (pool, None, next_block))
         } else {
             let (mut pool, ub, next_block) = Pool::open_from_txg(
                 object_access,
@@ -634,9 +639,7 @@ impl Pool {
             )
             .await;
 
-            pool.claim(object_access, guid, id)
-                .await
-                .map(|_| (pool, ub, next_block))
+            pool.claim(id).await.map(|_| (pool, ub, next_block))
         }
     }
 
@@ -1229,7 +1232,9 @@ impl Pool {
         })
     }
 
-    async fn try_claim(&self, object_access: &ObjectAccess, guid: PoolGuid, id: Uuid) -> OwnResult {
+    async fn try_claim(&self, id: Uuid) -> OwnResult {
+        let object_access = &self.state.shared_state.object_access;
+        let guid = self.state.shared_state.guid;
         let start = Instant::now();
         let owner_res = PoolOwnerPhys::get(object_access, guid).await;
         let mut duration = Instant::now().duration_since(start);
@@ -1310,25 +1315,12 @@ impl Pool {
         return OwnResult::Success;
     }
 
-    pub async fn unclaim(&self) {
-        PoolOwnerPhys::delete(
-            &self.state.shared_state.object_access,
-            self.state.shared_state.guid,
-        )
-        .await;
-    }
-
-    pub async fn claim(
-        &mut self,
-        object_access: &ObjectAccess,
-        guid: PoolGuid,
-        id: Uuid,
-    ) -> Result<(), PoolOpenError> {
-        if object_access.readonly() {
+    pub async fn claim(&mut self, id: Uuid) -> Result<(), PoolOpenError> {
+        if self.state.shared_state.object_access.readonly() {
             return Ok(());
         }
         loop {
-            match self.try_claim(object_access, guid, id).await {
+            match self.try_claim(id).await {
                 OwnResult::Success => {
                     return Ok(());
                 }
@@ -1339,6 +1331,20 @@ impl Pool {
                     continue;
                 }
             }
+        }
+    }
+
+    async fn unclaim(&self) {
+        PoolOwnerPhys::delete(
+            &self.state.shared_state.object_access,
+            self.state.shared_state.guid,
+        )
+        .await;
+    }
+
+    pub async fn close(&self) {
+        if !self.state.shared_state.object_access.readonly() {
+            self.unclaim().await;
         }
     }
 }
