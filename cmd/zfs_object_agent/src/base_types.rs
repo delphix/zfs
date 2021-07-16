@@ -109,3 +109,6 @@ impl Atime {
         Atime(self.0 + 1)
     }
 }
+
+#[derive(Serialize, Deserialize, Default, Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
+pub struct FreeLogId(pub usize);
