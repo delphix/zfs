@@ -249,7 +249,7 @@ typedef enum {
 	ZPOOL_PROP_COMPATIBILITY,
 	ZPOOL_PROP_OBJ_ENDPOINT,
 	ZPOOL_PROP_OBJ_REGION,
-	ZPOOL_PROP_OBJ_CREDENTIALS,
+	ZPOOL_PROP_OBJ_CRED_PROFILE,
 	ZPOOL_NUM_PROPS
 } zpool_prop_t;
 
@@ -638,7 +638,7 @@ typedef struct zpool_load_policy {
 #define	ZPOOL_CONFIG_VDEV_STATS		"vdev_stats"	/* not stored on disk */
 #define	ZPOOL_CONFIG_INDIRECT_SIZE	"indirect_size"	/* not stored on disk */
 /* not stored on disk */
-#define	ZPOOL_CONFIG_OBJSTORE_CREDENTIALS "objstore_credentials"
+#define	ZPOOL_CONFIG_CRED_PROFILE	"credentials_profile"
 
 /* container nvlist of extended stats */
 #define	ZPOOL_CONFIG_VDEV_STATS_EX	"vdev_stats_ex"

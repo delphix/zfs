@@ -403,13 +403,11 @@ void
 zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
     pthread_mutex_t *lock, avl_tree_t *cache)
 {
-	char *creds, *bucket = NULL, *endpoint, *region;
-	if ((nvlist_lookup_string(iarg->props,
-	    "object-credentials-location", &creds)) != 0) {
-		return;
-	}
+	char *profile = NULL, *bucket = NULL, *endpoint, *region;
+
 	// TODO: We don't handle multiple search paths yet
-	if (iarg->path != NULL) {
+	nvlist_lookup_string(iarg->props, "path", &bucket);
+	if (bucket == NULL && iarg->path != NULL) {
 		bucket = iarg->path[0];
 	}
 	if ((nvlist_lookup_string(iarg->props, "object-endpoint",
@@ -420,26 +418,24 @@ zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
 	    &region)) != 0) {
 		return;
 	}
+	nvlist_lookup_string(iarg->props, "object-credentials-profile",
+	    &profile);
 
 	nvlist_t *msg = fnvlist_alloc();
-	char *credentials;
-	if (iarg->handle_creds(hdl->lpc_lib_handle, creds, &credentials) != 0) {
-		fnvlist_free(msg);
-		return;
-	}
 	fnvlist_add_string(msg, "Type", "get pools");
 	if (bucket != NULL)
 		fnvlist_add_string(msg, "bucket", bucket);
 	fnvlist_add_string(msg, "region", region);
 	fnvlist_add_string(msg, "endpoint", endpoint);
-	fnvlist_add_string(msg, "credentials", credentials);
+	if (profile != NULL) {
+		fnvlist_add_string(msg, "credentials_profile", profile);
+	}
 	if (iarg->guid != 0)
 		fnvlist_add_uint64(msg, "guid", iarg->guid);
 	int sock = socket(AF_UNIX, SOCK_STREAM, 0);
 	int err = connect(sock, (struct sockaddr *)&zfs_user_socket,
 	    sizeof (zfs_user_socket));
 	if (err != 0) {
-		free(credentials);
 		fnvlist_free(msg);
 		close(sock);
 		return;
@@ -453,7 +449,6 @@ zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
 	ssize_t rv = write(sock, &len_le, sizeof (len_le));
 	if (rv < 0) {
 		fnvlist_pack_free(buf, len);
-		free(credentials);
 		close(sock);
 		return;
 	}
@@ -463,7 +458,6 @@ zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
 	fnvlist_pack_free(buf, len);
 
 	if (rv < 0) {
-		free(credentials);
 		close(sock);
 		return;
 	}
@@ -473,7 +467,6 @@ zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
 	size_t size;
 	rv = read_all(sock, &resp_size, sizeof (resp_size));
 	if (rv < 0) {
-		free(credentials);
 		close(sock);
 		return;
 	}
@@ -485,7 +478,6 @@ zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
 	rv = read_all(sock, buf, size);
 	close(sock);
 	if (rv < 0) {
-		free(credentials);
 		free(buf);
 		return;
 	}
@@ -503,13 +495,14 @@ zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
 
 		nvlist_t *tree = fnvlist_lookup_nvlist(config,
 		    ZPOOL_CONFIG_VDEV_TREE);
+
 		char *type;
-		if (nvlist_lookup_string(tree, ZPOOL_CONFIG_TYPE, &type) == 0 &&
+		if (profile != NULL &&
+		    nvlist_lookup_string(tree, ZPOOL_CONFIG_TYPE, &type) == 0 &&
 		    strcmp(type, VDEV_TYPE_OBJSTORE) == 0) {
 			fnvlist_add_string(tree,
-			    ZPOOL_CONFIG_OBJSTORE_CREDENTIALS, credentials);
+			    ZPOOL_CONFIG_CRED_PROFILE, profile);
 		}
-
 		uint64_t guid;
 		if (nvlist_lookup_uint64(tree, ZPOOL_CONFIG_GUID, &guid) != 0) {
 			continue;
@@ -518,7 +511,6 @@ zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
 		slice = zutil_alloc(hdl, sizeof (rdsk_node_t));
 		if (asprintf(&slice->rn_name, "%s", fnvlist_lookup_string(tree,
 		    ZPOOL_CONFIG_PATH)) == -1) {
-			free(credentials);
 			free(slice);
 			return;
 		}
@@ -540,7 +532,6 @@ zpool_find_import_agent(libpc_handle_t *hdl, importargs_t *iarg,
 		}
 		pthread_mutex_unlock(lock);
 	}
-	free(credentials);
 	fnvlist_free(resp);
 }
 

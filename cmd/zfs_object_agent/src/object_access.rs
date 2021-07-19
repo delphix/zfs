@@ -9,7 +9,7 @@ use log::*;
 use lru::LruCache;
 use rand::prelude::*;
 use rusoto_core::{ByteStream, RusotoError};
-use rusoto_credential::DefaultCredentialsProvider;
+use rusoto_credential::{AutoRefreshingProvider, ChainProvider, ProfileProvider};
 use rusoto_s3::*;
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,6 +32,14 @@ lazy_static! {
         Ok(val) => format!("{}/", val),
         Err(_) => "".to_string(),
     };
+    static ref NON_RETRYABLE_ERRORS: Vec<StatusCode> = vec![
+        StatusCode::BAD_REQUEST,
+        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
+        StatusCode::METHOD_NOT_ALLOWED,
+        StatusCode::PRECONDITION_FAILED,
+        StatusCode::PAYLOAD_TOO_LARGE,
+    ];
 }
 
 // log operations that take longer than this with info!()
@@ -158,14 +166,21 @@ impl ObjectAccess {
         rusoto_s3::S3Client::new_with(http_client, creds, region)
     }
 
-    pub fn get_client(endpoint: &str, region_str: &str) -> S3Client {
-        info!("region: {:?}", region_str);
+    pub fn get_client(endpoint: &str, region_str: &str, profile: Option<String>) -> S3Client {
+        info!("region: {}", region_str);
         info!("Endpoint: {}", endpoint);
+        info!("Profile: {:?}", profile);
 
-        let creds = DefaultCredentialsProvider::new().unwrap();
+        let auto_refreshing_provider =
+            AutoRefreshingProvider::new(ChainProvider::with_profile_provider(
+                ProfileProvider::with_default_credentials(profile.unwrap_or_else(|| "default".to_owned()))
+                    .unwrap(),
+            ))
+            .unwrap();
+
         let http_client = rusoto_core::HttpClient::new().unwrap();
         let region = ObjectAccess::get_custom_region(endpoint, region_str);
-        rusoto_s3::S3Client::new_with(http_client, creds, region)
+        rusoto_s3::S3Client::new_with(http_client, auto_refreshing_provider, region)
     }
 
     pub fn from_client(client: rusoto_s3::S3Client, bucket: &str) -> Self {
@@ -175,8 +190,8 @@ impl ObjectAccess {
         }
     }
 
-    pub fn new(endpoint: &str, region_str: &str, bucket: &str) -> Self {
-        let client = ObjectAccess::get_client(endpoint, region_str);
+    pub fn new(endpoint: &str, region_str: &str, bucket: &str, profile: Option<String>) -> Self {
+        let client = ObjectAccess::get_client(endpoint, region_str, profile);
 
         ObjectAccess {
             client,
@@ -318,7 +333,11 @@ impl ObjectAccess {
                         start_after: full_start_after.clone(),
                         ..Default::default()
                     };
-                    (true, self.client.list_objects_v2(req).await)
+                    let res = self.client.list_objects_v2(req).await;
+                    match res {
+                        Err(ref err) => (self.is_retryable(err), res),
+                        _ => (true, res),
+                    }
                 },
             )
             .await
@@ -382,14 +401,10 @@ impl ObjectAccess {
                 key: prefixed(key),
                 ..Default::default()
             };
-            let res = self.client.head_object(req).await;
+            let res: Result<HeadObjectOutput, RusotoError<HeadObjectError>> =
+                self.client.head_object(req).await;
             match res {
-                Err(RusotoError::Service(HeadObjectError::NoSuchKey(_))) => (false, res),
-                Err(RusotoError::Unknown(rusoto_core::request::BufferedHttpResponse {
-                    status: StatusCode::NOT_FOUND,
-                    body: _,
-                    headers: _,
-                })) => (false, res),
+                Err(ref err) => (self.is_retryable(err), res),
                 _ => (true, res),
             }
         })
@@ -404,6 +419,7 @@ impl ObjectAccess {
     async fn put_object_impl(&self, key: &str, data: Vec<u8>) {
         let len = data.len();
         let bytes = Bytes::from(data);
+
         retry(
             &format!("put {} ({} bytes)", prefixed(key), len),
             None,
@@ -417,7 +433,11 @@ impl ObjectAccess {
                     body: Some(stream),
                     ..Default::default()
                 };
-                (true, self.client.put_object(req).await)
+                let res = self.client.put_object(req).await;
+                match res {
+                    Err(ref err) => (self.is_retryable(err), res),
+                    _ => (true, res),
+                }
             },
         )
         .await
@@ -493,5 +513,22 @@ impl ObjectAccess {
     // XXX should we split them up here?
     pub async fn delete_objects(&self, keys: &[String]) {
         while self.delete_objects_impl(keys).await {}
+    }
+
+    // Treat some client errors as fatal errors
+    fn is_retryable<E>(&self, error: &RusotoError<E>) -> bool
+    where
+        E: std::error::Error,
+    {
+        match error {
+            RusotoError::Service(_) => false,
+            RusotoError::Credentials(_) => false,
+            RusotoError::Unknown(rusoto_core::request::BufferedHttpResponse {
+                status: stat,
+                body: _,
+                headers: _,
+            }) => !NON_RETRYABLE_ERRORS.contains(&stat),
+            _ => true,
+        }
     }
 }

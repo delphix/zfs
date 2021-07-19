@@ -79,9 +79,9 @@ zpool_prop_init(void)
 	    PROP_DEFAULT, ZFS_TYPE_POOL, "<uri>", "OBJ_ENDPOINT");
 	zprop_register_string(ZPOOL_PROP_OBJ_REGION, "object-region", NULL,
 	    PROP_DEFAULT, ZFS_TYPE_POOL, "<uri>", "OBJ_REGION");
-	zprop_register_string(ZPOOL_PROP_OBJ_CREDENTIALS,
-	    "object-credentials-location", NULL, PROP_DEFAULT, ZFS_TYPE_POOL,
-	    "<uri>", "OBJ_CREDENTIALS");
+	zprop_register_string(ZPOOL_PROP_OBJ_CRED_PROFILE,
+	    "object-credentials-profile", NULL, PROP_DEFAULT, ZFS_TYPE_POOL,
+	    "<uri>", "OBJ_CRED_PROFILE");
 
 	/* readonly number properties */
 	zprop_register_number(ZPOOL_PROP_SIZE, "size", 0, PROP_READONLY,

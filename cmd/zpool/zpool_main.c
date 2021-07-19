@@ -1549,16 +1549,11 @@ zpool_do_create(int argc, char **argv)
 		goto errout;
 	}
 
-	char *credloc, *credentials;
+	char *profile;
 	if ((nvlist_lookup_string(props,
-	    zpool_prop_to_name(ZPOOL_PROP_OBJ_CREDENTIALS), &credloc)) == 0) {
-		if (zpool_get_objstore_credentials(g_zfs, credloc,
-		    &credentials) != 0) {
-			goto errout;
-		}
-		fnvlist_add_string(props, ZPOOL_CONFIG_OBJSTORE_CREDENTIALS,
-		    credentials);
-		free(credentials);
+	    zpool_prop_to_name(ZPOOL_PROP_OBJ_CRED_PROFILE), &profile)) == 0) {
+		fnvlist_add_string(props, ZPOOL_CONFIG_CRED_PROFILE,
+		    profile);
 	}
 
 	/* pass off to make_root_vdev for bulk processing */
@@ -1568,10 +1563,10 @@ zpool_do_create(int argc, char **argv)
 		goto errout;
 
 	/*
-	 * We dont' store the creds as a normal property, so remove
+	 * We dont' store the creds profile as a normal property, so remove
 	 * it now that is has been consumed.
 	 */
-	(void) nvlist_remove_all(props, ZPOOL_CONFIG_OBJSTORE_CREDENTIALS);
+	(void) nvlist_remove_all(props, ZPOOL_CONFIG_CRED_PROFILE);
 
 	/* make_root_vdev() allows 0 toplevel children if there are spares */
 	if (!zfs_allocatable_devs(nvroot)) {
@@ -3728,8 +3723,6 @@ zpool_do_import(int argc, char **argv)
 	idata.scan = do_scan;
 	idata.policy = policy;
 	idata.props = props;
-	idata.handle_creds =
-	    (int (*)(void *, char *, char **))zpool_get_objstore_credentials;
 
 	pools = zpool_search_import(g_zfs, &idata, &libzfs_config_ops);
 

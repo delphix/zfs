@@ -335,8 +335,6 @@ _LIBZFS_H int zpool_props_refresh(zpool_handle_t *);
 
 _LIBZFS_H const char *zpool_prop_to_name(zpool_prop_t);
 _LIBZFS_H const char *zpool_prop_values(zpool_prop_t);
-_LIBZFS_H int zpool_get_objstore_credentials(libzfs_handle_t *, char *,
-    char **);
 
 /*
  * Pool health statistics.
