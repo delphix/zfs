@@ -34,12 +34,13 @@ impl BlockBasedLogEntry for IndexEntry {}
 pub struct ZettaCacheIndex {
     pub atime_histogram: AtimeHistogramPhys,
     pub log: BlockBasedLogWithSummary<IndexEntry>,
+    pub free_list: Vec<IndexValue>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct ZettaCacheIndexPhys {
-    atime_histogram: AtimeHistogramPhys,
-    log: BlockBasedLogWithSummaryPhys,
+    pub atime_histogram: AtimeHistogramPhys,
+    pub log: BlockBasedLogWithSummaryPhys,
 }
 
 impl ZettaCacheIndex {
@@ -51,6 +52,7 @@ impl ZettaCacheIndex {
         Self {
             atime_histogram: phys.atime_histogram,
             log: BlockBasedLogWithSummary::open(block_access, extent_allocator, phys.log).await,
+            free_list: Vec::new(),
         }
     }
 
@@ -61,8 +63,8 @@ impl ZettaCacheIndex {
         }
     }
 
-    pub fn set_histogram_start(&mut self, start: usize) {
-        self.atime_histogram.set_start(start);
+    pub fn get_histogram_start(&mut self) -> Atime {
+        return self.atime_histogram.get_start();
     }
 
     pub fn append(&mut self, entry: IndexEntry) {
@@ -70,13 +72,13 @@ impl ZettaCacheIndex {
         self.log.append(entry);
     }
 
-    pub fn append_or_evict(&mut self, entry: IndexEntry) {
+    pub fn append_or_free(&mut self, entry: IndexEntry) {
         // Add this entry if it is still in history covered by the histogram
-        if entry.value.atime.0 as usize >= self.atime_histogram.get_start() {
+        if entry.value.atime >= self.atime_histogram.get_start() {
             self.append(entry);
+        } else {
+            self.free_list.push(entry.value);
         }
-        // XXX - Note else case is not evict_block(). We are in
-        // the merge process and just need to free the space in the cache.
     }
 
     pub fn clear(&mut self) {
