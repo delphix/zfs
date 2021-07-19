@@ -102,6 +102,12 @@ pub enum PoolOpenError {
     GetError(Error),
 }
 
+impl From<anyhow::Error> for PoolOpenError {
+    fn from(e: anyhow::Error) -> Self {
+        PoolOpenError::GetError(e)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct PoolPhys {
     guid: PoolGuid, // redundant with key, for verification
@@ -570,11 +576,7 @@ impl Pool {
         cache: Option<ZettaCache>,
         id: Uuid,
     ) -> Result<(Pool, Option<UberblockPhys>, BlockId), PoolOpenError> {
-        let result = PoolPhys::get(object_access, guid).await;
-        if let Err(e) = result {
-            return Err(PoolOpenError::GetError(e));
-        }
-        let phys = result.unwrap();
+        let phys = PoolPhys::get(object_access, guid).await?;
         if phys.last_txg.0 == 0 {
             let shared_state = Arc::new(PoolSharedState {
                 object_access: object_access.clone(),
