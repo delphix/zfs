@@ -482,7 +482,7 @@ fn get_object_access(
     aws_secret_access_key: Option<&str>,
 ) -> ObjectAccess {
     match aws_access_key_id {
-        None => ObjectAccess::new(endpoint, region, bucket),
+        None => ObjectAccess::new(endpoint, region, bucket, false),
         Some(access_id) => {
             // If access_id is specified, aws_secret_access_key should also be specified.
             let secret_key = aws_secret_access_key.unwrap();
@@ -490,7 +490,7 @@ fn get_object_access(
             let client =
                 ObjectAccess::get_client_with_creds(endpoint, region, access_id, secret_key);
 
-            ObjectAccess::from_client(client, bucket)
+            ObjectAccess::from_client(client, bucket, false, endpoint, region)
         }
     }
 }

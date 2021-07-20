@@ -1,9 +1,16 @@
 use crate::base_types::*;
+use crate::heartbeat;
+use crate::heartbeat::HeartbeatGuard;
+use crate::heartbeat::HeartbeatPhys;
+use crate::heartbeat::HEARTBEAT_INTERVAL;
+use crate::heartbeat::LEASE_DURATION;
+use crate::object_access::OAError;
 use crate::object_access::ObjectAccess;
 use crate::object_based_log::*;
 use crate::object_block_map::ObjectBlockMap;
 use crate::object_block_map::StorageObjectLogEntry;
 use crate::zettacache::ZettaCache;
+use anyhow::Error;
 use anyhow::{Context, Result};
 use core::future::Future;
 use futures::future;
@@ -20,9 +27,12 @@ use std::mem;
 use std::ops::Bound::*;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::{Instant, SystemTime};
 use stream_reduce::Reduce;
 use tokio::sync::oneshot;
+use tokio::time::sleep;
+use uuid::Uuid;
 
 // XXX need a real tunables infrastructure.  Probably should use toml.
 // start freeing when the pending frees are this % of the entire pool
@@ -38,6 +48,65 @@ const ONE_MIB: u64 = 1_048_576;
 const LOG_CONDENSE_MIN_CHUNKS: usize = 30;
 // when log is 5x as large as the condensed version
 const LOG_CONDENSE_MULTIPLE: usize = 5;
+
+const CLAIM_DURATION: Duration = Duration::from_secs(2);
+enum OwnResult {
+    Success,
+    Failure(HeartbeatPhys),
+    Retry,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+struct PoolOwnerPhys {
+    id: PoolGuid,
+    owner: Uuid,
+}
+
+impl PoolOwnerPhys {
+    fn key(id: PoolGuid) -> String {
+        format!("zfs/{}/owner", id.to_string())
+    }
+
+    async fn get(object_access: &ObjectAccess, id: PoolGuid) -> anyhow::Result<Self> {
+        let key = Self::key(id);
+        let buf = object_access.get_object_impl(&key, None).await?;
+        let this: Self = serde_json::from_slice(&buf)
+            .context(format!("Failed to decode contents of {}", key))?;
+        debug!("got {:#?}", this);
+        assert_eq!(this.id, id);
+        Ok(this)
+    }
+
+    async fn put_timeout(
+        &self,
+        object_access: &ObjectAccess,
+        timeout: Option<Duration>,
+    ) -> Result<
+        rusoto_s3::PutObjectOutput,
+        OAError<rusoto_core::RusotoError<rusoto_s3::PutObjectError>>,
+    > {
+        debug!("putting {:#?}", self);
+        let buf = serde_json::to_vec(&self).unwrap();
+        object_access
+            .put_object_timed(&Self::key(self.id), buf, timeout)
+            .await
+    }
+
+    async fn delete(object_access: &ObjectAccess, id: PoolGuid) {
+        object_access.delete_object(&Self::key(id)).await;
+    }
+}
+#[derive(Debug)]
+pub enum PoolOpenError {
+    MmpError(String),
+    GetError(Error),
+}
+
+impl From<anyhow::Error> for PoolOpenError {
+    fn from(e: anyhow::Error) -> Self {
+        PoolOpenError::GetError(e)
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 struct PoolPhys {
@@ -273,6 +342,7 @@ pub struct PoolState {
     object_block_map: ObjectBlockMap,
     zettacache: Option<ZettaCache>,
     pub shared_state: Arc<PoolSharedState>,
+    _heartbeat_guard: Option<HeartbeatGuard>, // Used for RAII
 }
 
 /// state that's modified while syncing a txg
@@ -427,6 +497,7 @@ impl Pool {
         pool_phys: &PoolPhys,
         txg: Txg,
         cache: Option<ZettaCache>,
+        heartbeat_guard: Option<HeartbeatGuard>,
     ) -> (Pool, Option<UberblockPhys>, BlockId) {
         let phys = UberblockPhys::get(object_access, pool_phys.guid, txg)
             .await
@@ -473,6 +544,7 @@ impl Pool {
                 })),
                 zettacache: cache,
                 object_block_map,
+                _heartbeat_guard: heartbeat_guard,
             }),
         };
 
@@ -502,8 +574,9 @@ impl Pool {
         object_access: &ObjectAccess,
         guid: PoolGuid,
         cache: Option<ZettaCache>,
-    ) -> (Pool, Option<UberblockPhys>, BlockId) {
-        let phys = PoolPhys::get(object_access, guid).await.unwrap();
+        id: Uuid,
+    ) -> Result<(Pool, Option<UberblockPhys>, BlockId), PoolOpenError> {
+        let phys = PoolPhys::get(object_access, guid).await?;
         if phys.last_txg.0 == 0 {
             let shared_state = Arc::new(PoolSharedState {
                 object_access: object_access.clone(),
@@ -517,7 +590,7 @@ impl Pool {
             );
             let object_block_map = ObjectBlockMap::load(&storage_object_log, BlockId(0)).await;
 
-            let pool = Pool {
+            let mut pool = Pool {
                 state: Arc::new(PoolState {
                     shared_state: shared_state.clone(),
                     syncing_state: std::sync::Mutex::new(Some(PoolSyncingState {
@@ -542,15 +615,33 @@ impl Pool {
                     })),
                     zettacache: cache,
                     object_block_map,
+                    _heartbeat_guard: if !object_access.readonly() {
+                        Some(heartbeat::start_heartbeat(object_access.clone(), id).await)
+                    } else {
+                        None
+                    },
                 }),
             };
 
             let next_block = pool
                 .state
                 .with_syncing_state(|syncing_state| syncing_state.next_block());
-            (pool, None, next_block)
+            pool.claim(id).await.map(|_| (pool, None, next_block))
         } else {
-            Pool::open_from_txg(object_access, &phys, phys.last_txg, cache).await
+            let (mut pool, ub, next_block) = Pool::open_from_txg(
+                object_access,
+                &phys,
+                phys.last_txg,
+                cache,
+                if !object_access.readonly() {
+                    Some(heartbeat::start_heartbeat(object_access.clone(), id).await)
+                } else {
+                    None
+                },
+            )
+            .await;
+
+            pool.claim(id).await.map(|_| (pool, ub, next_block))
         }
     }
 
@@ -1141,6 +1232,122 @@ impl Pool {
         self.state.with_syncing_state(|syncing_state| {
             syncing_state.log_free(PendingFreesLogEntry { block, size });
         })
+    }
+
+    async fn try_claim(&self, id: Uuid) -> OwnResult {
+        let object_access = &self.state.shared_state.object_access;
+        let guid = self.state.shared_state.guid;
+        let start = Instant::now();
+        let owner_res = PoolOwnerPhys::get(object_access, guid).await;
+        let mut duration = Instant::now().duration_since(start);
+        if let Ok(owner) = owner_res {
+            info!("Owner found: {:?}", owner);
+            let heartbeat_res = HeartbeatPhys::get(object_access, owner.owner).await;
+            duration = Instant::now().duration_since(start);
+            if let Ok(heartbeat) = heartbeat_res {
+                info!("Heartbeat found: {:?}", heartbeat);
+                if owner.owner == id {
+                    info!("Self heartbeat found");
+                    return OwnResult::Success;
+                }
+                /*
+                 * We do this twice, because in the normal case we'll find an updated heartbeat within
+                 * a couple seconds. In the case where there are unexpected s3 failures or network
+                 * problems, we wait for the full duration.
+                 */
+                let short_duration = HEARTBEAT_INTERVAL * 2;
+                let long_duration = LEASE_DURATION * 2 - short_duration;
+                sleep(short_duration).await;
+                if let Ok(new_heartbeat) = HeartbeatPhys::get(object_access, owner.owner).await {
+                    if heartbeat.timestamp != new_heartbeat.timestamp {
+                        return OwnResult::Failure(new_heartbeat);
+                    }
+                }
+                sleep(long_duration).await;
+                if let Ok(new_heartbeat) = HeartbeatPhys::get(object_access, owner.owner).await {
+                    if heartbeat.timestamp != new_heartbeat.timestamp {
+                        return OwnResult::Failure(new_heartbeat);
+                    }
+                }
+                let time = Instant::now();
+                if let Ok(new_owner) = PoolOwnerPhys::get(object_access, guid).await {
+                    if new_owner.owner != owner.owner {
+                        return OwnResult::Failure(
+                            HeartbeatPhys::get(object_access, new_owner.owner)
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                }
+                duration = Instant::now().duration_since(time);
+            }
+        }
+
+        if duration > CLAIM_DURATION {
+            return OwnResult::Retry;
+        }
+
+        let owner = PoolOwnerPhys {
+            id: guid,
+            owner: id,
+        };
+
+        let put_result = owner
+            .put_timeout(object_access, Some(CLAIM_DURATION - duration))
+            .await;
+
+        if let Err(OAError::TimeoutError(_)) = put_result {
+            return OwnResult::Retry;
+        }
+        sleep(CLAIM_DURATION * 3).await;
+
+        let final_owner = PoolOwnerPhys::get(object_access, guid).await.unwrap();
+        if final_owner.owner != id {
+            return OwnResult::Failure(
+                HeartbeatPhys::get(object_access, final_owner.owner)
+                    .await
+                    .unwrap_or(HeartbeatPhys {
+                        timestamp: SystemTime::now(),
+                        hostname: "unknown".to_string(),
+                        lease_duration: LEASE_DURATION,
+                        id: final_owner.owner,
+                    }),
+            );
+        }
+        return OwnResult::Success;
+    }
+
+    pub async fn claim(&mut self, id: Uuid) -> Result<(), PoolOpenError> {
+        if self.state.shared_state.object_access.readonly() {
+            return Ok(());
+        }
+        loop {
+            match self.try_claim(id).await {
+                OwnResult::Success => {
+                    return Ok(());
+                }
+                OwnResult::Failure(heartbeat) => {
+                    return Err(PoolOpenError::MmpError(heartbeat.hostname));
+                }
+                OwnResult::Retry => {
+                    continue;
+                }
+            }
+        }
+    }
+
+    async fn unclaim(&self) {
+        PoolOwnerPhys::delete(
+            &self.state.shared_state.object_access,
+            self.state.shared_state.guid,
+        )
+        .await;
+    }
+
+    pub async fn close(&self) {
+        if !self.state.shared_state.object_access.readonly() {
+            self.unclaim().await;
+        }
     }
 }
 

@@ -7,13 +7,14 @@ use nvpair::{NvData, NvEncoding, NvList, NvListRef};
 use rusoto_s3::S3;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::{cmp::max, sync::Arc};
+use std::{cmp::max, fs::File, io::Write, path::Path, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixListener;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
+use uuid::Uuid;
 
 pub struct Server {
     input: OwnedReadHalf,
@@ -23,6 +24,7 @@ pub struct Server {
     num_outstanding_writes: Arc<AtomicUsize>,
     // XXX make Option?
     max_blockid: BlockId, // Maximum blockID that we've received a write for
+    readonly: bool,
 }
 
 impl Server {
@@ -53,6 +55,7 @@ impl Server {
             pool: None,
             num_outstanding_writes: Arc::new(AtomicUsize::new(0)),
             max_blockid: BlockId(0),
+            readonly: true,
         };
         tokio::spawn(async move {
             loop {
@@ -77,7 +80,7 @@ impl Server {
         });
     }
 
-    pub fn start(connection: UnixStream, cache: Option<ZettaCache>) {
+    pub fn start(connection: UnixStream, cache: Option<ZettaCache>, id: Uuid) {
         let (r, w) = connection.into_split();
         let mut server = Server {
             input: r,
@@ -85,6 +88,7 @@ impl Server {
             pool: None,
             num_outstanding_writes: Arc::new(AtomicUsize::new(0)),
             max_blockid: BlockId(0),
+            readonly: true,
         };
         tokio::spawn(async move {
             loop {
@@ -115,6 +119,7 @@ impl Server {
                                 "got error reading from kernel connection: {:?}",
                                 getreq_result
                             );
+                            server.close_pool().await;
                             return;
                         }
                         Ok(mynvl) => mynvl,
@@ -127,6 +132,8 @@ impl Server {
                         let guid = PoolGuid(nvl.lookup_uint64("GUID").unwrap());
                         let name = nvl.lookup_string("name").unwrap();
                         let object_access = Self::get_object_access(nvl.as_ref());
+                        server.readonly = false;
+
                         server
                             .create_pool(&object_access, guid, name.to_str().unwrap())
                             .await;
@@ -136,8 +143,15 @@ impl Server {
                         info!("got request: {:?}", nvl);
                         let guid = PoolGuid(nvl.lookup_uint64("GUID").unwrap());
                         let object_access = Self::get_object_access(nvl.as_ref());
+                        server.readonly = nvl.lookup("readonly").is_ok();
                         server
-                            .open_pool(&object_access, guid, cache.as_ref().cloned())
+                            .open_pool(
+                                &object_access,
+                                guid,
+                                id,
+                                server.readonly,
+                                cache.as_ref().cloned(),
+                            )
                             .await;
                     }
                     "begin txg" => {
@@ -202,6 +216,11 @@ impl Server {
                         let token = nvl.lookup_uint64("token").unwrap();
                         server.read_block(block, id, token);
                     }
+                    "exit agent" => {
+                        info!("Receiving agent shutdown request");
+                        server.close_pool().await;
+                        return;
+                    }
                     other => {
                         panic!("bad type {:?} in request {:?}", other, nvl);
                     }
@@ -218,6 +237,7 @@ impl Server {
         let mut w = output.lock().await;
         // XXX kernel expects this as host byte order
         //println!("sending response of {} bytes", len64);
+        debug!("sending response of {} bytes", len64);
         w.write_u64_le(len64).await.unwrap();
         w.write_all(buf.as_slice()).await.unwrap();
     }
@@ -226,18 +246,22 @@ impl Server {
         let bucket_name = nvl.lookup_string("bucket").unwrap();
         let region_str = nvl.lookup_string("region").unwrap();
         let endpoint = nvl.lookup_string("endpoint").unwrap();
+        let readonly = nvl.lookup("readonly").is_ok();
         ObjectAccess::new(
             endpoint.to_str().unwrap(),
             region_str.to_str().unwrap(),
             bucket_name.to_str().unwrap(),
+            readonly,
         )
     }
 
     async fn get_pools(&mut self, nvl: &NvList) {
-        let region_str = nvl.lookup_string("region").unwrap();
-        let endpoint = nvl.lookup_string("endpoint").unwrap();
-        let mut client =
-            ObjectAccess::get_client(endpoint.to_str().unwrap(), region_str.to_str().unwrap());
+        let region_cstr = nvl.lookup_string("region").unwrap();
+        let endpoint_cstr = nvl.lookup_string("endpoint").unwrap();
+
+        let region = region_cstr.to_str().unwrap();
+        let endpoint = endpoint_cstr.to_str().unwrap();
+        let mut client = ObjectAccess::get_client(endpoint, region);
         let mut resp = NvList::new_unique_names();
         let mut buckets = vec![];
         if let Ok(bucket) = nvl.lookup_string("bucket") {
@@ -257,7 +281,8 @@ impl Server {
         }
 
         for buck in buckets {
-            let object_access = ObjectAccess::from_client(client, buck.as_str());
+            let object_access =
+                ObjectAccess::from_client(client, buck.as_str(), self.readonly, endpoint, region);
             if let Ok(guid) = nvl.lookup_uint64("guid") {
                 if !Pool::exists(&object_access, PoolGuid(guid)).await {
                     client = object_access.release_client();
@@ -309,10 +334,24 @@ impl Server {
         &mut self,
         object_access: &ObjectAccess,
         guid: PoolGuid,
+        id: Uuid,
+        readonly: bool,
         cache: Option<ZettaCache>,
     ) {
-        let (pool, phys_opt, next_block) = Pool::open(object_access, guid, cache).await;
+        let (pool, phys_opt, next_block) = match Pool::open(object_access, guid, cache, id).await {
+            Err(PoolOpenError::MmpError(hostname)) => {
+                let mut nvl = NvList::new_unique_names();
+                nvl.insert("Type", "pool open failed").unwrap();
+                nvl.insert("cause", "MMP").unwrap();
+                nvl.insert("hostname", hostname.as_str()).unwrap();
+                debug!("sending response: {:?}", nvl);
+                Self::send_response(&self.output, nvl).await;
+                return;
+            }
+            x => x.unwrap(),
+        };
         self.pool = Some(Arc::new(pool));
+        self.readonly = readonly;
         let mut nvl = NvList::new_unique_names();
         nvl.insert("Type", "pool open done").unwrap();
         nvl.insert("GUID", &guid.0).unwrap();
@@ -427,6 +466,21 @@ impl Server {
             Self::send_response(&output, nvl).await;
         });
     }
+
+    async fn close_pool(&mut self) {
+        let mut nvl = NvList::new_unique_names();
+        nvl.insert("Type", "pool close done").unwrap();
+        if self.readonly {
+            debug!("sending response: {:?}", nvl);
+            Self::send_response(&self.output, nvl).await;
+            return;
+        }
+        if let Some(pool) = &self.pool {
+            pool.close().await;
+        }
+        debug!("sending response: {:?}", nvl);
+        Self::send_response(&self.output, nvl).await;
+    }
 }
 
 fn create_listener(path: String) -> UnixListener {
@@ -438,6 +492,27 @@ fn create_listener(path: String) -> UnixListener {
 pub async fn do_server(socket_dir: &str, cache_path: Option<&str>) {
     let ksocket_name = format!("{}/zfs_kernel_socket", socket_dir);
     let usocket_name = format!("{}/zfs_user_socket", socket_dir);
+    let id_path_name = format!("{}/zfs_agent_id", socket_dir);
+    let id_path = Path::new(&id_path_name);
+
+    let id = match tokio::fs::File::open(id_path).await {
+        Ok(mut f) => {
+            let mut bytes = Vec::new();
+            assert_eq!(
+                f.read_to_end(&mut bytes).await.unwrap(),
+                uuid::adapter::Hyphenated::LENGTH,
+            );
+            Uuid::parse_str(std::str::from_utf8(&bytes).unwrap()).unwrap()
+        }
+        Err(_) => {
+            let mut file = File::create(id_path).unwrap();
+            let uuid = Uuid::new_v4();
+            let mut buf = [0; uuid::adapter::Hyphenated::LENGTH];
+            uuid.to_hyphenated().encode_lower(&mut buf);
+            file.write_all(&buf).unwrap();
+            uuid
+        }
+    };
 
     let klistener = create_listener(ksocket_name.clone());
     let ulistener = create_listener(usocket_name.clone());
@@ -465,7 +540,7 @@ pub async fn do_server(socket_dir: &str, cache_path: Option<&str>) {
             match klistener.accept().await {
                 Ok((socket, _)) => {
                     info!("accepted connection on {}", ksocket_name);
-                    self::Server::start(socket, cache.as_ref().cloned());
+                    self::Server::start(socket, cache.as_ref().cloned(), id);
                 }
                 Err(e) => {
                     warn!("accept() on {} failed: {}", ksocket_name, e);

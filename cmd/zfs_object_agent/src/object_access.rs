@@ -41,6 +41,9 @@ const LONG_OPERATION_DURATION: Duration = Duration::from_secs(2);
 pub struct ObjectAccess {
     client: rusoto_s3::S3Client,
     bucket_str: String,
+    readonly: bool,
+    region_str: String,
+    endpoint_str: String,
 }
 
 /// For testing, prefix all object keys with this string.
@@ -50,7 +53,7 @@ pub fn prefixed(key: &str) -> String {
 
 #[derive(Debug)]
 #[allow(clippy::upper_case_acronyms)]
-enum OAError<E>
+pub enum OAError<E>
 where
     E: core::fmt::Debug + core::fmt::Display + std::error::Error,
 {
@@ -168,19 +171,31 @@ impl ObjectAccess {
         rusoto_s3::S3Client::new_with(http_client, creds, region)
     }
 
-    pub fn from_client(client: rusoto_s3::S3Client, bucket: &str) -> Self {
+    pub fn from_client(
+        client: rusoto_s3::S3Client,
+        bucket: &str,
+        readonly: bool,
+        endpoint: &str,
+        region: &str,
+    ) -> Self {
         ObjectAccess {
             client,
             bucket_str: bucket.to_string(),
+            readonly,
+            region_str: region.to_string(),
+            endpoint_str: endpoint.to_string(),
         }
     }
 
-    pub fn new(endpoint: &str, region_str: &str, bucket: &str) -> Self {
+    pub fn new(endpoint: &str, region_str: &str, bucket: &str, readonly: bool) -> Self {
         let client = ObjectAccess::get_client(endpoint, region_str);
 
         ObjectAccess {
             client,
             bucket_str: bucket.to_string(),
+            readonly,
+            region_str: region_str.to_string(),
+            endpoint_str: endpoint.to_string(),
         }
     }
 
@@ -188,7 +203,7 @@ impl ObjectAccess {
         self.client
     }
 
-    async fn get_object_impl(&self, key: &str, timeout: Option<Duration>) -> Result<Vec<u8>> {
+    pub async fn get_object_impl(&self, key: &str, timeout: Option<Duration>) -> Result<Vec<u8>> {
         let msg = format!("get {}", prefixed(key));
         let output = retry(&msg, timeout, || async {
             let req = GetObjectRequest {
@@ -401,12 +416,18 @@ impl ObjectAccess {
         self.head_object(key).await.is_some()
     }
 
-    async fn put_object_impl(&self, key: &str, data: Vec<u8>) {
+    async fn put_object_impl(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+        timeout: Option<Duration>,
+    ) -> Result<PutObjectOutput, OAError<RusotoError<PutObjectError>>> {
         let len = data.len();
         let bytes = Bytes::from(data);
+        assert!(!self.readonly);
         retry(
             &format!("put {} ({} bytes)", prefixed(key), len),
-            None,
+            timeout,
             || async {
                 let my_bytes = bytes.clone();
                 let stream = ByteStream::new_with_size(stream! { yield Ok(my_bytes)}, len);
@@ -421,25 +442,36 @@ impl ObjectAccess {
             },
         )
         .await
-        .unwrap();
+    }
+
+    fn invalidate_cache(key: &str, data: &Vec<u8>) {
+        let mut c = CACHE.lock().unwrap();
+        let mykey = key.to_string();
+        if c.cache.contains(&mykey) {
+            debug!("found {} in cache when putting - invalidating", key);
+            // XXX unfortuate to be copying; this happens every time when
+            // freeing (we get/modify/put the object).  Maybe when freeing,
+            // the get() should not add to the cache since it's probably
+            // just polluting.
+            c.cache.put(mykey, Arc::new(data.clone()));
+        }
     }
 
     pub async fn put_object(&self, key: &str, data: Vec<u8>) {
-        {
-            // invalidate cache.  don't hold lock across .await below
-            let mut c = CACHE.lock().unwrap();
-            let mykey = key.to_string();
-            if c.cache.contains(&mykey) {
-                debug!("found {} in cache when putting - invalidating", key);
-                // XXX unfortuate to be copying; this happens every time when
-                // freeing (we get/modify/put the object).  Maybe when freeing,
-                // the get() should not add to the cache since it's probably
-                // just polluting.
-                c.cache.put(mykey, Arc::new(data.clone()));
-            }
-        }
+        Self::invalidate_cache(key, &data);
 
-        self.put_object_impl(key, data).await;
+        self.put_object_impl(key, data, None).await.unwrap();
+    }
+
+    pub async fn put_object_timed(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+        timeout: Option<Duration>,
+    ) -> Result<PutObjectOutput, OAError<RusotoError<PutObjectError>>> {
+        Self::invalidate_cache(key, &data);
+
+        self.put_object_impl(key, data, timeout).await
     }
 
     pub async fn delete_object(&self, key: &str) {
@@ -455,6 +487,7 @@ impl ObjectAccess {
             keys.len(),
             prefixed(&keys[0])
         );
+        assert!(!self.readonly);
         let output = retry(&msg, None, || async {
             let v: Vec<_> = keys
                 .iter()
@@ -493,5 +526,21 @@ impl ObjectAccess {
     // XXX should we split them up here?
     pub async fn delete_objects(&self, keys: &[String]) {
         while self.delete_objects_impl(keys).await {}
+    }
+
+    pub fn bucket(&self) -> String {
+        self.bucket_str.clone()
+    }
+
+    pub fn region(&self) -> String {
+        self.region_str.clone()
+    }
+
+    pub fn endpoint(&self) -> String {
+        self.endpoint_str.clone()
+    }
+
+    pub fn readonly(&self) -> bool {
+        self.readonly
     }
 }

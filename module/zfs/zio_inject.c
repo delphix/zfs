@@ -182,7 +182,7 @@ zio_handle_panic_injection(spa_t *spa, char *tag, uint64_t type)
 				panic("Panic requested in function %s\n", tag);
 			} else {
 				vdev_t *vd = spa->spa_root_vdev->vdev_child[0];
-				object_store_restart_agent(vd);
+				object_store_stop_agent(vd);
 			}
 		}
 	}

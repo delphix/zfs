@@ -63,6 +63,9 @@
 #define	AGENT_CONFIG		"config"
 #define	AGENT_NEXT_BLOCK	"next_block"
 #define	AGENT_TOKEN		"token"
+#define	AGENT_CAUSE		"cause"
+#define	AGENT_HOSTNAME		"hostname"
+#define	AGENT_READONLY		"readonly"
 
 /*
  * By default, the logical/physical ashift for object store vdevs is set to
@@ -94,6 +97,7 @@ typedef enum {
 	VOS_SERIAL_CREATE_POOL,
 	VOS_SERIAL_OPEN_POOL,
 	VOS_SERIAL_END_TXG,
+	VOS_SERIAL_CLOSE_POOL,
 	VOS_SERIAL_TYPES
 } vos_serial_types_t;
 
@@ -127,6 +131,7 @@ typedef struct vdev_object_store {
 	kcondvar_t vos_outstanding_cv;
 	boolean_t vos_serial_done[VOS_SERIAL_TYPES];
 	vos_serial_flag_t vos_send_txg_selector;
+	uint64_t vos_result;
 
 	uint64_t vos_next_block;
 	uberblock_t vos_uberblock;
@@ -183,7 +188,7 @@ zfs_object_store_wait(vdev_object_store_t *vos, socket_state_t state)
 }
 
 static int
-zfs_object_store_open(vdev_object_store_t *vos, char *bucket_name, int mode)
+zfs_object_store_open(vdev_object_store_t *vos)
 {
 	ksocket_t s = INVALID_SOCKET;
 
@@ -430,21 +435,26 @@ agent_io_block_free(nvlist_t *nv)
 }
 
 void
-object_store_restart_agent(vdev_t *vd)
+object_store_stop_agent(vdev_t *vd)
 {
 	vdev_object_store_t *vos = vd->vdev_tsd;
+	if (vos->vos_sock == INVALID_SOCKET)
+		return;
+
 	ASSERT(MUTEX_HELD(&vos->vos_sock_lock));
 	/*
 	 * We need to ensure that we only issue a request when the
 	 * socket is ready. Otherwise, we block here since the agent
 	 * might be in recovery.
 	 */
+	zfs_dbgmsg("stop_agent()");
 	zfs_object_store_wait(vos, VOS_SOCK_OPEN);
 
 	nvlist_t *nv = fnvlist_alloc();
 	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_EXIT);
 	agent_request(vos, nv, FTAG);
 	fnvlist_free(nv);
+	agent_wait_serial(vos, VOS_SERIAL_CLOSE_POOL);
 }
 
 static void
@@ -499,8 +509,8 @@ agent_create_pool(vdev_t *vd, vdev_object_store_t *vos)
 	agent_wait_serial(vos, VOS_SERIAL_CREATE_POOL);
 }
 
-static void
-agent_open_pool(vdev_t *vd, vdev_object_store_t *vos)
+static uint64_t
+agent_open_pool(vdev_t *vd, vdev_object_store_t *vos, mode_t mode)
 {
 	/*
 	 * We need to ensure that we only issue a request when the
@@ -517,6 +527,8 @@ agent_open_pool(vdev_t *vd, vdev_object_store_t *vos)
 	fnvlist_add_string(nv, AGENT_ENDPOINT, vos->vos_endpoint);
 	fnvlist_add_string(nv, AGENT_REGION, vos->vos_region);
 	fnvlist_add_string(nv, AGENT_BUCKET, vd->vdev_path);
+	if (mode == O_RDONLY)
+		fnvlist_add_boolean(nv, AGENT_READONLY);
 	zfs_dbgmsg("agent_open_pool(guid=%llu bucket=%s)",
 	    (u_longlong_t)spa_guid(vd->vdev_spa),
 	    vd->vdev_path);
@@ -525,6 +537,7 @@ agent_open_pool(vdev_t *vd, vdev_object_store_t *vos)
 	mutex_exit(&vos->vos_sock_lock);
 	fnvlist_free(nv);
 	agent_wait_serial(vos, VOS_SERIAL_OPEN_POOL);
+	return (vos->vos_result);
 }
 
 static void
@@ -635,7 +648,8 @@ agent_resume(void *arg)
 	if (spa->spa_load_state == SPA_LOAD_CREATE) {
 		agent_create_pool(vd, vos);
 	}
-	agent_open_pool(vd, vos);
+	VERIFY0(agent_open_pool(vd, vos,
+	    vdev_object_store_open_mode(spa_mode(vd->vdev_spa))));
 
 	mutex_enter(&vos->vos_sock_lock);
 
@@ -905,6 +919,26 @@ agent_reader(void *arg)
 		vos->vos_serial_done[VOS_SERIAL_OPEN_POOL] = B_TRUE;
 		cv_broadcast(&vos->vos_outstanding_cv);
 		mutex_exit(&vos->vos_outstanding_lock);
+	} else if (strcmp(type, "pool open failed") == 0) {
+		char *cause = fnvlist_lookup_string(nv, AGENT_CAUSE);
+		spa_t *spa = vos->vos_vdev->vdev_spa;
+		zfs_dbgmsg("got pool open failed cause=\"%s\"", cause);
+		ASSERT0(strcmp(cause, "MMP"));
+		fnvlist_add_string(spa->spa_load_info,
+		    ZPOOL_CONFIG_MMP_HOSTNAME, fnvlist_lookup_string(nv,
+		    AGENT_HOSTNAME));
+		fnvlist_add_uint64(spa->spa_load_info,
+		    ZPOOL_CONFIG_MMP_STATE, MMP_STATE_ACTIVE);
+		fnvlist_add_uint64(spa->spa_load_info,
+		    ZPOOL_CONFIG_MMP_TXG, 0);
+
+		mutex_enter(&vos->vos_outstanding_lock);
+		vos->vos_result = SET_ERROR(EREMOTEIO);
+		ASSERT(!vos->vos_serial_done[VOS_SERIAL_OPEN_POOL]);
+		vos->vos_serial_done[VOS_SERIAL_OPEN_POOL] = B_TRUE;
+		cv_broadcast(&vos->vos_outstanding_cv);
+		mutex_exit(&vos->vos_outstanding_lock);
+		fnvlist_free(nv);
 	} else if (strcmp(type, "read done") == 0) {
 		uint64_t req = fnvlist_lookup_uint64(nv,
 		    AGENT_REQUEST_ID);
@@ -935,6 +969,15 @@ agent_reader(void *arg)
 		    zio->io_offset >> SPA_MINBLOCKSHIFT);
 		fnvlist_free(nv);
 		zio_delay_interrupt(zio);
+	} else if (strcmp(type, "pool close done") == 0) {
+		mutex_enter(&vos->vos_outstanding_lock);
+		ASSERT(!vos->vos_serial_done[VOS_SERIAL_CLOSE_POOL]);
+		vos->vos_serial_done[VOS_SERIAL_CLOSE_POOL] = B_TRUE;
+		cv_broadcast(&vos->vos_outstanding_cv);
+		mutex_exit(&vos->vos_outstanding_lock);
+		mutex_enter(&vos->vos_lock);
+		vos->vos_agent_thread_exit = B_TRUE;
+		mutex_exit(&vos->vos_lock);
 	} else {
 		zfs_dbgmsg("unrecognized response type!");
 	}
@@ -958,9 +1001,7 @@ vdev_object_store_socket_open(vdev_t *vd)
 		mutex_enter(&vos->vos_lock);
 		VERIFY3P(vos->vos_sock, ==, INVALID_SOCKET);
 
-		int error = zfs_object_store_open(vos, vd->vdev_path,
-		    vdev_object_store_open_mode(
-		    spa_mode(vd->vdev_spa)));
+		int error = zfs_object_store_open(vos);
 		if (error != 0) {
 			mutex_exit(&vos->vos_lock);
 			return (error);
@@ -1178,7 +1219,12 @@ vdev_object_store_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	if (vd->vdev_spa->spa_load_state == SPA_LOAD_CREATE) {
 		agent_create_pool(vd, vos);
 	}
-	agent_open_pool(vd, vos);
+	error = agent_open_pool(vd, vos,
+	    vdev_object_store_open_mode(spa_mode(vd->vdev_spa)));
+	if (error != 0) {
+		ASSERT3U(vd->vdev_spa->spa_load_state, !=, SPA_LOAD_CREATE);
+		return (error);
+	}
 
 	/*
 	 * Socket is now ready for communication, wake up
@@ -1209,14 +1255,16 @@ vdev_object_store_close(vdev_t *vd)
 
 	if (vd->vdev_reopening || vos == NULL)
 		return;
-	vos->vos_vdev = NULL;
+
+	mutex_enter(&vos->vos_sock_lock);
+	object_store_stop_agent(vd);
+	mutex_exit(&vos->vos_sock_lock);
 
 	mutex_enter(&vos->vos_lock);
 	vos->vos_agent_thread_exit = B_TRUE;
+	vos->vos_vdev = NULL;
 	zfs_object_store_shutdown(vos);
-	mutex_exit(&vos->vos_lock);
 
-	mutex_enter(&vos->vos_lock);
 	while (vos->vos_agent_thread != NULL) {
 		zfs_dbgmsg("vdev_object_store_close: shutting down agent");
 		cv_wait(&vos->vos_cv, &vos->vos_lock);

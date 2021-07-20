@@ -6483,7 +6483,7 @@ spa_export_common(const char *pool, int new_state, nvlist_t **oldconfig,
 			spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
 			spa->spa_state = new_state;
 			spa->spa_final_txg = spa_last_synced_txg(spa) +
-			    TXG_DEFER_SIZE + 1;
+			    TXG_DEFER_SIZE + 3;
 			vdev_config_dirty(spa->spa_root_vdev);
 			spa_config_exit(spa, SCL_ALL, FTAG);
 		}
