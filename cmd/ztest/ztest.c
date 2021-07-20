@@ -134,8 +134,14 @@
 #include <libnvpair.h>
 #include <libzutil.h>
 #include <sys/crypto/icp.h>
+#include <sys/un.h>
+#include <sys/socket.h>
+#include <object_agent.h>
 #if (__GLIBC__ && !__UCLIBC__)
 #include <execinfo.h> /* for backtrace() */
+#endif
+#ifdef HAVE_LIBZOA
+#include <libzoa.h>
 #endif
 
 static int ztest_fd_data = -1;
@@ -774,6 +780,7 @@ static ztest_option_t option_table[] = {
 	    NO_DEFAULT, DEFAULT_POOL},
 	{ 'f',	"vdev-file-directory", "PATH", "File directory for vdev files",
 	    NO_DEFAULT, DEFAULT_VDEV_DIR},
+#ifdef HAVE_LIBZOA
 	{ 'O',	"object-endpoint", "URI", "Object-store endpoint",
 	    NO_DEFAULT, DEFAULT_ENDPOINT},
 	{ 'A',	"object-region", "STRING", "Object-store region",
@@ -782,6 +789,7 @@ static ztest_option_t option_table[] = {
 	    NO_DEFAULT, NULL},
 	{ 'z',	"object-credentials", "URI", "Object store credentials URI",
 	    NO_DEFAULT, DEFAULT_CREDS_FILE},
+#endif
 	{ 'M',	"multi-host", NULL,
 	    "Multi-host; simulate pool imported on remote host",
 	    NO_DEFAULT, NULL},
@@ -1038,6 +1046,7 @@ process_options(int argc, char **argv)
 				free(path);
 			}
 			break;
+#ifdef HAVE_LIBZOA
 		case 'O':
 			(void) strlcpy(zo->zo_obj_store_endpoint, optarg,
 			    sizeof (zo->zo_obj_store_endpoint));
@@ -1058,6 +1067,7 @@ process_options(int argc, char **argv)
 			    sizeof (zo->zo_obj_store_creds_file));
 			zo->zo_obj_store = 1;
 			break;
+#endif
 		case 'M':
 			zo->zo_mmp_test = 1;
 			break;
@@ -8123,6 +8133,20 @@ ztest_run_init(void)
 	}
 }
 
+static void
+zoa_thread(void *arg)
+{
+#ifdef HAVE_LIBZOA
+	char ztest_sock_dir[] = "/tmp/ztest.sock.XXXXXX";
+	char *dir = mkdtemp(ztest_sock_dir);
+	ASSERT3S(dir, !=, NULL);
+	set_object_agent_sock_dir(ztest_sock_dir);
+	libzoa_init(ztest_sock_dir, "/tmp/zoa.log");
+#else
+	fatal(0, "libzoa support missing.");
+#endif
+}
+
 int
 main(int argc, char **argv)
 {
@@ -8220,6 +8244,11 @@ main(int argc, char **argv)
 	ztest_ds = umem_alloc(ztest_opts.zo_datasets * sizeof (ztest_ds_t),
 	    UMEM_NOFAIL);
 	zs = ztest_shared;
+
+	if (ztest_opts.zo_obj_store) {
+		thread_create(NULL, 0, zoa_thread, NULL, 0, NULL,
+		    TS_RUN | TS_JOINABLE, defclsyspri);
+	}
 
 	if (fd_data_str) {
 		metaslab_force_ganging = ztest_opts.zo_metaslab_force_ganging;

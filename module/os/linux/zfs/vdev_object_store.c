@@ -74,6 +74,9 @@
  */
 unsigned long vdev_object_store_logical_ashift = SPA_MINBLOCKSHIFT;
 unsigned long vdev_object_store_physical_ashift = SPA_MINBLOCKSHIFT;
+struct sockaddr_un zfs_kernel_socket = {
+	AF_UNIX, "/run/zfs_kernel_socket"
+};
 
 typedef enum {
 	VOS_SOCK_CLOSED = (1 << 0),
@@ -148,10 +151,6 @@ vdev_object_store_open_mode(spa_mode_t spa_mode)
 
 	return (mode);
 }
-
-static struct sockaddr_un zfs_kernel_socket = {
-	AF_UNIX, "/run/zfs_kernel_socket"
-};
 
 static inline vdev_object_store_request_t *
 vdev_object_store_request_alloc(void)

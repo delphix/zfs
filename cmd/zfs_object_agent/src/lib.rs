@@ -4,6 +4,7 @@ pub mod block_allocator;
 pub mod block_based_log;
 pub mod extent_allocator;
 pub mod index;
+pub mod init;
 pub mod object_access;
 pub mod object_based_log;
 pub mod object_block_map;

@@ -9,7 +9,7 @@ edition = "2018"
 [dependencies]
 clap = "2"
 futures = "0.3.13"
-libzoa = { path = "../" }
+zoa_common = { path = "../" }
 nvpair = { git = "https://github.com/ahrens/rust-libzfs", branch = "work"}
 rand = "0.8.3"
 rusoto_core = "0.46.0"

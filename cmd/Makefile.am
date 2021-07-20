@@ -1,6 +1,6 @@
 include $(top_srcdir)/config/Shellcheck.am
 
-SUBDIRS  = zfs zpool zdb zhack zinject zstream ztest
+SUBDIRS = zfs zpool zhack zinject zstream
 SUBDIRS += fsck_zfs vdev_id raidz_test zfs_ids_to_path zfs_file
 SUBDIRS += zpool_influxdb
 
@@ -23,6 +23,9 @@ endif
 if BUILD_RUST
 SUBDIRS += zfs_object_agent zfs_object_agent/scripts
 endif
+
+# ztest and zdb depend on zfs_object_agent, if present.
+SUBDIRS += ztest zdb
 
 PHONY = cppcheck
 cppcheck: $(CPPCHECKDIRS)
