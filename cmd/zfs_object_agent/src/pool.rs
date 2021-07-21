@@ -892,6 +892,7 @@ impl Pool {
     pub fn initiate_flush(&self, block: BlockId) {
         self.state.with_syncing_state(|syncing_state| {
             // XXX because called when server times out waiting for request
+            trace!("flushing block {}", block);
             if syncing_state.syncing_txg.is_none() {
                 return;
             }

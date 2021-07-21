@@ -657,6 +657,20 @@ zio_add_child(zio_t *pio, zio_t *cio)
 	pio->io_child_count++;
 	cio->io_parent_count++;
 
+	/*
+	 * For object-based storage, we need to notify the backend
+	 * to flush out writes when we an I/O waiting. We only
+	 * need to do this if the waiting I/O is waiting for allocating
+	 * children. To make this happen, we set a flag on the parent
+	 * I/O to indicate that if it needs to wait, it also needs
+	 * to flush the backend afterwards.
+	 */
+	if (!spa_normal_class(pio->io_spa)->mc_ops->msop_block_based &&
+	    cio->io_type == ZIO_TYPE_WRITE && IO_IS_ALLOCATING(cio)) {
+		pio->io_control_flags |= ZIO_CONTROL_FLUSH_WRITES;
+	}
+	pio->io_max_offset = MAX(pio->io_max_offset, cio->io_max_offset);
+
 	mutex_exit(&cio->io_lock);
 	mutex_exit(&pio->io_lock);
 }
@@ -717,6 +731,7 @@ zio_notify_parent(zio_t *pio, zio_t *zio, enum zio_wait_type wait,
 	if (zio->io_error && !(zio->io_flags & ZIO_FLAG_DONT_PROPAGATE))
 		*errorp = zio_worst_error(*errorp, zio->io_error);
 	pio->io_reexecute |= zio->io_reexecute;
+	pio->io_max_offset = MAX(pio->io_max_offset, zio->io_max_offset);
 	ASSERT3U(*countp, >, 0);
 
 	(*countp)--;
@@ -1337,7 +1352,7 @@ zio_ioctl(zio_t *pio, spa_t *spa, vdev_t *vd, int cmd,
 zio_t *
 zio_trim(zio_t *pio, vdev_t *vd, uint64_t offset, uint64_t size,
     zio_done_func_t *done, void *private, zio_priority_t priority,
-    enum zio_flag flags, enum trim_flag trim_flags)
+    enum zio_flag flags, enum zio_control_flag zio_control_flags)
 {
 	zio_t *zio;
 
@@ -1349,7 +1364,7 @@ zio_trim(zio_t *pio, vdev_t *vd, uint64_t offset, uint64_t size,
 	zio = zio_create(pio, vd->vdev_spa, 0, NULL, NULL, size, size, done,
 	    private, ZIO_TYPE_TRIM, priority, flags | ZIO_FLAG_PHYSICAL,
 	    vd, offset, NULL, ZIO_STAGE_OPEN, ZIO_TRIM_PIPELINE);
-	zio->io_trim_flags = trim_flags;
+	zio->io_control_flags |= zio_control_flags;
 
 	return (zio);
 }
@@ -3497,7 +3512,9 @@ zio_object_allocate_and_issue(zio_t *zio)
 	 */
 	zio->io_pipeline &= ~ZIO_STAGE_VDEV_IO_START;
 
-	spa_config_enter(spa, SCL_ALLOC|SCL_ZIO, FTAG, RW_READER);
+	// Keep SCL_ZIO held until io_assess()
+	ASSERT(!(zio->io_flags & ZIO_FLAG_CONFIG_WRITER));
+	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
 
 	ASSERT3U(zio->io_prop.zp_copies, ==, 1);
 	int error = metaslab_alloc(spa, mc, zio->io_size, bp,
@@ -3518,19 +3535,6 @@ zio_object_allocate_and_issue(zio_t *zio)
 
 	zfs_dbgmsg("zio=%px child=%px stage=%llu",
 	    zio, child, (u_longlong_t)child->io_stage);
-
-	// Keep SCL_ZIO held until io_assess()
-	spa_config_exit(spa, SCL_ALLOC, FTAG);
-	/*
-	 * Ensure that zio_vdev_io_start() will actually call
-	 * vdev_object_store_io_start() on this zio while we have the lock held.
-	 */
-#if 0
-	zio_t *next_zio =
-	    zio_pipeline[highbit64(ZIO_STAGE_VDEV_IO_START) - 1](zio);
-	zfs_dbgmsg("zio=%px completed io_start (off=%llu, next=%px)",
-	    zio, DVA_GET_OFFSET(&bp->blk_dva[0]), next_zio);
-#endif
 	return (zio);
 }
 
@@ -4438,6 +4442,33 @@ zio_ready(zio_t *zio)
 		return (NULL);
 	}
 
+	if (!spa_normal_class(zio->io_spa)->mc_ops->msop_block_based &&
+	    zio->io_control_flags & ZIO_CONTROL_FLUSH_WRITES &&
+	    zio->io_waiter) {
+		/*
+		 * XXX - it would be nice to always wait for logical
+		 * zio children to be ready above but we need to see
+		 * if there is an impact to performance. For now, we
+		 * do this only for object store pools.
+		 *
+		 * For object storage pools, we need to make sure that our
+		 * logical I/Os are ready meaning they have completed
+		 * block allocation.
+		 */
+		if ((zio->io_type == ZIO_TYPE_NULL ||
+		    zio->io_type == ZIO_TYPE_WRITE) &&
+		    zio_wait_for_children(zio, ZIO_CHILD_LOGICAL_BIT |
+		    ZIO_CHILD_GANG_BIT, ZIO_WAIT_READY)) {
+			return (NULL);
+		}
+
+		/*
+		 * Now that all logical I/Os are ready, we can
+		 * let the object store to flush them.
+		 */
+		object_store_flush_writes(zio->io_spa, zio->io_max_offset);
+	}
+
 	if (zio->io_ready) {
 		ASSERT(IO_IS_ALLOCATING(zio));
 		ASSERT(bp->blk_birth == zio->io_txg || BP_IS_HOLE(bp) ||
@@ -4575,13 +4606,6 @@ zio_done(zio_t *zio)
 	const uint64_t psize = zio->io_size;
 	zio_t *pio, *pio_next;
 	zio_link_t *zl = NULL;
-
-	/*
-	 * For object store pools, we need to flush writes if we
-	 * have a zio waiting on writes.
-	 */
-	boolean_t flush_writes_needed =
-	    !spa_normal_class(zio->io_spa)->mc_ops->msop_block_based;
 
 	/*
 	 * If our children haven't all completed,
@@ -4924,25 +4948,11 @@ zio_done(zio_t *zio)
 	for (pio = zio_walk_parents(zio, &zl); pio != NULL; pio = pio_next) {
 		zio_link_t *remove_zl = zl;
 		pio_next = zio_walk_parents(zio, &zl);
-
-		if (flush_writes_needed && zio->io_type == ZIO_TYPE_WRITE &&
-		    pio->io_waiter) {
-			zfs_dbgmsg("ZIO set write_flush: %px", pio);
-			mutex_enter(&pio->io_lock);
-			pio->io_flush_writes = B_TRUE;
-			mutex_exit(&pio->io_lock);
-		}
-
 		zio_remove_child(pio, zio, remove_zl);
 		zio_notify_parent(pio, zio, ZIO_WAIT_DONE, &next_to_execute);
 	}
 
 	if (zio->io_waiter != NULL) {
-		if (zio->io_flush_writes) {
-			ASSERT(flush_writes_needed);
-			zfs_dbgmsg("ZIO agent flush requested");
-			object_store_flush_writes(zio->io_spa);
-		}
 		mutex_enter(&zio->io_lock);
 		zio->io_executor = NULL;
 		cv_broadcast(&zio->io_cv);

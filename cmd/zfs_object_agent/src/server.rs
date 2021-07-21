@@ -13,7 +13,6 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixListener;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
-use tokio::time::Duration;
 
 pub struct Server {
     input: OwnedReadHalf,
@@ -88,37 +87,16 @@ impl Server {
         };
         tokio::spawn(async move {
             loop {
-                let nvl = match tokio::time::timeout(
-                    Duration::from_millis(100),
-                    Self::get_next_request(&mut server.input),
-                )
-                .await
+                let nvl = match Self::get_next_request(&mut server.input).await
                 {
                     Err(_) => {
-                        // timed out. Note that we can not call flush_writes()
-                        // while in the middle of a end_txg(). So we only do it
-                        // while there are writes in progress, which can't be
-                        // the case during an end_txg().
-                        // XXX we should also be able to time out and flush even
-                        // if we are getting lots of reads.
-                        if server.pool.is_some()
-                            && server.num_outstanding_writes.load(Ordering::Acquire) > 0
-                        {
-                            trace!("timeout; flushing writes");
-                            server.flush_writes();
-                        }
-                        continue;
+                        info!(
+                            "got error reading from kernel connection: {:?}",
+                            server.input
+                        );
+                        return;
                     }
-                    Ok(getreq_result) => match getreq_result {
-                        Err(_) => {
-                            info!(
-                                "got error reading from kernel connection: {:?}",
-                                getreq_result
-                            );
-                            return;
-                        }
-                        Ok(mynvl) => mynvl,
-                    },
+                    Ok(mynvl) => mynvl,
                 };
                 match nvl.lookup_string("Type").unwrap().to_str().unwrap() {
                     "create pool" => {
@@ -156,7 +134,17 @@ impl Server {
                     }
                     "flush writes" => {
                         trace!("got request: {:?}", nvl);
-                        server.flush_writes();
+                        let block = BlockId(nvl.lookup_uint64("block").unwrap());
+
+                        // Note that we can not call flush_writes()
+                        // while in the middle of a end_txg(). So we only do it
+                        // while there are writes in progress, which can't be
+                        // the case during an end_txg().
+                        if server.pool.is_some()
+                            && server.num_outstanding_writes.load(Ordering::Acquire) == 0 {
+                                panic!("flush during end txg");
+                            }
+                        server.flush_writes(block);
                     }
                     "end txg" => {
                         debug!("got request: {:?}", nvl);
@@ -348,10 +336,9 @@ impl Server {
     }
 
     // no response
-    fn flush_writes(&mut self) {
+    fn flush_writes(&mut self, block: BlockId) {
         let pool = self.pool.as_ref().unwrap().clone();
-        let max_blockid = self.max_blockid;
-        pool.initiate_flush(max_blockid);
+        pool.initiate_flush(block);
     }
 
     // sends response when completed
