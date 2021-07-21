@@ -34,7 +34,6 @@ impl BlockBasedLogEntry for IndexEntry {}
 pub struct ZettaCacheIndex {
     pub atime_histogram: AtimeHistogramPhys,
     pub log: BlockBasedLogWithSummary<IndexEntry>,
-    pub free_list: Vec<IndexValue>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -52,7 +51,6 @@ impl ZettaCacheIndex {
         Self {
             atime_histogram: phys.atime_histogram,
             log: BlockBasedLogWithSummary::open(block_access, extent_allocator, phys.log).await,
-            free_list: Vec::new(),
         }
     }
 
@@ -70,15 +68,6 @@ impl ZettaCacheIndex {
     pub fn append(&mut self, entry: IndexEntry) {
         self.atime_histogram.insert(entry.value);
         self.log.append(entry);
-    }
-
-    pub fn append_or_free(&mut self, entry: IndexEntry) {
-        // Add this entry if it is still in history covered by the histogram
-        if entry.value.atime >= self.atime_histogram.get_start() {
-            self.append(entry);
-        } else {
-            self.free_list.push(entry.value);
-        }
     }
 
     pub fn clear(&mut self) {

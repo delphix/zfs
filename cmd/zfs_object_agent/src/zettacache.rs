@@ -924,13 +924,25 @@ impl ZettaCacheState {
     }
 
     async fn merge_pending_changes(&mut self, old_index: &ZettaCacheIndex) -> ZettaCacheIndex {
+
+        // Helper function to determine if an entry being merged should be added to the new index or,
+        // if due to eviction, should be freed.
+        fn add_to_index_or_list(index: &mut ZettaCacheIndex, list: &mut Vec<IndexValue>, entry: IndexEntry) {
+            if entry.value.atime >= index.get_histogram_start() {
+                index.append(entry);
+            } else {
+                list.push(entry.value);
+            }
+        }
+
         let begin = Instant::now();
         // XXX when we are continually merging, over multiple checkpoints, we
         // will probably want the BlockBasedLog to know about multiple
         // generations, and therefore we'd keep the one BlockBasedLog but create
         // a new generation (as we do with ObjectBasedLog).
-        // XXX - calculate an eviction atime for the new index: use 10% of available space:
-        let mut eviction_atime = old_index.atime_histogram.start;
+
+        // Calculate an eviction atime for the new index: use 10% of available space:
+        let mut eviction_atime = self.atime_histogram.start;
         let mut target_size = (self.block_access.size() / 100) * TARGET_CACHE_SIZE_PCT;
         info!("target cache size for storage size {} is {}", self.block_access.size(), target_size);
         info!("histogram starts at {:?} and has {} entries",
@@ -944,6 +956,7 @@ impl ZettaCacheState {
             trace!("including {} in target at bucket {}", count, index);
             target_size -= count;
         }
+
         info!("setting new eviction atime to {:?}", eviction_atime);
         let mut new_index = ZettaCacheIndex::open(
             self.block_access.clone(),
@@ -954,6 +967,7 @@ impl ZettaCacheState {
             },
         )
         .await;
+
         // new_index.set_histogram_start(eviction_atime);
         info!(
             "writing new index to merge {} pending changes into index of {} entries ({} MB)",
@@ -962,6 +976,7 @@ impl ZettaCacheState {
             old_index.log.num_bytes() / 1024 / 1024,
         );
         // XXX load operation_log and verify that the pending_changes match it?
+        let mut free_list: Vec<IndexValue> = Vec::new();
         let mut pending_changes_iter = self.pending_changes.iter().peekable();
         old_index
             .log
@@ -979,7 +994,7 @@ impl ZettaCacheState {
                         break;
                     }
                     // Add this new entry to the index
-                    new_index.append_or_free(IndexEntry {
+                    add_to_index_or_list(&mut new_index, &mut free_list, IndexEntry {
                         key: **pc_key,
                         value: *pc_value,
                     });
@@ -996,7 +1011,7 @@ impl ZettaCacheState {
                         } else {
                             // There shouldn't be a pending removal of an entry that doesn't exist in the index.
                             assert_gt!(**pc_key, entry.key);
-                            new_index.append_or_free(entry);
+                            add_to_index_or_list(&mut new_index, &mut free_list, entry);
                         }
                     }
                     Some((pc_key, PendingChange::Insert(_pc_value))) => {
@@ -1005,14 +1020,14 @@ impl ZettaCacheState {
                         // to be removed first, resulting in a
                         // PendingChange::RemoveThenInsert.
                         assert_gt!(**pc_key, entry.key);
-                        new_index.append_or_free(entry);
+                        add_to_index_or_list(&mut new_index, &mut free_list, entry);
                     }
                     Some((pc_key, PendingChange::RemoveThenInsert(pc_value))) => {
                         if **pc_key == entry.key {
                             // This key must have been removed (evicted) and then re-inserted.
                             // Add the pending change to the next generation instead of the current index's entry
                             assert_eq!(pc_value.size, entry.value.size);
-                            new_index.append_or_free(IndexEntry {
+                            add_to_index_or_list(&mut new_index, &mut free_list, IndexEntry {
                                 key: **pc_key,
                                 value: *pc_value,
                             });
@@ -1022,7 +1037,7 @@ impl ZettaCacheState {
                         } else {
                             // We shouldn't have skipped any, because there has to be a corresponding Index entry
                             assert_gt!(**pc_key, entry.key);
-                            new_index.append_or_free(entry);
+                            add_to_index_or_list(&mut new_index, &mut free_list, entry);
                         }
                     }
                     Some((pc_key, PendingChange::UpdateAtime(pc_value))) => {
@@ -1030,7 +1045,7 @@ impl ZettaCacheState {
                             // Add the pending entry to the next generation instead of the current index's entry
                             assert_eq!(pc_value.location, entry.value.location);
                             assert_eq!(pc_value.size, entry.value.size);
-                            new_index.append_or_free(IndexEntry {
+                            add_to_index_or_list(&mut new_index, &mut free_list, IndexEntry {
                                 key: **pc_key,
                                 value: *pc_value,
                             });
@@ -1040,12 +1055,12 @@ impl ZettaCacheState {
                         } else {
                             // We shouldn't have skipped any, because there has to be a corresponding Index entry
                             assert_gt!(**pc_key, entry.key);
-                            new_index.append_or_free(entry);
+                            add_to_index_or_list(&mut new_index, &mut free_list, entry);
                         }
                     }
                     None => {
                         // no more pending changes
-                        new_index.append_or_free(entry);
+                        add_to_index_or_list(&mut new_index, &mut free_list, entry);
                     }
                 }
                 future::ready(())
@@ -1058,7 +1073,7 @@ impl ZettaCacheState {
                 pc_key,
                 pc_value
             );
-            new_index.append_or_free(IndexEntry {
+            add_to_index_or_list(&mut new_index, &mut free_list, IndexEntry {
                 key: **pc_key,
                 value: *pc_value,
             });
@@ -1078,8 +1093,8 @@ impl ZettaCacheState {
         new_index.flush().await;
 
         // Free the evicted blocks from the cache
-        debug!("freeing {} blocks", new_index.free_list.len());
-        while let Some(value) = new_index.free_list.pop() {
+        debug!("freeing {} blocks", free_list.len());
+        for value in free_list {
             let extent = Extent {location: value.location, size: value.size};
             self.block_allocator.free(&extent);
         }
@@ -1088,7 +1103,6 @@ impl ZettaCacheState {
 
         self.pending_changes.clear();
         self.operation_log.clear();
-        self.atime_histogram.clear();
         self.atime_histogram = new_index.atime_histogram.clone();
 
         info!(
