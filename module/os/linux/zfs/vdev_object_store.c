@@ -307,10 +307,10 @@ agent_request_search(vdev_queue_t *vq, uint64_t blockid)
 
 	/*
 	 * We search in the active avl tree for the offset associated
-	 * with the request. We must set 'io_offset_match' since the
-	 * avl comparison function not only looks at offset but
-	 * also zio_t pointer. By setting the 'io_offset_match' we
-	 * return back the first zio_t which matches only the
+	 * with the request. We must set ZIO_CONTROL_OFFSET_MATCH since
+	 * the avl comparison function not only looks at offset but
+	 * also the zio_t pointer. By setting the ZIO_CONTROL_OFFSET_MATCH
+	 * flag, we return back the first zio_t which matches only the
 	 * offset value.
 	 *
 	 * XXX - This is safe since we can only have one active I/O to
@@ -318,10 +318,10 @@ agent_request_search(vdev_queue_t *vq, uint64_t blockid)
 	 * info).
 	 */
 	vq->vq_io_search.io_offset = blockid << SPA_MINBLOCKSHIFT;
-	vq->vq_io_search.io_offset_match = B_TRUE;
+	vq->vq_io_search.io_control_flags |= ZIO_CONTROL_OFFSET_MATCH;
 
 	zio_t *zio = avl_find(&vq->vq_active_tree, &vq->vq_io_search, NULL);
-	vq->vq_io_search.io_offset_match = B_FALSE;
+	vq->vq_io_search.io_control_flags &= ~ZIO_CONTROL_OFFSET_MATCH;
 	return (zio);
 }
 
@@ -598,14 +598,15 @@ agent_end_txg(vdev_object_store_t *vos, uint64_t txg, void *ub_buf,
 }
 
 static void
-agent_flush_writes(vdev_object_store_t *vos)
+agent_flush_writes(vdev_object_store_t *vos, uint64_t blockid)
 {
 	mutex_enter(&vos->vos_sock_lock);
 	zfs_object_store_wait(vos, VOS_SOCK_READY);
 
 	nvlist_t *nv = fnvlist_alloc();
 	fnvlist_add_string(nv, AGENT_TYPE, AGENT_TYPE_FLUSH_WRITES);
-	zfs_dbgmsg("agent_flush");
+	fnvlist_add_uint64(nv, AGENT_BLKID, blockid);
+	zfs_dbgmsg("agent_flush: blockid %llu", (u_longlong_t)blockid);
 
 	agent_request(vos, nv, FTAG);
 	mutex_exit(&vos->vos_sock_lock);
@@ -746,12 +747,13 @@ object_store_free_block(vdev_t *vd, uint64_t offset, uint64_t asize)
 }
 
 void
-object_store_flush_writes(spa_t *spa)
+object_store_flush_writes(spa_t *spa, uint64_t offset)
 {
 	vdev_t *vd = spa->spa_root_vdev->vdev_child[0];
 	ASSERT3P(vd->vdev_ops, ==, &vdev_object_store_ops);
 	vdev_object_store_t *vos = vd->vdev_tsd;
-	agent_flush_writes(vos);
+	uint64_t blockid = offset >> SPA_MINBLOCKSHIFT;
+	agent_flush_writes(vos, blockid);
 }
 
 void

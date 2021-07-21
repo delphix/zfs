@@ -251,7 +251,8 @@ vdev_queue_offset_compare(const void *x1, const void *x2)
 	 * an exact offset match then return once TREE_CMP finds
 	 * the offset.
 	 */
-	if (z1->io_offset_match || z2->io_offset_match)
+	if (z1->io_control_flags & ZIO_CONTROL_OFFSET_MATCH ||
+	    z2->io_control_flags & ZIO_CONTROL_OFFSET_MATCH)
 		return (cmp);
 
 	return (TREE_PCMP(z1, z2));

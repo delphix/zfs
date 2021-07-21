@@ -29,6 +29,6 @@ typedef struct vdev_object_store_stats {
 void object_store_begin_txg(vdev_t *, uint64_t);
 void object_store_end_txg(vdev_t *, nvlist_t *, uint64_t);
 void object_store_free_block(vdev_t *, uint64_t, uint64_t);
-void object_store_flush_writes(spa_t *);
+void object_store_flush_writes(spa_t *, uint64_t);
 void object_store_restart_agent(vdev_t *vd);
 void object_store_get_stats(vdev_t *, vdev_object_store_stats_t *);
