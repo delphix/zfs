@@ -30,8 +30,9 @@ const SUPERBLOCK_SIZE: usize = 4 * 1024;
 //const SUPERBLOCK_MAGIC: u64 = 0x2e11acac4e;
 const DEFAULT_CHECKPOINT_RING_BUFFER_SIZE: usize = 1024 * 1024;
 const DEFAULT_SLAB_SIZE: usize = 16 * 1024 * 1024;
-const DEFAULT_METADATA_SIZE_PCT: f64 = 1.0; // Can lower this to test forced eviction.
-const MAX_PENDING_CHANGES: usize = 100_000; // XXX should be based on RAM usage, ~tens of millions at least
+const DEFAULT_METADATA_SIZE_PCT: f64 = 5.0; // Can lower this to test forced eviction.
+const MAX_PENDING_CHANGES: usize = 50_000; // XXX should be based on RAM usage, ~tens of millions at least
+const TARGET_CACHE_SIZE_PCT: u64 = 10;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ZettaSuperBlockPhys {
@@ -148,7 +149,7 @@ impl BlockBasedLogEntry for ChunkSummaryEntry {}
 #[derive(Debug, Serialize, Deserialize, Copy, Clone)]
 enum OperationLogEntry {
     Insert((IndexKey, IndexValue)),
-    Remove((IndexKey, Atime)),
+    Remove((IndexKey, IndexValue)),
 }
 impl OnDisk for OperationLogEntry {}
 impl BlockBasedLogEntry for OperationLogEntry {}
@@ -156,20 +157,51 @@ impl BlockBasedLogEntry for OperationLogEntry {}
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct AtimeHistogramPhys {
     histogram: Vec<u64>,
+    start: Atime,
 }
 
 impl AtimeHistogramPhys {
-    pub fn insert(&mut self, atime: Atime) {
-        let atime_usize = atime.0 as usize;
-        if atime_usize >= self.histogram.len() {
-            self.histogram.resize(atime_usize + 1, 0);
-        }
-        self.histogram[atime_usize] += 1;
+    pub fn new(start: Atime) -> AtimeHistogramPhys {
+        let this = AtimeHistogramPhys {
+            histogram: Default::default(),
+            start,
+        };
+        return this;
     }
 
-    pub fn remove(&mut self, atime: Atime) {
-        let atime_usize = atime.0 as usize;
-        self.histogram[atime_usize] -= 1;
+    pub fn get_start(&mut self) -> Atime {
+        return self.start;
+    }
+
+    pub fn atime_for_target_size(&mut self, target_size: u64) -> Atime {
+        info!("histogram starts at {:?} and has {} entries", self.start, self.histogram.len());
+        let mut remaining = target_size;
+        let mut target_index = self.start.0;
+        for (index, count) in self.histogram.iter().enumerate().rev() {
+            if remaining <= *count {
+                trace!("final include of {} for target at bucket {}", count, index);
+                target_index += index as u64;
+                break;
+            }
+            trace!("including {} in target at bucket {}", count, index);
+            remaining -= count;
+        }
+        return Atime { 0:target_index };
+    }
+
+    pub fn insert(&mut self, value: IndexValue) {
+        assert_ge!(value.atime, self.start);
+        let index = value.atime - self.start;
+        if index >= self.histogram.len() {
+            self.histogram.resize(index + 1, 0);
+        }
+        self.histogram[index] += value.size as u64;
+    }
+
+    pub fn remove(&mut self, value: IndexValue) {
+        assert_ge!(value.atime, self.start);
+        let index = value.atime - self.start;
+        self.histogram[index] -= value.size as u64;
     }
 
     pub fn clear(&mut self) {
@@ -403,9 +435,9 @@ impl ZettaCache {
                             }
                         }
                         num_insert_entries += 1;
-                        atime_histogram.insert(value.atime);
+                        atime_histogram.insert(value);
                     }
-                    OperationLogEntry::Remove((key, atime)) => {
+                    OperationLogEntry::Remove((key, value)) => {
                         match pending_changes.entry(key) {
                             btree_map::Entry::Occupied(mut oe) => match oe.get() {
                                 PendingChange::Insert(value) => {
@@ -430,7 +462,7 @@ impl ZettaCache {
                             }
                         }
                         num_remove_entries += 1;
-                        atime_histogram.remove(atime);
+                        atime_histogram.remove(value);
                     }
                 };
                 future::ready(())
@@ -609,9 +641,9 @@ impl ZettaCacheState {
         }
         trace!("cache hit: reading {:?} from {:?}", key, value);
         if value.atime != self.atime {
-            self.atime_histogram.remove(value.atime);
-            self.atime_histogram.insert(self.atime);
+            self.atime_histogram.remove(value);
             value.atime = self.atime;
+            self.atime_histogram.insert(value);
         }
         // XXX looking up again.  But can't pass in both &mut self and &mut PendingChange
         let pc = self.pending_changes.get_mut(&key);
@@ -715,9 +747,9 @@ impl ZettaCacheState {
             }
         }
         trace!("adding Remove to operation_log {:?}", key);
-        self.atime_histogram.remove(value.atime);
+        self.atime_histogram.remove(value);
         self.operation_log
-            .append(OperationLogEntry::Remove((key, value.atime)));
+            .append(OperationLogEntry::Remove((key, value)));
     }
 
     /// Insert this block to the cache, if space and performance parameters
@@ -779,7 +811,7 @@ impl ZettaCacheState {
                 ve.insert(PendingChange::Insert(value));
             }
         }
-        self.atime_histogram.insert(value.atime);
+        self.atime_histogram.insert(value);
 
         trace!("adding Insert to operation_log {:?} {:?}", key, value);
         self.operation_log
@@ -838,6 +870,7 @@ impl ZettaCacheState {
         }
         self.outstanding_writes.clear();
 
+        trace!("{:?} pending changes at checkpoint", self.pending_changes.len());
         if self.pending_changes.len() > MAX_PENDING_CHANGES {
             index.flush().await;
             let new_index = self.merge_pending_changes(index).await;
@@ -907,17 +940,34 @@ impl ZettaCacheState {
     }
 
     async fn merge_pending_changes(&mut self, old_index: &ZettaCacheIndex) -> ZettaCacheIndex {
+
+        // Helper function to determine if an entry being merged should be added to the new index or,
+        // if due to eviction, should be freed.
+        fn add_to_index_or_list(index: &mut ZettaCacheIndex, list: &mut Vec<IndexValue>, entry: IndexEntry) {
+            if entry.value.atime >= index.get_histogram_start() {
+                index.append(entry);
+            } else {
+                list.push(entry.value);
+            }
+        }
+
         let begin = Instant::now();
         // XXX when we are continually merging, over multiple checkpoints, we
         // will probably want the BlockBasedLog to know about multiple
         // generations, and therefore we'd keep the one BlockBasedLog but create
         // a new generation (as we do with ObjectBasedLog).
+
+        // Calculate an eviction atime for the new index: use 10% of available space:
+        let target_size = (self.block_access.size() / 100) * TARGET_CACHE_SIZE_PCT;
+        info!("target cache size for storage size {} is {}", self.block_access.size(), target_size);
         let mut new_index = ZettaCacheIndex::open(
             self.block_access.clone(),
             self.extent_allocator.clone(),
-            Default::default(),
+            ZettaCacheIndexPhys::new(self.atime_histogram.atime_for_target_size(target_size)),
         )
         .await;
+        info!("set new eviction atime to {:?}", new_index.get_histogram_start());
+
         info!(
             "writing new index to merge {} pending changes into index of {} entries ({} MB)",
             self.pending_changes.len(),
@@ -925,6 +975,7 @@ impl ZettaCacheState {
             old_index.log.num_bytes() / 1024 / 1024,
         );
         // XXX load operation_log and verify that the pending_changes match it?
+        let mut free_list: Vec<IndexValue> = Vec::new();
         let mut pending_changes_iter = self.pending_changes.iter().peekable();
         old_index
             .log
@@ -942,7 +993,7 @@ impl ZettaCacheState {
                         break;
                     }
                     // Add this new entry to the index
-                    new_index.append(IndexEntry {
+                    add_to_index_or_list(&mut new_index, &mut free_list, IndexEntry {
                         key: **pc_key,
                         value: *pc_value,
                     });
@@ -959,7 +1010,7 @@ impl ZettaCacheState {
                         } else {
                             // There shouldn't be a pending removal of an entry that doesn't exist in the index.
                             assert_gt!(**pc_key, entry.key);
-                            new_index.append(entry);
+                            add_to_index_or_list(&mut new_index, &mut free_list, entry);
                         }
                     }
                     Some((pc_key, PendingChange::Insert(_pc_value))) => {
@@ -968,14 +1019,14 @@ impl ZettaCacheState {
                         // to be removed first, resulting in a
                         // PendingChange::RemoveThenInsert.
                         assert_gt!(**pc_key, entry.key);
-                        new_index.append(entry);
+                        add_to_index_or_list(&mut new_index, &mut free_list, entry);
                     }
                     Some((pc_key, PendingChange::RemoveThenInsert(pc_value))) => {
                         if **pc_key == entry.key {
                             // This key must have been removed (evicted) and then re-inserted.
                             // Add the pending change to the next generation instead of the current index's entry
                             assert_eq!(pc_value.size, entry.value.size);
-                            new_index.append(IndexEntry {
+                            add_to_index_or_list(&mut new_index, &mut free_list, IndexEntry {
                                 key: **pc_key,
                                 value: *pc_value,
                             });
@@ -985,7 +1036,7 @@ impl ZettaCacheState {
                         } else {
                             // We shouldn't have skipped any, because there has to be a corresponding Index entry
                             assert_gt!(**pc_key, entry.key);
-                            new_index.append(entry);
+                            add_to_index_or_list(&mut new_index, &mut free_list, entry);
                         }
                     }
                     Some((pc_key, PendingChange::UpdateAtime(pc_value))) => {
@@ -993,7 +1044,7 @@ impl ZettaCacheState {
                             // Add the pending entry to the next generation instead of the current index's entry
                             assert_eq!(pc_value.location, entry.value.location);
                             assert_eq!(pc_value.size, entry.value.size);
-                            new_index.append(IndexEntry {
+                            add_to_index_or_list(&mut new_index, &mut free_list, IndexEntry {
                                 key: **pc_key,
                                 value: *pc_value,
                             });
@@ -1003,12 +1054,12 @@ impl ZettaCacheState {
                         } else {
                             // We shouldn't have skipped any, because there has to be a corresponding Index entry
                             assert_gt!(**pc_key, entry.key);
-                            new_index.append(entry);
+                            add_to_index_or_list(&mut new_index, &mut free_list, entry);
                         }
                     }
                     None => {
                         // no more pending changes
-                        new_index.append(entry);
+                        add_to_index_or_list(&mut new_index, &mut free_list, entry);
                     }
                 }
                 future::ready(())
@@ -1021,7 +1072,7 @@ impl ZettaCacheState {
                 pc_key,
                 pc_value
             );
-            new_index.append(IndexEntry {
+            add_to_index_or_list(&mut new_index, &mut free_list, IndexEntry {
                 key: **pc_key,
                 value: *pc_value,
             });
@@ -1040,14 +1091,18 @@ impl ZettaCacheState {
         // Note: the caller is about to flush as well, but we want to count the time in the below info!
         new_index.flush().await;
 
+        // Free the evicted blocks from the cache
+        debug!("freeing {} blocks", free_list.len());
+        for value in free_list {
+            let extent = Extent {location: value.location, size: value.size};
+            self.block_allocator.free(&extent);
+        }
+
         debug!("new histogram: {:#?}", new_index.atime_histogram);
-        assert_eq!(
-            new_index.atime_histogram.histogram,
-            self.atime_histogram.histogram
-        );
 
         self.pending_changes.clear();
         self.operation_log.clear();
+        self.atime_histogram = new_index.atime_histogram.clone();
 
         info!(
             "wrote new index with {} entries ({} MB) in {:.1}s ({:.1}MB/s)",

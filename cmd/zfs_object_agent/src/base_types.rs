@@ -3,6 +3,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::*;
 use std::ops::Add;
+use std::ops::Sub;
 
 /*
  * Things that are stored on disk.
@@ -107,5 +108,12 @@ pub struct Atime(pub u64);
 impl Atime {
     pub fn next(&self) -> Atime {
         Atime(self.0 + 1)
+    }
+}
+
+impl Sub<Atime> for Atime {
+    type Output = usize;
+    fn sub(self, rhs: Atime) -> usize {
+        return self.0 as usize - rhs.0 as usize;
     }
 }

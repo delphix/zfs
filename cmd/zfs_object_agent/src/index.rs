@@ -31,15 +31,24 @@ pub struct IndexEntry {
 impl OnDisk for IndexEntry {}
 impl BlockBasedLogEntry for IndexEntry {}
 
-pub struct ZettaCacheIndex {
-    pub atime_histogram: AtimeHistogramPhys,
-    pub log: BlockBasedLogWithSummary<IndexEntry>,
-}
-
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct ZettaCacheIndexPhys {
     atime_histogram: AtimeHistogramPhys,
     log: BlockBasedLogWithSummaryPhys,
+}
+
+impl ZettaCacheIndexPhys {
+    pub fn new(min_atime: Atime) -> Self {
+        Self {
+            atime_histogram: AtimeHistogramPhys::new(min_atime),
+            log: Default::default(),
+        }
+    }
+}
+
+pub struct ZettaCacheIndex {
+    pub atime_histogram: AtimeHistogramPhys,
+    pub log: BlockBasedLogWithSummary<IndexEntry>,
 }
 
 impl ZettaCacheIndex {
@@ -61,8 +70,12 @@ impl ZettaCacheIndex {
         }
     }
 
+    pub fn get_histogram_start(&mut self) -> Atime {
+        return self.atime_histogram.get_start();
+    }
+
     pub fn append(&mut self, entry: IndexEntry) {
-        self.atime_histogram.insert(entry.value.atime);
+        self.atime_histogram.insert(entry.value);
         self.log.append(entry);
     }
 
