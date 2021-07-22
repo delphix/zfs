@@ -31,15 +31,24 @@ pub struct IndexEntry {
 impl OnDisk for IndexEntry {}
 impl BlockBasedLogEntry for IndexEntry {}
 
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct ZettaCacheIndexPhys {
+    atime_histogram: AtimeHistogramPhys,
+    log: BlockBasedLogWithSummaryPhys,
+}
+
+impl ZettaCacheIndexPhys {
+    pub fn new(min_atime: Atime) -> Self {
+        Self {
+            atime_histogram: AtimeHistogramPhys::new(min_atime),
+            log: Default::default(),
+        }
+    }
+}
+
 pub struct ZettaCacheIndex {
     pub atime_histogram: AtimeHistogramPhys,
     pub log: BlockBasedLogWithSummary<IndexEntry>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Default)]
-pub struct ZettaCacheIndexPhys {
-    pub atime_histogram: AtimeHistogramPhys,
-    pub log: BlockBasedLogWithSummaryPhys,
 }
 
 impl ZettaCacheIndex {

@@ -173,9 +173,25 @@ impl AtimeHistogramPhys {
         return self.start;
     }
 
+    pub fn atime_for_target_size(&mut self, target_size: u64) -> Atime {
+        info!("histogram starts at {:?} and has {} entries", self.start, self.histogram.len());
+        let mut remaining = target_size;
+        let mut target_index = self.start.0;
+        for (index, count) in self.histogram.iter().enumerate().rev() {
+            if remaining <= *count {
+                trace!("final include of {} for target at bucket {}", count, index);
+                target_index += index as u64;
+                break;
+            }
+            trace!("including {} in target at bucket {}", count, index);
+            remaining -= count;
+        }
+        return Atime { 0:target_index };
+    }
+
     pub fn insert(&mut self, value: IndexValue) {
         assert_ge!(value.atime, self.start);
-        let index = value.atime.0 as usize - self.start.0 as usize;
+        let index = value.atime - self.start;
         if index >= self.histogram.len() {
             self.histogram.resize(index + 1, 0);
         }
@@ -184,7 +200,7 @@ impl AtimeHistogramPhys {
 
     pub fn remove(&mut self, value: IndexValue) {
         assert_ge!(value.atime, self.start);
-        let index = value.atime.0 as usize - self.start.0 as usize;
+        let index = value.atime - self.start;
         self.histogram[index] -= value.size as u64;
     }
 
@@ -942,33 +958,16 @@ impl ZettaCacheState {
         // a new generation (as we do with ObjectBasedLog).
 
         // Calculate an eviction atime for the new index: use 10% of available space:
-        let mut eviction_atime = self.atime_histogram.start;
-        let mut target_size = (self.block_access.size() / 100) * TARGET_CACHE_SIZE_PCT;
+        let target_size = (self.block_access.size() / 100) * TARGET_CACHE_SIZE_PCT;
         info!("target cache size for storage size {} is {}", self.block_access.size(), target_size);
-        info!("histogram starts at {:?} and has {} entries",
-            self.atime_histogram.start, self.atime_histogram.histogram.len());
-        for (index, count) in self.atime_histogram.histogram.iter().enumerate().rev() {
-            if *count >= target_size {
-                trace!("final include of {} for target at bucket {}", count, index);
-                eviction_atime.0 += index as u64; 
-                break;
-            }
-            trace!("including {} in target at bucket {}", count, index);
-            target_size -= count;
-        }
-
-        info!("setting new eviction atime to {:?}", eviction_atime);
         let mut new_index = ZettaCacheIndex::open(
             self.block_access.clone(),
             self.extent_allocator.clone(),
-            ZettaCacheIndexPhys {
-                atime_histogram: AtimeHistogramPhys::new(eviction_atime),
-                ..Default::default()
-            },
+            ZettaCacheIndexPhys::new(self.atime_histogram.atime_for_target_size(target_size)),
         )
         .await;
+        info!("set new eviction atime to {:?}", new_index.get_histogram_start());
 
-        // new_index.set_histogram_start(eviction_atime);
         info!(
             "writing new index to merge {} pending changes into index of {} entries ({} MB)",
             self.pending_changes.len(),
